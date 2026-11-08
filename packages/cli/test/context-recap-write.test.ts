@@ -4,7 +4,7 @@
 // the write flows through the ONE store (supersession + addressability gate),
 // advisory contract findings ride stderr, and the gate refuses loud.
 
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import http from "node:http";
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -14,6 +14,27 @@ import { contextCommand } from "../src/commands/context.js";
 import { DaemonClient, DaemonConnectionError, DaemonTimeoutError } from "../src/client.js";
 import { STATE_FILE, type LifecycleDeps, type DaemonState } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
+import { createFullTestDb } from "../../daemon/test/helpers/test-app.js";
+
+afterEach(() => vi.unstubAllEnvs());
+
+async function seedRegistryDb(
+  tmp: string,
+  input: { rig?: string; logicalId?: string; sessionName?: string } = {},
+): Promise<string> {
+  const rig = input.rig ?? "r1";
+  const logicalId = input.logicalId ?? "s1";
+  const sessionName = input.sessionName ?? `${logicalId}@${rig}`;
+  const dbPath = join(tmp, "openrig.sqlite");
+  const db = createFullTestDb();
+  db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("rig-fixture", rig);
+  db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES (?, ?, ?, ?)").run("node-fixture", "rig-fixture", logicalId, "codex");
+  db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, ?)").run("session-fixture", "node-fixture", sessionName, "running");
+  await db.backup(dbPath);
+  db.close();
+  vi.stubEnv("OPENRIG_DB", dbPath);
+  return dbPath;
+}
 
 /** A running daemon on `port`, as the CLI's status check sees it. */
 function lifecycleDeps(port: number): LifecycleDeps {
@@ -64,6 +85,7 @@ describe("rig context recap-write — the boundary write verb", () => {
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp);
       mkdirSync(join(tmp, "topology", "rigs", "r1", "seats", "s1"), { recursive: true });
       const f1 = join(tmp, "era1.md");
       writeFileSync(f1, "## Recent Decisions\nchose X because Y");
@@ -87,14 +109,15 @@ describe("rig context recap-write — the boundary write verb", () => {
     }
   });
 
-  it("provisions a missing seat directory beneath an existing topology rig", async () => {
+  it("provisions a missing seat directory beneath an existing topology seats root", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "s06-recap-provision-"));
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp);
       const rigDir = join(tmp, "topology", "rigs", "r1");
       const seatDir = join(rigDir, "seats", "s1");
-      mkdirSync(rigDir, { recursive: true });
+      mkdirSync(join(rigDir, "seats"), { recursive: true });
       expect(existsSync(seatDir)).toBe(false);
       const recap = join(tmp, "recap.md");
       writeFileSync(recap, "## Recent Decisions\nchose provisioning because manual mkdir is not a product path");
@@ -120,6 +143,7 @@ describe("rig context recap-write — the boundary write verb", () => {
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp);
       const recap = join(tmp, "recap.md");
       writeFileSync(recap, "## Recent Decisions\nnone");
 
@@ -135,11 +159,33 @@ describe("rig context recap-write — the boundary write verb", () => {
     }
   });
 
+  it("refuses a registered rig whose physical topology tree is missing", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "issue11-recap-registered-missing-tree-"));
+    const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
+    try {
+      process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp, { rig: "r2", logicalId: "qa.reviewer", sessionName: "qa-reviewer@r2" });
+      const recap = join(tmp, "recap.md");
+      writeFileSync(recap, "## Recent Decisions\nrefuse implicit rig provisioning");
+
+      const res = await runRecapWrite(["recap-write", "--rig", "r2", "--seat", "qa.reviewer", "--file", recap]);
+
+      expect(res.exitCode).toBe(1);
+      expect(res.errLogs.join("\n")).toMatch(/physical topology rig directory.*does not exist/i);
+      expect(existsSync(join(tmp, "topology", "rigs", "r2"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_TOPOLOGY_ROOT"];
+      else process.env["OPENRIG_TOPOLOGY_ROOT"] = saved;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("refuses unsafe rig or seat path segments before provisioning", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "s06-recap-path-guard-"));
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp);
       mkdirSync(join(tmp, "topology", "rigs", "r1"), { recursive: true });
       const recap = join(tmp, "recap.md");
       writeFileSync(recap, "## Recent Decisions\nnone");
@@ -161,6 +207,7 @@ describe("rig context recap-write — the boundary write verb", () => {
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp);
       const rigDir = join(tmp, "topology", "rigs", "r1");
       const outside = join(tmp, "outside");
       mkdirSync(rigDir, { recursive: true });
@@ -186,6 +233,7 @@ describe("rig context recap-write — the boundary write verb", () => {
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp);
       const seatDir = join(tmp, "topology", "rigs", "r1", "seats", "s1");
       mkdirSync(seatDir, { recursive: true });
       const bad = join(tmp, "bad.md");
@@ -200,10 +248,37 @@ describe("rig context recap-write — the boundary write verb", () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("resolves the issue #11 dashed session-member ref to the registered dotted seat and rejects unknown refs", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "issue11-recap-seat-ref-"));
+    const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
+    try {
+      process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
+      await seedRegistryDb(tmp, { logicalId: "lead.dev-a", sessionName: "lead-dev-a@r1" });
+      const registeredSeat = join(tmp, "topology", "rigs", "r1", "seats", "lead.dev-a");
+      mkdirSync(registeredSeat, { recursive: true });
+      const recap = join(tmp, "recap.md");
+      writeFileSync(recap, "## Recent Decisions\nregistry identity owns recap storage");
+
+      const ok = await runRecapWrite(["recap-write", "--rig", "r1", "--seat", "lead-dev-a", "--file", recap]);
+      expect(ok.exitCode ?? 0).toBe(0);
+      expect(readFileSync(join(registeredSeat, "RECAP.md"), "utf-8")).toContain("registry identity owns recap storage");
+      expect(existsSync(join(tmp, "topology", "rigs", "r1", "seats", "lead-dev-a", "RECAP.md"))).toBe(false);
+
+      const unknown = await runRecapWrite(["recap-write", "--rig", "r1", "--seat", "nosuchseat", "--file", recap]);
+      expect(unknown.exitCode).toBe(1);
+      expect(unknown.errLogs.join("\n")).toMatch(/Valid logical seat ids: lead\.dev-a/);
+      expect(existsSync(join(tmp, "topology", "rigs", "r1", "seats", "nosuchseat"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_TOPOLOGY_ROOT"];
+      else process.env["OPENRIG_TOPOLOGY_ROOT"] = saved;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 // A sandboxed seat (a default Codex seat) can't write the topology tree. The OS refuses the write (EPERM under a
-// sandbox; EACCES here, from a read-only rig folder), so the CLI hands the same recap to the daemon, which owns the tree.
+// sandbox; EACCES here, from a read-only seats root), so the CLI hands the same recap to the daemon, which owns the tree.
 describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this process may not write the topology tree", () => {
   it("hands the recap to the daemon, which writes it; nothing is written by this process", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "recap-via-daemon-"));
@@ -221,10 +296,12 @@ describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this pro
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as { port: number }).port;
     const rigDir = join(tmp, "topology", "rigs", "r1");
+    const seatsRoot = join(rigDir, "seats");
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
-      mkdirSync(rigDir, { recursive: true });
-      chmodSync(rigDir, 0o555);
+      await seedRegistryDb(tmp);
+      mkdirSync(seatsRoot, { recursive: true });
+      chmodSync(seatsRoot, 0o555);
       const recap = join(tmp, "recap.md");
       writeFileSync(recap, "## Recent Decisions\nchose the daemon because the seat can't write here");
 
@@ -235,9 +312,9 @@ describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this pro
         body: { rig: "r1", seat: "s1", content: "## Recent Decisions\nchose the daemon because the seat can't write here" } }]);
       expect(res.logs.join("\n")).toBe(`Recap written: /daemon/topology/rigs/r1/seats/s1/RECAP.md (1 superseded predecessor retained), by the daemon at http://127.0.0.1:${port}`);
       expect(res.errLogs.join("\n")).toMatch(/can't write the topology tree \(EACCES.*\), so the daemon writes the recap instead/);
-      expect(existsSync(join(rigDir, "seats"))).toBe(false);
+      expect(existsSync(join(seatsRoot, "s1"))).toBe(false);
     } finally {
-      chmodSync(rigDir, 0o755);
+      chmodSync(seatsRoot, 0o755);
       await new Promise<void>((resolve) => server.close(() => resolve()));
       if (saved === undefined) delete process.env["OPENRIG_TOPOLOGY_ROOT"];
       else process.env["OPENRIG_TOPOLOGY_ROOT"] = saved;
@@ -249,10 +326,12 @@ describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this pro
     const tmp = mkdtempSync(join(tmpdir(), "recap-daemon-timeout-"));
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     const rigDir = join(tmp, "topology", "rigs", "r1");
+    const seatsRoot = join(rigDir, "seats");
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
-      mkdirSync(rigDir, { recursive: true });
-      chmodSync(rigDir, 0o555);
+      await seedRegistryDb(tmp);
+      mkdirSync(seatsRoot, { recursive: true });
+      chmodSync(seatsRoot, 0o555);
       const recap = join(tmp, "recap.md");
       writeFileSync(recap, "## Recent Decisions\nnone");
       const post = vi.fn(async () => { throw new DaemonTimeoutError("Request to /api/context-packs/seat-recap timed out after 5000ms"); });
@@ -264,7 +343,7 @@ describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this pro
       expect(res.exitCode).toBe(1);
       expect(res.errLogs.join("\n")).toContain("outcome is UNKNOWN");
     } finally {
-      chmodSync(rigDir, 0o755);
+      chmodSync(seatsRoot, 0o755);
       if (saved === undefined) delete process.env["OPENRIG_TOPOLOGY_ROOT"];
       else process.env["OPENRIG_TOPOLOGY_ROOT"] = saved;
       rmSync(tmp, { recursive: true, force: true });
@@ -275,10 +354,12 @@ describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this pro
     const tmp = mkdtempSync(join(tmpdir(), "recap-no-daemon-"));
     const saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     const rigDir = join(tmp, "topology", "rigs", "r1");
+    const seatsRoot = join(rigDir, "seats");
     try {
       process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
-      mkdirSync(rigDir, { recursive: true });
-      chmodSync(rigDir, 0o555);
+      await seedRegistryDb(tmp);
+      mkdirSync(seatsRoot, { recursive: true });
+      chmodSync(seatsRoot, 0o555);
       const recap = join(tmp, "recap.md");
       writeFileSync(recap, "## Recent Decisions\nnone");
 
@@ -291,7 +372,7 @@ describe.skipIf(process.getuid?.() === 0)("rig context recap-write when this pro
       expect(res.errLogs[0]).toMatch(/can't write the topology tree \(EACCES.*\), so the daemon writes the recap instead/);
       expect(res.errLogs.slice(1).join("\n")).toMatch(/ECONNREFUSED|daemon/i);
     } finally {
-      chmodSync(rigDir, 0o755);
+      chmodSync(seatsRoot, 0o755);
       if (saved === undefined) delete process.env["OPENRIG_TOPOLOGY_ROOT"];
       else process.env["OPENRIG_TOPOLOGY_ROOT"] = saved;
       rmSync(tmp, { recursive: true, force: true });

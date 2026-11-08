@@ -7,23 +7,35 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { contextPacksRoutes } from "../src/routes/context-packs.js";
+import type Database from "better-sqlite3";
+import { createFullTestDb } from "./helpers/test-app.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
 
 describe("POST /api/context-packs/seat-recap", () => {
   let tmp: string;
   let saved: string | undefined;
-  const app = new Hono();
-  app.route("/api/context-packs", contextPacksRoutes());
+  let db: Database.Database;
+  let app: Hono;
   const write = (body: unknown) => app.request("/api/context-packs/seat-recap", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
 
   beforeEach(() => {
+    db = createFullTestDb();
+    db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("recap-rig", "r1");
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES (?, ?, ?, ?)").run("recap-s1", "recap-rig", "s1", "codex");
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, ?)").run("recap-session-s1", "recap-s1", "s1@r1", "running");
+    const rigRepo = new RigRepository(db);
+    app = new Hono();
+    app.use("*", async (c, next) => { c.set("rigRepo" as never, rigRepo); await next(); });
+    app.route("/api/context-packs", contextPacksRoutes());
     tmp = mkdtempSync(join(tmpdir(), "seat-recap-route-"));
     saved = process.env["OPENRIG_TOPOLOGY_ROOT"];
     process.env["OPENRIG_TOPOLOGY_ROOT"] = join(tmp, "topology");
-    mkdirSync(join(tmp, "topology", "rigs", "r1"), { recursive: true });
+    mkdirSync(join(tmp, "topology", "rigs", "r1", "seats"), { recursive: true });
   });
   afterEach(() => {
+    db.close();
     if (saved === undefined) delete process.env["OPENRIG_TOPOLOGY_ROOT"];
     else process.env["OPENRIG_TOPOLOGY_ROOT"] = saved;
     rmSync(tmp, { recursive: true, force: true });
@@ -52,12 +64,15 @@ describe("POST /api/context-packs/seat-recap", () => {
 
     const outside = join(tmp, "outside");
     mkdirSync(outside);
-    symlinkSync(outside, join(tmp, "topology", "rigs", "r1", "seats"));
+    const seatsRoot = join(tmp, "topology", "rigs", "r1", "seats");
+    rmSync(seatsRoot, { recursive: true, force: true });
+    symlinkSync(outside, seatsRoot);
     const linked = await write({ rig: "r1", seat: "s1", content: "## Recent Decisions\nx" });
     expect(linked.status).toBe(400);
     expect((await linked.json()).message).toMatch(/symlink/);
     expect(existsSync(join(outside, "s1"))).toBe(false);
-    rmSync(join(tmp, "topology", "rigs", "r1", "seats"));
+    rmSync(seatsRoot);
+    mkdirSync(seatsRoot);
 
     const unaddressable = await write({ rig: "r1", seat: "s1", content: "## Same\na\n## Same\nb" });
     expect(unaddressable.status).toBe(400);
@@ -99,6 +114,16 @@ describe("POST /api/context-packs/seat-recap", () => {
     const res = await write({ rig: "r1", seat: "s1", content: `#${"\t".repeat(200_000)}\n## Recent Decisions\nkept the shared parser linear` });
     expect(res.status).toBe(200);
     expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  it("refuses a registered rig whose physical topology tree is missing", async () => {
+    db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run("recap-rig-2", "r2");
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES (?, ?, ?, ?)").run("recap-s2", "recap-rig-2", "qa.reviewer", "codex");
+
+    const res = await write({ rig: "r2", seat: "qa.reviewer", content: "## Recent Decisions\nrefuse implicit rig provisioning" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).message).toMatch(/physical topology rig directory.*does not exist/i);
+    expect(existsSync(join(tmp, "topology", "rigs", "r2"))).toBe(false);
   });
 
   it("refuses a body without rig, seat and content as strings", async () => {
