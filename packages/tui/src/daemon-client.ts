@@ -252,6 +252,89 @@ export class DaemonClient {
     return { body: { seats: data["seats"] as import("./cost/cost-read.js").CostBody["seats"], note: typeof data["note"] === "string" ? data["note"] : "" } };
   }
 
+  /** Finite coordination history, with strictly bounded passive GETs. No exporter, collector or refresh endpoint. */
+  async finiteTelemetry(): Promise<import("./telemetry/telemetry-model.js").TelemetryRead> {
+    const { parseTelemetryPage, parseRuntimeSummary } = await import("./telemetry/telemetry-model.js");
+    type Result = import("./telemetry/telemetry-model.js").TelemetryPageResult;
+    const read = async (path: string, stream: "events" | "queue-transitions" | "tenures"): Promise<Result> => {
+      let response: Response;
+      try {
+        response = await this.fetchImpl(`${this.baseUrl}${path}`, { method: "GET", headers: this.headers, signal: AbortSignal.timeout(5_000) });
+        const body: unknown = await response.json().catch(() => null);
+        if (!response.ok) return { status: "unavailable", reason: `HTTP ${response.status}` };
+        return parseTelemetryPage(body, stream);
+      } catch (error) {
+        return { status: "unavailable", reason: error instanceof Error ? error.message : "read failed" };
+      }
+    };
+    const [events, transitions] = await Promise.all([
+      read("/api/telemetry/v1/events?start=recent&limit=16", "events"),
+      read("/api/telemetry/v1/queue-transitions?start=recent&limit=16", "queue-transitions"),
+    ]);
+    // Tenure history has a required node ID; use a passive inventory lookup with a strict sample cap.
+    // A missing inventory is recorded separately, never interpreted as absence of tenures.
+    let tenures: Result = { status: "unavailable", reason: "node inventory unavailable" };
+    let runtime: import("./telemetry/telemetry-model.js").RuntimeRead = { status: "unavailable", reason: "rig inventory unavailable" };
+    try {
+      const inventory: unknown = await this.ps();
+      const rigs = Array.isArray(inventory) ? inventory : [];
+      const addressable = [...new Set(rigs.flatMap(entry =>
+        entry && typeof entry === "object" && typeof (entry as { rigId?: unknown }).rigId === "string" && (entry as { rigId: string }).rigId
+          ? [(entry as { rigId: string }).rigId] : []))];
+      if (addressable.length > 1) {
+        const reason = "multiple rigs in inventory; target ambiguous (select a rig before reading runtime or tenures)";
+        return { events, transitions, tenures: { status: "unavailable", reason }, runtime: { status: "unavailable", reason } };
+      }
+      const rig = addressable.length === 1 ? { rigId: addressable[0]! } : null;
+      if (rig) {
+        try {
+          const response = await this.fetchImpl(`${this.baseUrl}/api/telemetry/runtime/summary?rigId=${encodeURIComponent(rig.rigId)}`, { method: "GET", headers: this.headers, signal: AbortSignal.timeout(5_000) });
+          runtime = response.ok ? parseRuntimeSummary(await response.json().catch(() => null)) : { status: "unavailable", reason: `HTTP ${response.status}` };
+        } catch (error) { runtime = { status: "unavailable", reason: error instanceof Error ? error.message : "runtime read failed" }; }
+      }
+      const nodeInventory: unknown = rig ? await this.rigNodes(rig.rigId) : [];
+      const nodes = Array.isArray(nodeInventory) ? nodeInventory : [];
+      const nodeIds = [...new Set(nodes.flatMap(node =>
+        node && typeof node === "object" && typeof (node as { nodeId?: unknown }).nodeId === "string" && (node as { nodeId: string }).nodeId.length > 0
+          ? [(node as { nodeId: string }).nodeId] : []))];
+      tenures = nodeIds.length > 1 ? { status: "unavailable", reason: "multiple nodes in rig inventory; tenure node target ambiguous" }
+        : nodeIds.length === 1 ? await read(`/api/telemetry/v1/nodes/${encodeURIComponent(nodeIds[0]!)}/tenures?limit=16`, "tenures")
+        : { status: "unavailable", reason: "no addressable node in inventory (tenure history unverified)" };
+    } catch (error) {
+      tenures = { status: "unavailable", reason: error instanceof Error ? error.message : "node inventory read failed" };
+    }
+    return { events, transitions, tenures, runtime };
+  }
+
+  /** A1 passive cgroup-v2 sample, strictly validated before it reaches the view. */
+  async seatMemory(): Promise<import("./memory/memory-model.js").MemoryRead["status"]> {
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.baseUrl}/api/ps/seat-resources`, { headers: this.headers, signal: AbortSignal.timeout(5_000) });
+    } catch (error) {
+      return { status: null, error: error instanceof Error ? error.message : "Memory read failed" };
+    }
+    const raw: unknown = await res.json().catch(() => null);
+    const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+    if (!res.ok) return { status: res.status, error: object(raw) && typeof raw.error === "string" ? raw.error : `HTTP ${res.status}` };
+    const validBytes = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    const validSeat = (value: unknown): boolean => {
+      if (!object(value) || typeof value.sessionName !== "string" || !value.sessionName || typeof value.rigId !== "string" || typeof value.state !== "string") return false;
+      if (!["available", "unavailable", "unsupported"].includes(String(value.availability))) return false;
+      if (value.availability !== "available") return value.observed === null && typeof value.reason === "string" && value.reason.length > 0;
+      if (value.reason !== null || !object(value.observed)) return false;
+      const observed = value.observed;
+      return observed.source === "cgroup-v2" && validBytes(observed.bytesCurrent)
+        && (observed.bytesLimit === null || validBytes(observed.bytesLimit))
+        && (observed.swapBytesCurrent === undefined || validBytes(observed.swapBytesCurrent));
+    };
+    if (!object(raw) || raw.schemaVersion !== 1 || typeof raw.sampledAt !== "string" || !Number.isFinite(Date.parse(raw.sampledAt))
+      || typeof raw.host !== "string" || !raw.host || !Array.isArray(raw.seats) || !raw.seats.every(validSeat)) {
+      return { status: res.status, error: "the response was not a valid seat-resources/v1 view" };
+    }
+    return { body: raw as unknown as import("./memory/memory-model.js").MemoryBody };
+  }
+
   /** Bounded canonical findings; the TUI filters this one record set by scope. */
   healthFindings(limit = 200) {
     return this.get(`/api/health?limit=${limit}`);
