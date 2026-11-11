@@ -23,19 +23,12 @@ OpenRig does not embed third-party messaging platform SDKs (such as WhatsApp, Ma
 ## 1. System Topology & Custody Boundaries
 
 ### Outbound Custody & Recovery
-- OpenRig enqueues outbound decisions to a local `DispatchBuffer` before issuing any HTTP `POST` to `OPENRIG_RELAY_URL` (in `push` mode) or holding the decision for connector pull (in `pull` mode).
-- Each logical decision freezes its complete `relayEnvelope` onto the parent `DispatchBuffer` entry before the first delivery pass, with no self-imposed outbound 64 KiB cap or multi-part splitting.
-- **Push mode (`OPENRIG_RELAY_MODE=push`, default)**:
-  - Transport is at-least-once: OpenRig sends the complete JSON envelope in a single HTTP `POST` per attempt with `deliveryId = <decisionId>` (preserving the full `body`, `humanDetail`, `humanQuestions`/options, `summary` overflow, and digest `items` without silent clipping).
-  - An HTTP `2xx` response from the bridge acknowledges durable bridge custody of that complete envelope (`deliveryId`). The bridge must persist each envelope by `deliveryId` and deduplicate replayed `deliveryId`s idempotently.
-  - OpenRig records the logical queue acceptance receipt (`relay-owner-notification-accepted` with `deliveryId`) and drains the decision from `DispatchBuffer` once the HTTP `POST` returns `2xx`.
-  - Failed dispatches remain in OpenRig's `DispatchBuffer` and record a relay-specific failure transition note (`relay-owner-notification-transport-failed` naming the `connectorRef`, distinct from Slack's `slack-owner-notification-transport-failed`). Replays after a lost ACK or daemon/bridge restart re-send the exact frozen `relayEnvelope` with the same `deliveryId` and bytes. If the relay subsystem stops while an outbound HTTP `POST` is in flight (or before it starts), the transport aborts cleanly (`stopped`) without recording a false failure transition note or false acceptance receipt, retaining the buffered decision for replay on restart. There is currently no periodic background timer redriving outbound dispatches on timeout.
-- **Pull mode (`OPENRIG_RELAY_MODE=pull`)**:
-  - Client-only connectors that do not bind a listening HTTP server set `OPENRIG_RELAY_MODE=pull`. A pull profile is ready with `OPENRIG_RELAY_INBOUND_TOKEN` alone (`OPENRIG_RELAY_URL` and `OPENRIG_RELAY_OUTBOUND_TOKEN` are optional and unused in pull mode).
-  - Outbound decisions remain in `DispatchBuffer` awaiting connector pull and are never treated as failed push destinations (`relay-owner-notification-transport-failed` is not recorded). While the outbox lists a notice (staged in `DispatchBuffer` and `relay-attempted-decisions.jsonl` for its `connectorRef`), it is not a missing post for up to **24 hours** (`PULL_OUTBOX_NEVER_POSTED_WINDOW_MS`) and reads `never-posted` (`undelivered-human-notice`) if still unacknowledged after that. A notice the outbox does not list (never staged, staging failed, or its `DispatchBuffer` or seen stores are unreadable, so the outbox answers `503`) uses the usual 120-second window (`NEVER_POSTED_WINDOW_MS`). This is reporting only: nothing is held, refused or re-sent.
-  - The connector lists its pending complete envelopes via `GET /api/gateway/relay/outbox` (read-only; no consumer leases, read receipts, or required polling cadences) and acknowledges durable custody via `POST /api/gateway/relay/outbox/ack`.
-  - An acknowledgment on `POST /api/gateway/relay/outbox/ack` has the exact same custody meaning as a push `2xx`: OpenRig records `relay-owner-notification-accepted` (closing informational `update` items as delivered), marks its local outbound seen/delivered guards, and drains the decision from `DispatchBuffer`. Duplicate acknowledgments reconcile idempotently (`alreadyAccepted: true`), and retries after a partial local write failure finish the remaining receipt and drain sequence.
-- **Custody boundary (both modes)**: Bridge acceptance (via push `2xx` or pull `POST /api/gateway/relay/outbox/ack`) confirms durable custody of the complete envelope by the connector only (projected as `accepted` / `"Accepted by bridge"`, whereas Slack posts use `posted` / `"Delivered"`). It does not mean posted, seen, answered, or approved.
+- OpenRig enqueues outbound decisions to a local `DispatchBuffer` before issuing any HTTP `POST` to `OPENRIG_RELAY_URL`.
+- Each logical decision freezes its complete `relayEnvelope` onto the parent `DispatchBuffer` entry before the first network attempt, with no self-imposed outbound 64 KiB cap or multi-part splitting.
+- Transport is at-least-once: OpenRig sends the complete JSON envelope in a single HTTP `POST` per attempt with `deliveryId = <decisionId>` (preserving the full `body`, `humanDetail`, `humanQuestions`/options, `summary` overflow, and digest `items` without silent clipping).
+- An HTTP `2xx` response from the bridge acknowledges durable bridge custody of that complete envelope (`deliveryId`). The bridge must persist each envelope by `deliveryId` and deduplicate replayed `deliveryId`s idempotently.
+- OpenRig records the logical queue acceptance receipt (`relay-owner-notification-accepted` with `deliveryId`) and drains the decision from `DispatchBuffer` once the HTTP `POST` returns `2xx`. Bridge acceptance confirms custody by the bridge process only (and is projected as `accepted` / `"Accepted by bridge"`, whereas Slack posts use `posted` / `"Delivered"`). It does not indicate downstream platform delivery, posting, or human receipt.
+- Failed dispatches remain in OpenRig's `DispatchBuffer` and record a relay-specific failure transition note (`relay-owner-notification-transport-failed` naming the `connectorRef`, distinct from Slack's `slack-owner-notification-transport-failed`). Replays after a lost ACK or daemon/bridge restart re-send the exact frozen `relayEnvelope` with the same `deliveryId` and bytes. If the relay subsystem stops while an outbound HTTP `POST` is in flight (or before it starts), the transport aborts cleanly (`stopped`) without recording a false failure transition note or false acceptance receipt, retaining the buffered decision for replay on restart. There is currently no periodic background timer redriving outbound dispatches on timeout.
 
 ### Inbound Custody & Resolution
 - The operator bridge posts replies to `POST /api/gateway/relay/inbound`.
@@ -61,29 +54,21 @@ Each relay connector loads configuration from an absolute file referenced by the
 
 ### Required Secrets Keys
 
-**Push mode (`OPENRIG_RELAY_MODE=push`, default when omitted):**
 ```ini
 OPENRIG_RELAY_URL=http://127.0.0.1:8088/webhook
 OPENRIG_RELAY_OUTBOUND_TOKEN=sec_outbound_token_value
 OPENRIG_RELAY_INBOUND_TOKEN=sec_inbound_token_value
 ```
 
-**Pull mode (`OPENRIG_RELAY_MODE=pull`):**
-```ini
-OPENRIG_RELAY_MODE=pull
-OPENRIG_RELAY_INBOUND_TOKEN=sec_inbound_token_value
-```
-
-- `OPENRIG_RELAY_MODE`: Optional mode selector (`push` or `pull`; defaults to `push` when omitted). Any other value is rejected as `not-ready`.
-- `OPENRIG_RELAY_URL`: Required in `push` mode; ignored/unused in `pull` mode (`endpointUrl: null`). When required, must use `http:`, loopback host (`127.0.0.1/8`, `::1`, or `localhost`), without URL credentials or hash fragments. Redirects (3xx) are rejected.
-- `OPENRIG_RELAY_OUTBOUND_TOKEN`: Required in `push` mode; ignored/unused in `pull` mode. Non-empty Bearer token sent by OpenRig on outbound HTTP `POST` requests to the bridge.
-- `OPENRIG_RELAY_INBOUND_TOKEN`: Non-empty Bearer token required in both `push` and `pull` modes to authenticate connector requests (`GET /api/gateway/relay/outbox`, `POST /api/gateway/relay/outbox/ack`, and `POST /api/gateway/relay/inbound`). Must be unique across different configured relay connector profiles (`connectorRef`); sharing the same inbound token across multiple relay profiles is rejected as ambiguous (`not-ready`). Using the same token value for both `OPENRIG_RELAY_OUTBOUND_TOKEN` and `OPENRIG_RELAY_INBOUND_TOKEN` within a single `push` profile is allowed, with a redacted readiness warning explaining why separate directional tokens are recommended so an outbound capture cannot authenticate inbound replies.
+- `OPENRIG_RELAY_URL`: Must use `http:`, loopback host (`127.0.0.1/8`, `::1`, or `localhost`), without URL credentials or hash fragments. Redirects (3xx) are rejected.
+- `OPENRIG_RELAY_OUTBOUND_TOKEN`: Non-empty Bearer token sent by OpenRig on outbound requests to the bridge.
+- `OPENRIG_RELAY_INBOUND_TOKEN`: Non-empty Bearer token required on inbound requests from the bridge. Must be unique across different configured relay connector profiles (`connectorRef`); sharing the same inbound token across multiple relay profiles is rejected as ambiguous (`not-ready`). Using the same token value for both `OPENRIG_RELAY_OUTBOUND_TOKEN` and `OPENRIG_RELAY_INBOUND_TOKEN` within a single profile is allowed, with a redacted readiness warning explaining why separate directional tokens are recommended so an outbound capture cannot authenticate inbound replies.
 
 ---
 
 ## 3. Wire Protocol Specifications
 
-### Outbound Envelope (`POST <OPENRIG_RELAY_URL>` or `GET /api/gateway/relay/outbox`)
+### Outbound Envelope (`POST <OPENRIG_RELAY_URL>`)
 
 ```json
 {
@@ -107,13 +92,6 @@ OPENRIG_RELAY_INBOUND_TOKEN=sec_inbound_token_value
 - `body`: Complete plain text content (including full `summary` overflow, `body`, `humanDetail`, and rendered `humanQuestions` headers, prompts, and option labels/descriptions) sent in a single complete JSON envelope without silent character clipping or self-imposed outbound byte splitting.
 - `replyRef`: Fixed-size opaque base64url token (`<= 4,096` characters for any supported ID lengths — `246`–`266` characters in protocol v1, hashing the canonical frozen `RelayReplyRefPayload` and binding `connectorHash`, `mode`, and optional `digest: true`) for actionable decisions; `null` for informational updates (and `null` at the top level of multi-item digests).
 - `items`: Present when `outcome` is `"digest"`. Array of objects with `qitemId`, `notificationKey`, `summary`, optional `body`, and per-item `replyRef` (or `null`).
-
-### Pull Outbox Endpoints (`GET /api/gateway/relay/outbox` & `POST /api/gateway/relay/outbox/ack`)
-
-Both endpoints require a direct loopback TCP peer (`127.0.0.1/8` or `::1`), reject browser cross-origin headers (`403`), and authenticate the caller via `Authorization: Bearer <OPENRIG_RELAY_INBOUND_TOKEN>` (`401`). If the human registry, `DispatchBuffer` (`pendingStrict()`), or outbound `SeenStore` cannot be read, both return `503` (`human_registry_unavailable`, `dispatch_buffer_unavailable`, `seen_store_unavailable`, `queue_store_unavailable`, or `receipt_write_failed`) rather than returning an empty `deliveries` array.
-
-- **`GET /api/gateway/relay/outbox?limit=<1..200>`** (default `50`): Returns `{ "ok": true, "connectorRef": "<ref>", "deliveries": [ <RelayOutboundEnvelope>, ... ] }` with complete pending envelopes from `DispatchBuffer` belonging to the authenticated `connectorRef` in FIFO buffer order. Strictly read-only (no leases or read receipts).
-- **`POST /api/gateway/relay/outbox/ack`**: Closed JSON object `{ "deliveryId": "<decisionId>" }` accepting any non-empty string `deliveryId` the outbox can list, within the 64 KiB request-body size bound (`413 payload_too_large`); unknown fields or an empty or non-string `deliveryId` return `400 invalid_envelope`. Finishes any remaining `relay-owner-notification-accepted` transition receipts, marks `slack-outbound-seen.jsonl` and `relay-delivered-decisions.jsonl`, releases the in-memory outbound poll guard, and drains `deliveryId` from `DispatchBuffer`. Returns `200 { "ok": true, "deliveryId": "<id>", "connectorRef": "<ref>", "alreadyAccepted": false }` (`"alreadyAccepted": true` on duplicate ack for the same `connectorRef`, or `404 unknown_delivery` if unknown or owned by another connector; duplicate and unknown acks are answered from `relay-delivered-decisions.jsonl` and `relay-attempted-decisions.jsonl`, and the transition receipt scan runs only when those disagree). On any `503` partial failure, a retry with the same `deliveryId` finishes the remaining receipt and drain steps.
 
 ### Inbound Envelope (`POST /api/gateway/relay/inbound`)
 
@@ -194,10 +172,7 @@ rig gateway human set alice binding.0 "relay:local-bridge:file:$HOME/.config/ope
 ```
 
 > [!NOTE]
-> `rig gateway human set alice binding.<n>` accepts either a full binding specification string or `unset` to remove that binding slot:
-> - **One-primary rule:** No replacement primary is chosen silently. If removing a `primary` binding would leave other bindings, the command refuses. To replace the primary in place, set its slot to the new primary spec; to promote an existing secondary binding, first save that binding's full spec (`kind:connectorRef:secretsRef:role[:handle=<id>]`) from `rig gateway human show <entityId> --json`, then unset that secondary slot, then find the primary's current slot in `remainingBindings` (or `rig gateway human show <entityId> --json`, since the primary's slot shifts down when a lower-index secondary is removed) and set it to the saved spec with role `primary` (promotion replaces the former primary binding; its connector reference and inbound handle are not retained as a secondary); to remove every binding, unset the secondary bindings first using their current slot indexes from `remainingBindings` or `rig gateway human show <entityId>`, then finish at `binding.0` (once all secondaries are gone, the primary is at `binding.0`).
-> - **Shifted slot indexes:** Removal returns `remainingBindings` with their new `binding.<n>` slot numbers (the primary's slot shifts down too when a lower-index secondary is removed). Because indexes shift down after removal, do not blindly retry `binding.0 unset`; inspect `remainingBindings`, the operation receipt, or `rig gateway human show <entityId>` before retrying.
-> - **What removal does:** Removing a binding keeps the person, their preferences, their other bindings, and their open questions. Removing the last binding makes the current delivery episode inactive, so new missing-post findings stop (an already-open recovery item for an undelivered notice may remain); the current delivery-outcome display may disappear too, while historical receipt notes remain. It does not answer, close, or cancel open questions, cancel or reroute already-prepared deliveries, or retract anything a bridge has already accepted. A person with no binding needs a daemon from the release that accepts one (v0.7.9+); do not roll back past it while any fragment has `connectorBindings: []`.
+> `rig gateway human set alice binding.<n>` requires a full binding specification string. Supplying `unset` is not supported for binding slots. To reassign a participant, overwrite the slot with a full binding string or remove and re-add the human fragment.
 
 Operator notices use the existing default person. If several people are registered, choose the recipient explicitly when needed:
 
@@ -228,11 +203,7 @@ rig daemon status
 In `rig gateway human show <entityId> --json`, `deliveryReadiness.state` reports `ready` when the binding configuration and local secrets file are valid. This confirms local readiness, not whether the operator bridge process is currently running.
 
 ### Step 5: Removing Bindings or Participants
-To remove a connector binding while keeping the participant, their preferences, their other bindings, and their open questions, unset the binding slot:
-```bash
-rig gateway human set alice binding.0 unset --reason "retire relay bridge"
-```
-Before removing a participant altogether, ensure any pending queue items and conversations assigned to them are resolved:
+Before removing a participant, ensure any pending queue items and conversations assigned to them are resolved.
 ```bash
 rig gateway human remove alice
 ```

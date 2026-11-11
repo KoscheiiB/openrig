@@ -292,7 +292,7 @@ describe("custody of asks held for quiet hours", () => {
     expect(findingFor(await sweep(), row)).toEqual([]);
   });
 
-  it("an attempted ask whose quiet hours can't be read at its replay posts, saying so: it's neither held nor orphaned", async () => {
+  it("an attempted ask kept in flight because quiet hours couldn't be read is neither held nor orphaned: it is ordinary in-flight work", async () => {
     const row = await ask();
     const w = wire();
     failPosts = true; // attempted, nothing reached Slack
@@ -304,14 +304,13 @@ describe("custody of asks held for quiet hours", () => {
     w.stop();
     const read = vi.spyOn(HumanQuietStore.prototype, "quietStateFor").mockImplementation(() => { throw new Error("disk I/O error (test)"); });
     try {
-      wire(); // the replay: unreadable quiet hours aren't a quiet window, so it posts and says so
+      wire(); // the replay can't decide, so the attempted decision stays buffered with no hold
       await settle();
     } finally { read.mockRestore(); }
-    expect(posts).toHaveLength(1);
-    expect(String(posts[0]!.text)).toContain("OpenRig couldn't read your quiet hours.");
+    expect(posts).toHaveLength(0);
     expect(repo.listTransitions(row.qitemId).some((t) => (t.transitionNote ?? "").startsWith("delivery-decision: quiet-hold "))).toBe(false);
     expect(quietHoldCustody(db, row.qitemId)).toBeNull();
-    expect(repo.waitingView(row.qitemId)!.nextBackstop).toMatchObject({ mechanism: "none (posted to the human; awaiting their decision)" });
+    expect(String((repo.waitingView(row.qitemId)!.nextBackstop as { note?: string }).note ?? "")).not.toMatch(/quiet hours/);
   });
 
   // A failed wake on the row, so the sweep's undelivered-wake loop sees it.

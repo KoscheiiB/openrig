@@ -12,7 +12,6 @@ export interface NodeBinding extends Binding {
   cwd: string;
   /** In-place Claude continuation only: executable observed before the old process exits. */
   claudeExecutable?: string;
-  claudeLaunch?: import("./claude-continuation-launch.js").ClaudeContinuationLaunch;
   model?: string;
   effort?: string;
   /** Claude-only, session-scoped Advisor model. */

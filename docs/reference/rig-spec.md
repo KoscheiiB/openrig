@@ -587,13 +587,9 @@ rig provider switch --seat pi-worker@my-rig --to-account work \
 rig provider switch --seat pi-worker@my-rig --clear-account-home --reason "Return to configured login"
 ```
 
-When switching into Pi with `--clear-account-home`, OpenRig restores the seat's original Pi login only if no effective member or rig Pi account home is configured. A member's `PI_CODING_AGENT_DIR` shadows the rig's value; if the member value is relative, it is ignored and the rig home does not take effect.
-
 Pi account changes work with or without `launch_wrapper`. The wrapper receives the successor's managed Pi directory;
-it must preserve the selected credentials if you want OpenRig's account choice to apply.
-Use `rig seat set-runtime <seat> --runtime <runtime> --reason "Change provider"` with `pi`, `codex` or `claude-code` for cross-runtime switches.
-Those resolve the target's settings afresh rather than keeping the source model or effort;
-see [runtime switching](getting-started.md#move-a-seat-to-the-other-runtime).
+it must preserve the selected credentials if you want OpenRig's account choice to apply. Switching a seat between Pi
+and another runtime is not supported by this account-home feature.
 
 This switch starts a fresh conversation with a handover, even when the runtime stays the same. The existing
 subscription-login switch preserves the conversation. Once the successor confirms, OpenRig commits its home, runtime,
@@ -695,7 +691,7 @@ first turn. Check `/status` after a real tool turn to confirm the authentication
 
 For Codex, a saved native API-key login is selected with the existing `--to-account <name>`
 path, exactly like a saved subscription login. Prepare it using native `codex login --with-api-key`
-with the key on stdin, then `CODEX_HOME=<home> rig auth save <name>`; never put a key in argv.
+with the key on stdin, then `rig auth save --codex-home <home> <name>`; never put a key in argv.
 Use the seat's existing home. Preparing a login replaces that home's active credentials, so do it
 before running seats there, or prepare/import a native auth profile separately. Switches preserve
 an outgoing credential copy and report peers sharing the home. A native keyring or administrator
@@ -783,7 +779,7 @@ directory's `CLAUDE.md`, including blocks written by other rigs.
 | `effort` | string | no | — | Reasoning effort override, trimmed. Claude gets `--effort`, Codex `-c model_reasoning_effort=…`, Pi `--thinking` (see "Pi" below). A non-string value is ignored with an advisory. |
 | `advisor` | string | no | — | Claude-only Advisor model for this seat. Overrides the AgentSpec profile/default; blank or non-string values are ignored with an advisory. |
 | `claude_mcp` | `none` | no | normal loading | Claude members only. Disable MCP server loading for this agent on every launch and resume. Omit the field to keep Claude's normal configuration; see [Claude MCP loading](#claude-mcp-loading-runtime-claude-code). |
-| `launch_wrapper` | string[] | no | — | Local `pi`, `codex`, `claude-code` and community-harness members; runner presets must declare wrapper support. Literal argument prefix applied to the native executable and its arguments on fresh launch, relaunch, rebuild, resume, fork, restore and handover; `[]` explicitly clears a stored wrapper when re-applying an authored spec, while omitting the key leaves an existing seat's stored choice unchanged. See [Launch wrapper](#launch-wrapper-runtime-pi-and-codex). |
+| `launch_wrapper` | string[] | no | — | Local built-in `pi`, `codex` and `claude-code` members only. Literal argument prefix applied to the native executable and its arguments on fresh launch, relaunch, rebuild, resume, fork, restore and handover; `[]` explicitly clears a stored wrapper when re-applying an authored spec, while omitting the key leaves an existing seat's stored choice unchanged. See [Launch wrapper](#launch-wrapper-runtime-pi-and-codex). |
 | `permission_policy` | string | no | — | Member-level permission policy; overrides the rig's. Not valid on terminal members. |
 | `env` | map | no | — | Launch environment for this seat, laid over the rig's `env`. Same rules as the rig-level field. Valid on terminal members too. See "Launch environment" below. |
 | `agent_file` | string | no | — | Claude members only. A Claude agent definition (a `.md` file with `name` in its frontmatter) for this seat. It's copied into the seat's own storage and launched as `--agent openrig:<name>`. A path beside the spec: no `..`, not absolute. |
@@ -921,11 +917,9 @@ This requires a Claude Code version that supports `--advisor`. OpenRig never wri
 choose different Advisors. When Advisor is unset, no flag is emitted and Claude's
 own defaults/settings apply. Other runtimes ignore this field.
 
-<a id="launch-wrapper-runtime-pi-and-codex"></a>
+### Launch wrapper (`runtime: pi` and `codex`)
 
-### Launch wrapper (`runtime: pi`, `codex` and `claude-code`)
-
-Set `launch_wrapper` on a local `pi`, `codex`, `claude-code` or community-harness member to prefix its native executable and arguments with a literal argv vector:
+Set `launch_wrapper` on a local built-in `pi`, `codex` or `claude-code` member to prefix its native executable and arguments with a literal argv vector:
 
 ```yaml
 members:
@@ -937,7 +931,7 @@ members:
     launch_wrapper: ["launcher", "exec", "--profile", "seat-a", "--"]
 ```
 
-- **Scope and literal argv:** Local `pi`, `codex`, `claude-code` and supported community-harness members support `launch_wrapper`; legacy flat nodes support it only on `pi`, `codex` and `claude-code`. Other runtimes, including the maintained `openshell-claude` environment path, reject it, including `[]`. Community preset capability and execution requirements are defined in the [runner contract](harness-runner-contract.md#2-declare-it-what-the-preset-says-fixed-at-launch). Each fork uses its target member's own selection. Arguments are literal strings without NUL, CR or LF; spaces, quotes, metacharacters and empty non-executable arguments are preserved.
+- **Scope and literal argv:** Local built-in `pi`, `codex` and `claude-code` members, including legacy flat nodes, support `launch_wrapper`; other runtimes reject it, including `[]`. Each fork uses its target member's own selection. Arguments are literal strings without NUL, CR or LF; spaces, quotes, metacharacters and empty non-executable arguments are preserved.
 - **Executable resolution:** `launch_wrapper[0]` must be an absolute path or bare command name. Preflight and launch resolve it using the daemon's launch `PATH` and working directory, before adding the seat's `rig` bin directory. Relative paths containing `/`, aliases and functions are unsupported for the wrapper itself.
 - **Native child and `exec` contract:** The wrapper prefixes the resolved Codex entry, prefixes the resolved Pi child executable inside the host runner, or prefixes the real Claude executable and native arguments. Managed Claude applies it after rebuilding the environment; pinned continuations retain their executable. The wrapper must `exec` its child in place, preserving working directory, environment, signals, exit status and TTY stdio (Claude/Codex) or RPC pipes (Pi). Supervising wrappers are unsupported.
 - **Classic Claude lookup:** Wrapped classic launch supports bash, zsh, sh and dash and requires `command -v claude` to resolve to an executable file; aliases and functions refuse with `launch_wrapper unavailable; no agent started.` To keep custom flags or environment, put them in a `#!` script named `claude` on `PATH`; the wrapper runs that script ([#1477](https://github.com/mvschwarz/openrig/issues/1477)).
@@ -1021,7 +1015,7 @@ This is human-authored (you choose the pod/member IDs) and system-validated (the
 | `spawned_by` | Source was spawned by target; the target launches first. Constrains launch order. | Child → parent in hierarchical topologies |
 | `can_observe` | Source can observe target's output. Does NOT constrain launch order. | Reviewer → implementer, monitor → worker |
 | `collaborates_with` | Peer collaboration relationship. Does NOT constrain launch order. | Co-equal peers working together |
-| `escalates_to` | Fallback queue escalation for a seat without a single declared delegation parent (none, or several). Does NOT constrain launch order. | Local member or same-daemon `pod-member@rig` address |
+| `escalates_to` | Fallback queue escalation for a seat without a declared delegation parent. Does NOT constrain launch order. | Local member or same-daemon `pod-member@rig` address |
 
 A named `escalates_to` target may be in another rig on the same daemon and need not exist at import time.
 See [fallback escalation across rigs](edge-types.md#fallback-escalation-across-rigs) for precedence, single-hop delivery,
@@ -1364,7 +1358,7 @@ spec can pass `rig spec validate` and then fail at preflight or import. Run
 24. Startup action `idempotent` is a required boolean.
 25. Non-idempotent actions must not include `restore` in `applies_on`.
 26. `applies_on` values must be from: `fresh_start`, `restore`.
-27. `launch_wrapper` is valid on `pi`, `codex`, `claude-code` and supported community-harness members (`[]` included); see the [runner contract](harness-runner-contract.md#2-declare-it-what-the-preset-says-fixed-at-launch) for community capability requirements. It must be an array of strings without NUL/CR/LF, and `launch_wrapper[0]` (when non-empty) must be an absolute path or a bare command name on the daemon `PATH`.
+27. `launch_wrapper` is valid only on `pi`, `codex` and `claude-code` members (`[]` included); it must be an array of strings without NUL/CR/LF, and `launch_wrapper[0]` (when non-empty) must be an absolute path or a bare command name on the daemon `PATH`.
 
 ---
 

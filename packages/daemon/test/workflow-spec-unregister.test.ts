@@ -85,8 +85,7 @@ describe("POST /api/workflow/specs/unregister (#2635)", () => {
   const register = (dir: string, file: string, id: string, version: string) => {
     const path = join(dir, file);
     writeFileSync(path, spec(id, version));
-    // Register the way instantiate and the folder scan do; validate is read-only since #2726.
-    runtime.specCache.readThrough(path);
+    runtime.validate(path);
     return path;
   };
   const unregister = async (body: Record<string, unknown>) => {

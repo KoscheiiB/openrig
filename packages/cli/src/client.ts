@@ -437,9 +437,9 @@ export class DaemonClient {
     // DaemonResponseError carrying the status + a bounded snippet, instead of a
     // raw SyntaxError bubbling to a cryptic (json) or silent (human) CLI exit.
     // A well-formed non-2xx body still parses and returns {status,data}; 204 has none.
-    if (res.status === 204) return { status: res.status, data: undefined as T, headers: res.headers };
+    if (res.status === 204) return { status: res.status, data: undefined as T };
     try {
-      return { status: res.status, data: JSON.parse(text) as T, headers: res.headers };
+      return { status: res.status, data: JSON.parse(text) as T };
     } catch {
       throw new DaemonResponseError(res.status, text);
     }

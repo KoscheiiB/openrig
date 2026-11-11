@@ -10,15 +10,6 @@ const execFileAsync = promisify(execFile);
 export const TMUX_MAX_BUFFER = 64 * 1024 * 1024;
 export const TMUX_EXEC_TIMEOUT_MS = 30_000;
 
-// The first client seeds tmux's global environment. Seat credentials still arrive through
-// the explicit per-session config channel, never through the daemon's ambient credentials.
-function tmuxClientEnvironment(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const key of ["OPENRIG_ACTIVITY_HOOK_TOKEN", "RIGGED_ACTIVITY_HOOK_TOKEN", "OPENRIG_AUTH_BEARER_TOKEN",
-    "OPENRIG_TERMINAL_BEARER_TOKEN", "OPENRIG_RELAY_INBOUND_TOKEN", "OPENRIG_RELAY_OUTBOUND_TOKEN"]) delete env[key];
-  return env;
-}
-
 const tmuxExecOptions = { windowsHide: true, maxBuffer: TMUX_MAX_BUFFER, timeout: TMUX_EXEC_TIMEOUT_MS, killSignal: "SIGKILL" as const };
 
 function warnTmuxDeadline(err: unknown, started: number, argv: string[]): void {
@@ -93,7 +84,7 @@ function withExecOutput(err: unknown): unknown {
  */
 export const execCommand: ExecFn = async (cmd: string): Promise<string> => {
   try {
-    const { stdout } = await execAsync(cmd, { env: /^tmux(?:\s|$)/.test(cmd) ? tmuxClientEnvironment() : process.env });
+    const { stdout } = await execAsync(cmd);
     return stdout;
   } catch (err) {
     throw withExecOutput(err);
@@ -104,7 +95,7 @@ export const execCommand: ExecFn = async (cmd: string): Promise<string> => {
 export const execTmuxCommand: ExecFn = async (cmd: string): Promise<string> => {
   const started = performance.now();
   try {
-    return (await execFileAsync("/bin/sh", ["-c", /^tmux\s/.test(cmd) ? `exec ${cmd}` : cmd], { ...tmuxExecOptions, env: tmuxClientEnvironment() })).stdout;
+    return (await execFileAsync("/bin/sh", ["-c", /^tmux\s/.test(cmd) ? `exec ${cmd}` : cmd], tmuxExecOptions)).stdout;
   } catch (err) {
     // Tokens are diagnostic labels only; the command is executed by the shell without rewriting its arguments.
     const labels = (cmd.match(/'[^']*'|"[^"]*"|\S+/g) ?? []).map(word => word.replace(/^(['"])(.*)\1$/, "$2"));
@@ -126,7 +117,7 @@ export const execArgvCommand: ArgvExecFn = async (argv: string[]): Promise<strin
   const started = performance.now();
   // Nothing ran when no file was found: a shell also finds tmux through an entry the lookup skips, such as a literal
   // `~/bin`, and reports a missing one as the shell transport does.
-  const opts = { ...tmuxExecOptions, env: tmuxClientEnvironment() };
+  const opts = tmuxExecOptions;
   const run = (file: string | null) => file ? execFileAsync(file, args, opts) : execFileAsync("/bin/sh", ["-c", 'exec "$0" "$@"', bin, ...args], opts);
   try {
     if (process.platform === "win32") return (await execFileAsync(bin, args, opts)).stdout;
@@ -152,7 +143,7 @@ export const execArgvCommand: ArgvExecFn = async (argv: string[]): Promise<strin
  * and rejects with the spawn error when even the shell could not start. POSIX only, as control mode is.
  */
 export async function spawnTmuxClient(args: string[]): Promise<ChildProcessWithoutNullStreams> {
-  const opts = { stdio: "pipe" as const, windowsHide: true, env: tmuxClientEnvironment() };
+  const opts = { stdio: "pipe" as const, windowsHide: true };
   const started = (file: string | null) => new Promise<ChildProcessWithoutNullStreams>((resolve, reject) => {
     const child = file ? spawn(file, args, opts) : spawn("/bin/sh", ["-c", 'exec "$0" "$@"', "tmux", ...args], opts);
     child.once("error", reject);

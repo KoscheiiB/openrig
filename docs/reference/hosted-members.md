@@ -86,14 +86,8 @@ entry. The entry holds secret names, never values:
 These facts stay separate on the row:
 - **Wake:** with a trigger, the row's wake result is `wake-accepted:webhook (<url_ref>) answered <status>` when the trigger took the
   ring, or `failed:webhook …`. Accepted means the tool's trigger answered, not that the member read the row.
-  - With no trigger, the result is `unroutable`. The member finds work by reading its own inbox and picks a row up by claiming
-    it, so a row gets no finding of its own. Work it leaves unclaimed past the stuck sweep's unclaimed age
-    (`queue.stuck_sweep_unclaimed_age_minutes`, 60 by default) is listed in one standing notice per member. The notice goes to
-    the operator seat when it's a person, else the rows' creator when they all share one, else the operator agent, else the
-    member itself. A notice to a creator lists only that creator's rows: when another creator's row joins, the notice moves to
-    the next recipient. It says whether the member has read its own pending inbox recently: a check-in, never a receipt or a
-    claim. A member with a declared route (a delegation parent or `escalates_to`) gets one finding per unclaimed row at that
-    route instead.
+  - With no trigger, the result is `unroutable`, and OpenRig tells the person: the operator seat when it's a person, else whoever
+    created the row.
   - It tells the person too when the member was rung but hasn't claimed the work by the stuck sweep's unclaimed age
     (`queue.stuck_sweep_unclaimed_age_minutes`, 60 by default).
   - The member sees new work when it checks: when it's rung, when its person asks it to, or on a schedule the tool runs.
@@ -101,7 +95,7 @@ These facts stay separate on the row:
 - **Result:** the closing transition and its resolution, or the handoff.
 - **Notification:** where a person asked, Slack's posted receipt. A posted notice isn't the person's acknowledgment.
 
-**On the team:** `rig_team` lists the rig's hosted members (roster entries marked hosted that aren't one of its nodes), with their capabilities and caveat, no pane, and activity `unknown`. With an external grant offering `team/list`, call it without `rigId` to discover the connected team. It selects the grant's sole rig, or returns only its granted names when a choice is needed.
+**On the team:** `rig_team` lists the rig's hosted members (roster entries marked hosted that aren't one of its nodes), with their capabilities and caveat, no pane, and activity `unknown`.
 OpenRig doesn't observe a hosted member between its calls, so it never reads idle. `rig roster find` shows it the same way.
 - **Presence:** each entry carries `presence`, which says what OpenRig last saw of the member. It isn't pickup, and `null` means unknown:
   - `lastCallAt`: its last authenticated call to this host's `rig mcp serve --http`, recorded at most once a minute in
@@ -135,10 +129,6 @@ and nothing else is offered:
   - It reads the items it sent and the items addressed to it from those seats, never the team's internal items.
   - With `queue`/`claim` and `queue`/`update`, it claims and closes only items addressed to its own seat that it can read,
     and waits (blocked) only on an item it names and can read. Its answers hide what reading the item hides.
-- **A first task without a seat address:** with `--task-destination <member@rig>` on the same `rig mcp serve`, a
-  `rig_queue_create` that leaves out `destination` goes to that receiver. The operator sets it; a caller can't. It must be
-  exactly one existing local node within that request's grant, or nothing is written. An explicit `destination` works as
-  before.
 - **Two assistants together:** a grant with `team`/`list` sees its rigs' seats with `rig_team`, and may address and hear from
   another connected assistant's seat. A grant without it never reaches a seat in the service's caller form
   (`cus-<id>-<connection>@<rig>`), so an existing connection keeps the reach it had.
@@ -147,8 +137,8 @@ and nothing else is offered:
   - **Queued:** the item exists and is `pending` with no claim.
   - **Picked up:** the receiver's claim (`in-progress`).
   - **Answered:** closed `done`, with the answer in `resolution`.
-  - Reading or listing an item records nothing on the item, and nothing wakes an assistant, so an item stays queued until its
-    receiver claims it. A member listing its own pending inbox records only a check-in time, which the notice above reads.
+  - Reading or listing an item records nothing, and nothing wakes an assistant, so an item stays queued until its receiver
+    claims it.
 
 ### A person answering the team's questions through their assistant
 
@@ -158,8 +148,7 @@ pair, the person's assistant can read the team's questions waiting on them and s
 Steering. The caller's seat is never taken for a person: without `person`, the `question` pair offers nothing, and an
 unusable `person` withholds only these two tools while the grant's other tools keep working.
 
-- **Register the person** on the instance, once:
-  `rig gateway human add <entity_id> --display-name "<name>" --delivery-class B --default`.
+- **Register the person** on the instance, once: `rig gateway human add <entity_id> --display-name "<name>" --default`.
   Without `--binding`, they're asked in the Feed and on Steering only. As the default person, today's asks addressed to no
   registered person (such as `human@host`) are theirs too.
 - **`rig_question_list`** shows what Steering shows that person as answerable: an ask addressed to them, or a row parked on
@@ -190,6 +179,5 @@ unusable `person` withholds only these two tools while the grant's other tools k
 ## Limits today
 
 - **Webhook triggers only:** OpenRig rings a webhook. Email and other triggers aren't supported yet. A member without a trigger
-  isn't rung; work it leaves unclaimed past the unclaimed age is listed in one notice instead, which goes to its person, else
-  its rows' shared creator, the operator agent or the member itself.
+  isn't rung, and its person is told instead.
 - **It can't act as a person:** it works rows addressed to its seat, a person's request to it included. It can't settle an ask addressed to a person, or hand work to one, except through a grant service's grant that names its person, which records that person's own answers (above).

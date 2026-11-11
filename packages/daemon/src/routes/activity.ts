@@ -1,5 +1,5 @@
 import { runtimeSwitchActivityRole } from "./runtime-switch-custody.js";
-import { AGENT_RUNNER_HOSTED_PI_RPC, SessionRegistry, physicalSessionName, recordedRunner, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
+import { SessionRegistry, physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -18,8 +18,7 @@ import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
 import { nodeExecutorConfirmedStopped } from "../domain/node-inventory.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
-import { validateResumeToken, validateSessionFileFormat } from "../domain/resume-token-validation.js";
-import { loadCommunityHarnessPreset } from "../domain/community-harness-presets.js";
+import { validateResumeToken } from "../domain/resume-token-validation.js";
 import { claudeHookFromLaunchedProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { transportSenderSession } from "./require-sender-identity.js";
 import {
@@ -97,7 +96,7 @@ export function restoredRunnerHookEvidence(
   if (!latest || latest.evidenceSource !== "runtime_hook" || latest.generationProvenance !== "resolved") return null;
   const state = !latest.stale ? latest.state
     : latest.reason === "stale_runtime_hook"
-      ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime, latest.communityRunner === true, latest.piRpc === true) : "unknown";
+      ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime, latest.communityRunner === true) : "unknown";
   // A working beat keeps the lifetime it was admitted with, as when it was posted.
   return evidenceFromHookActivity({ seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime,
     ...(isWorkingLivenessBeat(latest.rawEvent, latest.rawSubtype)
@@ -416,36 +415,11 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
       return c.json({ ok: true, sessionId, provenance: "rpc", tokenPersisted });
     }
 
-/** The seat speaks Pi's RPC protocol through OpenRig's hosted runner: its launch recorded the protocol (agent_runner 2),
- *  or, only while no launch record exists (an identity post can arrive first), its installed preset declares
- *  `protocol: pi-rpc`. Any other recorded value never qualifies: a plain launch (0) or a preset's own runner (`runner: true`,
- *  1) keeps its own identity path, so a later preset edit can't move a launched seat onto this one. */
-function isPiRpcHarness(db: import("better-sqlite3").Database, sessionId: string, runtime: string): boolean {
-  if (runtime === "pi" || runtime === "omp" || runtime === "claude-code" || runtime === "codex" || runtime === "terminal") {
-    return false;
-  }
-  if (sessionCommunityRunnerSelect(db) !== "NULL") {
-    const row = db.prepare(`SELECT ${sessionCommunityRunnerSelect(db, "s")} AS runner FROM sessions s WHERE s.id = ?`).get(sessionId) as { runner?: number | null } | undefined;
-    if (row?.runner !== null && row?.runner !== undefined) return row.runner === AGENT_RUNNER_HOSTED_PI_RPC;
-  }
-  const found = loadCommunityHarnessPreset(runtime);
-  return found.ok && found.preset.protocol === "pi-rpc";
-}
-
     // OPR.0.4.6.PI1 FR-5 — Pi session identity arrives from the pi-runner's
     // RPC get_state (provenance "rpc" on the bus, never scrape). The resume
     // TOKEN for Pi is the session FILE (body.sessionFile), not the session id;
     // it is format-validated before the persist and never echoed on failure.
-    // Pi-RPC community harnesses share this protocol, but persist community:<name>.
-    const isPi = runtime === "pi" && resolved.runtime === "pi";
-    const isCommunityPi = !isPi && (resolved.runtime !== null && resolved.runtime !== "omp" && isPiRpcHarness(store.db, resolved.sessionId, resolved.runtime));
-    // A current generation isn't a runtime binding: a process started inside the seat (a Pi helper, say) carries the
-    // seat's generation. Only the seat's own runtime reports its identity; any other keeps the saved token and publishes
-    // nothing for the seat, as OMP's runtime check does above.
-    if (isCommunityPi && runtime !== resolved.runtime) {
-      return c.json({ ok: true, ignored: "runtime_mismatch", tokenPersisted: false });
-    }
-    if (isPi || isCommunityPi) {
+    if (runtime === "pi") {
       // A delayed get_state from a retired runner must not replace the successor's
       // resume token or publish a current identity. Keep resolution, this check
       // and both effects synchronous so renewal cannot interleave at an await.
@@ -460,27 +434,26 @@ function isPiRpcHarness(db: import("better-sqlite3").Database, sessionId: string
       } catch {
         return c.json({
           ok: false, code: "generation_resolver_error", tokenPersisted: false,
-          error: `${isPi ? "Pi" : resolved.runtime} session identity ignored: occupant generation is unavailable.`,
+          error: "Pi session identity ignored: occupant generation is unavailable.",
         }, 503);
       }
       if (reason) {
         return c.json({
           ok: false, code: reason, tokenPersisted: false,
-          error: `${isPi ? "Pi" : resolved.runtime} session identity ignored: emitter is not the registered current occupant.`,
+          error: "Pi session identity ignored: emitter is not the registered current occupant.",
         }, 409);
       }
       const sessionFile = stringOrNull(body.sessionFile);
-      const validation = isPi ? validateResumeToken("pi", sessionFile) : validateSessionFileFormat(sessionFile, resolved.runtime ?? "community");
-      const resumeType = isPi ? "pi_session_file" : `community:${resolved.runtime}`;
+      const validation = validateResumeToken("pi", sessionFile);
       if (validation.ok) {
-        sessionRegistry.updateResumeToken(resolved.sessionId, resumeType, validation.token, "hook");
+        sessionRegistry.updateResumeToken(resolved.sessionId, "pi_session_file", validation.token, "hook");
       }
       eventBus.emit({
         type: "agent.session_identity",
         rigId: resolved.rigId,
         nodeId: resolved.nodeId,
         sessionName: resolved.sessionName,
-        runtime: resolved.runtime ?? "pi",
+        runtime: "pi",
         sessionId,
         provenance: "rpc",
       });
@@ -525,30 +498,26 @@ function isPiRpcHarness(db: import("better-sqlite3").Database, sessionId: string
       const still = bindToGrant(c, store, grant, body);
       if ("refused" in still) return still.refused;
     }
-    // #1524 (a) for Codex, #2768 for Claude, synchronous with the write below (no await between them): a known earlier
-    // occupant's hook (its generation is registered for this node and isn't the current one) neither writes nor
-    // publishes. An absent or unregistered generation, no current tenure, or an unreadable ledger keep today's write.
-    // A no-launch adoption (reconcile, bind, self-attach) registers the live process again without replacing it, so
-    // an occupant followed only by adoptions is still current; a launch after it is what makes it earlier.
-    if (runtime === "codex" || runtime === "claude-code") {
+    // #1524 (a), Codex only, synchronous with the write below (no await between them):
+    // - a known earlier occupant's hook (its generation is registered for this node and isn't the current one)
+    //   neither writes nor publishes. An absent or unregistered generation, no current tenure, or an unreadable
+    //   ledger keep today's write.
+    // - Codex sends an explicit transcript_path null for a thread it never persists (an internal thread), and also
+    //   when it can't read a persisted conversation's rollout. Either way the saved pointer is kept, so an internal
+    //   thread can't replace it. An absent key, an empty string or a malformed value keep today's write.
+    if (runtime === "codex") {
       let generationMismatch = false;
       try {
         const current = sessionRegistry.currentOccupantTenure(resolved.nodeId);
         generationMismatch = !!generation && !!current && current.generationUuid !== generation
-          && sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation)
-          && !sessionRegistry.isOccupantContinuedByAdoption(resolved.nodeId, generation);
+          && sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation);
       } catch { /* an unreadable ledger is no evidence of a mismatch */ }
       if (generationMismatch) {
         return c.json({
           ok: false, code: "generation_mismatch", tokenPersisted: false,
-          error: `${runtime === "codex" ? "Codex" : "Claude"} session identity ignored: emitter is an earlier occupant of this seat.`,
+          error: "Codex session identity ignored: emitter is an earlier occupant of this seat.",
         }, 409);
       }
-    }
-    // Codex sends an explicit transcript_path null for a thread it never persists (an internal thread), and also when it
-    // can't read a persisted conversation's rollout. Either way the saved pointer is kept, so an internal thread can't
-    // replace it. An absent key, an empty string or a malformed value keep today's write.
-    if (runtime === "codex") {
       if (body.transcriptPathPresent === true && body.transcriptPath === null) {
         return c.json({
           ok: true, sessionId, provenance: "hook", tokenPersisted: false, code: "transcript_absent",
@@ -767,7 +736,7 @@ function recordHookActivity(c: Context, store: AgentActivityStore, body: Record<
       oracle.declareRungInventory(
         { seatNodeId: emitted.nodeId, sessionName: emitted.sessionName },
         // The same recorded launch facts the reconcile pass reads, so a community seat's first hook gets its own inventory.
-        runtimeRungInventory(runtime, currentSession?.community_harness ?? null, recordedRunner(currentSession?.community_runner)),
+        runtimeRungInventory(runtime, currentSession?.community_harness ?? null, currentSession?.community_runner === 1),
       );
     }
     if (beat) {
@@ -977,7 +946,7 @@ activityRoutes.get("/parked", (c) => {
     | undefined;
   const queueRepo = c.get("queueRepo" as never) as
     | {
-        listOpenObligations: (destinationSession: string, limit: number) => Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; summary: string | null }>;
+        list: (opts: { destinationSession?: string; state?: string[]; limit?: number }) => Array<{ qitemId: string; state: string; summary?: string | null }>;
         getParkWakeStatus: (qitemId: string) => import("../domain/queue-wake-repository.js").ParkWakeStatus | null;
         parkWakeServedByOwnReminder?: (qitemId: string) => boolean;
       }
@@ -994,10 +963,10 @@ activityRoutes.get("/parked", (c) => {
   const { diagnoseSeatParked, diagnoseRigParked, PARKED_OBLIGATION_LIMIT } = parkedQuery;
   const deps = {
     getSeatState: (id: string) => nodeExecutorConfirmedStopped(rigRepo.db, id) ? null : oracle.getSeatState(id),
-    // The obligation face only: the same rows, order and limit as a full list() of this destination's open states,
-    // without the per-row projections (pickup, waiting view, delivery ledger) the diagnosis never reads.
     listOpenObligations: (destination: string, limit: number) => ({
-      rows: queueRepo.listOpenObligations(destination, limit),
+      rows: queueRepo
+        .list({ destinationSession: destination, state: ["pending", "in-progress", "blocked"], limit })
+        .map((r) => ({ qitemId: r.qitemId, state: r.state as "pending" | "in-progress" | "blocked", summary: r.summary ?? null })),
       limit,
     }),
     getParkWake: (qitemId: string) => queueRepo.getParkWakeStatus(qitemId),

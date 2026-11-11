@@ -305,18 +305,6 @@ function projectForExternal<T>(row: T, view: ExternalView): T {
   return fields as T;
 }
 
-/** A handed-on item as a scoped caller receives it: without the daemon's own successor fields (successors,
- *  successorsTruncated, successorNote), which name rows and remote ids regardless of this caller's scope. Its answer is
- *  show's scope-checked successor (successorOf). */
-function withoutDaemonSuccessors<T>(row: T): T {
-  if (!row || typeof row !== "object" || Array.isArray(row)) return row;
-  const fields = { ...(row as Record<string, unknown>) };
-  delete fields.successors;
-  delete fields.successorsTruncated;
-  delete fields.successorNote;
-  return fields as T;
-}
-
 /** What an authenticated non-owner caller may reach: its own seat, its rigs' seats, the items they send or own (to read),
  *  the items they own (to change), and its shared roots. A person (<entityId>@external) is never in a non-owner's scope. */
 function scopeFor(access: McpAccess, seatOf: () => string | undefined): Scope {
@@ -401,18 +389,6 @@ function externalScope(access: McpAccess, seatOf: () => string | undefined): Sco
     shows: caller,
     names: (seat) => caller(seat) || team(seat),
   };
-}
-
-/** The daemon's root_unknown names every shared root it has. A scoped caller learns only the ones it may read: the
- *  daemon's roots its grant names, or none when that list can't be read. Every other answer passes as it is. */
-function scopedRootUnknown(res: DaemonResponse<unknown>, scope: Scope): DaemonResponse<unknown> {
-  const data = (res.data ?? {}) as Record<string, unknown>;
-  if (data.error !== "root_unknown") return res;
-  const roots = Array.isArray(data.configuredRoots)
-    ? data.configuredRoots.filter((name): name is string => typeof name === "string" && scope.root(name)) : [];
-  const named = typeof data.rootName === "string" ? ` '${data.rootName}'` : "";
-  return { status: res.status, data: { error: "root_unknown", ...(named ? { rootName: data.rootName } : {}), configuredRoots: roots,
-    message: `Shared root${named} is not configured on this daemon. Shared roots this connection may read: ${roots.join(", ") || "(none)"}.` } };
 }
 
 /** A target outside an authenticated caller's scope. It names the kind of target only, never the record. */
@@ -633,9 +609,8 @@ const EXTERNAL_INBOX_INSTRUCTIONS = [...SHARED_INSTRUCTIONS,
 function instructionsFor(access: McpAccess | undefined, frontDoor = false): string {
   if (!access?.external) return frontDoor ? FRONT_DOOR_INSTRUCTIONS : INSTRUCTIONS;
   const tools = externalTools(access.external);
-  const instructions = tools.has("rig_queue_claim") && tools.has("rig_queue_update") ? EXTERNAL_INBOX_INSTRUCTIONS
-    : tools.has("rig_question_list") || tools.has("rig_question_answer") ? EXTERNAL_PERSON_INSTRUCTIONS : EXTERNAL_INSTRUCTIONS;
-  return tools.has("rig_team") ? `Discover the team this grant connects you to by calling rig_team without rigId. A sole granted rig is selected automatically; with several, it returns the granted names to choose from.\n${instructions}` : instructions;
+  if (tools.has("rig_queue_claim") && tools.has("rig_queue_update")) return EXTERNAL_INBOX_INSTRUCTIONS;
+  return tools.has("rig_question_list") || tools.has("rig_question_answer") ? EXTERNAL_PERSON_INSTRUCTIONS : EXTERNAL_INSTRUCTIONS;
 }
 
 /** A configured default must identify exactly one existing local node. No topology relationship, name convention
@@ -1445,10 +1420,9 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
         const view = externalView(scope);
         let successor = handedOn ? await successorOf(client, qitemId, row.closureTarget, view ? scope!.item : undefined) : undefined;
         if (scope && !view && successor && "destinationSession" in successor && !scope.successor(successor.destinationSession)) successor = { unknown: true, code: "out_of_scope" };
-        const shownItem = scope ? withoutDaemonSuccessors(item.data) : item.data;
         const data = view
-          ? { item: projectForExternal(shownItem, view), transitions: Array.isArray(transitions.data) ? transitions.data.map((t) => projectForExternal(t, view)) : transitions.data }
-          : { item: shownItem, transitions: transitions.data };
+          ? { item: projectForExternal(item.data, view), transitions: Array.isArray(transitions.data) ? transitions.data.map((t) => projectForExternal(t, view)) : transitions.data }
+          : { item: item.data, transitions: transitions.data };
         return mapResult({ status: 200, data: { ...data, ...(handedOn ? { successor } : {}) } }, undefined, { structured: true });
       } catch (err) {
         return caught(err);
@@ -1705,33 +1679,18 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
   if (offered("rig_team")) server.registerTool(
     "rig_team",
     {
-      description: "Show a rig's team. For an external grant, omit rigId to use its sole rig or see its granted names to choose from. The answer includes its lead, the rig's one delegates_to root (the seat that delegates to others and that nothing delegates to: the seat to delegate to), and each seat's pod, role, runtime, delegation (reportsTo, delegatesTo) and activity as the daemon reports it. Activity the daemon doesn't know reads unknown, never idle. hostedMembers are the rig's members that live outside a terminal (roster entries marked hosted): their authored capabilities and limits, with no pane and activity unknown.",
+      description: "Show a rig's team: its lead, the rig's one delegates_to root (the seat that delegates to others and that nothing delegates to: the seat to delegate to), and each seat's pod, role, runtime, delegation (reportsTo, delegatesTo) and activity as the daemon reports it. Activity the daemon doesn't know reads unknown, never idle. hostedMembers are the rig's members that live outside a terminal (roster entries marked hosted): their authored capabilities and limits, with no pane and activity unknown.",
       inputSchema: z.object({
-        rigId: z.string().optional().describe("Rig name or identifier; optional for an external grant to discover its team"),
+        rigId: z.string().describe("Rig name or identifier"),
       }),
       annotations: READ_ONLY,
     },
     async ({ rigId }) => {
       try {
-        const inferred = rigId === undefined && !!access?.external;
-        if (rigId === undefined) {
-          if (!access?.external) {
-            const message = "Pass a rig name or identifier as rigId.";
-            return errorResult(message, "rig_required", message);
-          }
-          const rigs = [...new Set(access.rigs)];
-          if (rigs.length !== 1) return mapResult({ status: 200, data: { rigs,
-            message: rigs.length ? "Choose one of this grant's rigs and pass its name as rigId." : "This grant names no rigs; ask the connection operator to check its scope." } }, undefined, { structured: true });
-          rigId = rigs[0]!;
-        }
         // An external caller names one of its grant's rigs, so a lookup never answers about another workspace's rig.
         if (access?.external && !scope?.rig(rigId)) return outOfScope(`Rig ${rigId}`);
         const rig = await rigIdFor(client, rigId);
         if ("content" in rig) return rig;
-        if (inferred && !rig.resolved) {
-          const message = `No rig could be resolved from this grant's scope: ${rigId}. Check the connection's scope with its operator.`;
-          return errorResult(message, "scoped_rig_unresolved", message, { rigs: [rigId] });
-        }
         const id = encodeURIComponent(rig.id);
         const detail = await client.get(`/api/rigs/${id}`);
         if (detail.status >= 400) return mapResult(detail);
@@ -1880,7 +1839,7 @@ export function createMcpServer(client: DaemonClient, options: { seat?: string; 
       try {
         const read = async (source: string, rootName: string, inside: string): Promise<TextResult> => {
           const res = await client.get(`/api/files/read?${new URLSearchParams({ root: rootName, path: inside }).toString()}`);
-          if (res.status >= 400) return mapResult(scope ? scopedRootUnknown(res, scope) : res);
+          if (res.status >= 400) return mapResult(res);
           return mapResult({ status: 200, data: artifactView(source, (res.data ?? {}) as FileRead, offset ?? 0) }, undefined, { structured: true });
         };
         if (scope && root && !scope.root(root)) return outOfScope(`Root ${root}`);

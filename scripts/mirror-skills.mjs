@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -9,7 +8,6 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   rmSync,
   lstatSync,
   writeFileSync,
@@ -557,7 +555,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   }
 }
 
-if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+if (import.meta.url === `file://${resolve(process.argv[1])}`) {
   try {
     await main();
   } catch (err) {

@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import {
   buildInternalLeakMessage,
@@ -201,7 +200,7 @@ function splitNul(bytes) {
     .sort();
 }
 
-if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
+if (import.meta.url === `file://${resolve(process.argv[1])}`) {
   try {
     process.exitCode = main();
   } catch (error) {

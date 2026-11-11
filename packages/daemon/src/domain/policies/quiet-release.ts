@@ -48,16 +48,6 @@ export function parseQuietHoldNote(note: string): QuietHold | null {
 export const hasToken = (note: string, prefix: string, key: string): boolean =>
   note.startsWith(`${prefix} `) && note.split(/\s+/).includes(`notification_key=${key}`);
 
-/** The row's record that an ask went on to post although its person's quiet hours couldn't be read: written once per
- *  episode, before the post, whose outcome is its own receipt. */
-export const QUIET_UNREADABLE_PREFIX = "slack-quiet-unreadable";
-
-export function noteQuietUnreadable(queueRepo: QueueRepository, qitemId: string, notificationKey: string, detail: string): void {
-  if (queueRepo.listTransitions(qitemId).some((t) => hasToken(t.transitionNote ?? "", QUIET_UNREADABLE_PREFIX, notificationKey))) return;
-  queueRepo.update({ qitemId, actorSession: "daemon@kernel",
-    transitionNote: `${QUIET_UNREADABLE_PREFIX} notification_key=${notificationKey} detail=${detail.replace(/\s+/g, " ").trim()}` });
-}
-
 /** Record a held ask on its row (once per episode) and make sure its window's release job is armed: one SQLite
  *  transaction, so a hold note never commits without the job that releases it (or the reverse). */
 export function holdForQuiet(input: {
@@ -101,10 +91,9 @@ export function armQuietRelease(input: { jobsRepo: WatchdogJobsRepository; windo
   return { jobId: job.jobId };
 }
 
-export type ReleaseDisposition = "row-not-active" | "superseded" | "recipient-changed" | "below-posting-threshold" | "no-connector";
+export type ReleaseDisposition = "row-not-active" | "superseded" | "recipient-changed" | "below-posting-threshold";
 export type ReleaseVerdict =
-  /** `quietUnreadable`: the person's quiet hours couldn't be read, and the caller asked to go on past that. */
-  | { kind: "post"; alert: QueueItem; quietUnreadable?: string }
+  | { kind: "post"; alert: QueueItem }
   | { kind: "quiet"; windowId: string }
   | { kind: "disposition"; reason: ReleaseDisposition }
   /** Something the verdict depends on couldn't be read (the registry, the alert list, the quiet state): decide nothing,
@@ -123,18 +112,12 @@ export async function releaseVerdict(input: {
   notificationKey: string;
   now: Date;
   alerts?: QueueItem[];
-  /** Unreadable quiet hours aren't a quiet window: decide the rest, and a current ask posts, marked. Without it they
-   *  read as unavailable. */
-  pastUnreadableQuiet?: boolean;
 }): Promise<ReleaseVerdict> {
   let quiet: ReturnType<typeof quietHoldFor>;
   try {
     quiet = quietHoldFor(input.queueRepo.db, input.entityId, input.now);
   } catch (error) {
-    const detail = (error as Error).message;
-    if (!input.pastUnreadableQuiet) return { kind: "unavailable", detail };
-    const current = await currentAskVerdict(input);
-    return current.kind === "post" ? { ...current, quietUnreadable: detail } : current;
+    return { kind: "unavailable", detail: (error as Error).message };
   }
   if (quiet) return { kind: "quiet", windowId: quiet.windowId };
   return currentAskVerdict(input);
@@ -164,27 +147,11 @@ export async function currentAskVerdict(input: {
   // Not a current alert for this person any more: say why, from the row as it is now.
   const row = input.queueRepo.getById(input.qitemId);
   const latest = row ? input.queueRepo.transitionLog.latestOwnerNotificationForQitem(input.qitemId) : null;
-  const reason: ReleaseDisposition | "unread" = !row || !isBlockerLive(row.state) ? "row-not-active"
+  const reason: ReleaseDisposition = !row || !isBlockerLive(row.state) ? "row-not-active"
     : latest && `${input.qitemId}:${latest.transitionId}` !== input.notificationKey ? "superseded"
       : alert ? "recipient-changed"
-        : connectorReason(input);
-  if (reason === "unread") return { kind: "unavailable", detail: "the person's connector bindings couldn't be read" };
+        : "below-posting-threshold";
   return { kind: "disposition", reason };
-}
-
-/** Why a person's ask isn't among the alerts when its row is still current: the alert list leaves out a person with no
- *  connector binding (reached in the Feed and Steering only), which isn't the posting threshold. Bindings that can't be
- *  read are unknown, never "below threshold". */
-function connectorReason(input: { home: string; registry: RunQuietReleaseInput["registry"]; entityId: string }): "no-connector" | "below-posting-threshold" | "unread" {
-  let reg: ReturnType<RunQuietReleaseInput["registry"]["loadHumanRegistry"]>;
-  try {
-    reg = input.registry.loadHumanRegistry(input.home);
-  } catch {
-    return "unread";
-  }
-  if (!reg.ok) return "unread";
-  const person = reg.entities?.find((e) => e.entityId === input.entityId);
-  return person && (person.connectorBindings?.length ?? 0) === 0 ? "no-connector" : "below-posting-threshold";
 }
 
 /** The current human alerts, or null when the registry can't be loaded: "unknown", never "none". */
@@ -194,10 +161,9 @@ async function currentAlerts(queueRepo: QueueRepository, home: string, registry:
   return makeQueuePorts(queueRepo, { loadHumanRegistry: () => reg } as never).listHumanAlerts({ minimumLevel: loadConfig(home).minimumLevelThatPosts });
 }
 
-/** The gateway's half: re-check a release at post time. `post`: post it. `post-quiet-unreadable`: post it, saying the
- *  person's quiet hours couldn't be read (only with `pastUnreadableQuiet`; the row records it). `declined`: not posted,
- *  and the row says why. `retry`: it couldn't be checked; nothing is written, and the window's release job (still
- *  active, since this ask has neither a receipt nor a disposition) dispatches it again at its next evaluation. */
+/** The gateway's half: re-check a release at post time. `post`: post it. `declined`: not posted, and the row says why.
+ *  `retry`: it couldn't be checked; nothing is written, and the window's release job (still active, since this ask has
+ *  neither a receipt nor a disposition) dispatches it again at its next evaluation. */
 export async function confirmReleaseAtPost(input: {
   queueRepo: QueueRepository;
   jobsRepo: WatchdogJobsRepository;
@@ -207,13 +173,8 @@ export async function confirmReleaseAtPost(input: {
   qitemId: string;
   notificationKey: string;
   now?: Date;
-  pastUnreadableQuiet?: boolean;
-}): Promise<"post" | "post-quiet-unreadable" | "declined" | "retry"> {
+}): Promise<"post" | "declined" | "retry"> {
   const verdict = await releaseVerdict({ ...input, now: input.now ?? new Date() });
-  if (verdict.kind === "post" && verdict.quietUnreadable !== undefined) {
-    noteQuietUnreadable(input.queueRepo, input.qitemId, input.notificationKey, verdict.quietUnreadable);
-    return "post-quiet-unreadable";
-  }
   if (verdict.kind === "post") return "post";
   if (verdict.kind === "unavailable") return "retry";
   const key = input.notificationKey;
@@ -236,7 +197,7 @@ export interface RunQuietReleaseInput {
   queueRepo: QueueRepository;
   jobsRepo: WatchdogJobsRepository;
   home: string;
-  registry: { loadHumanRegistry: (home: string) => { ok: boolean; entities?: Array<{ entityId: string; connectorBindings?: readonly unknown[] }> } };
+  registry: { loadHumanRegistry: (home: string) => { ok: boolean; entities?: Array<{ entityId: string }> } };
   dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => { ok: boolean; error?: string };
   jobId: string;
   now?: Date;
@@ -254,8 +215,7 @@ export async function runQuietRelease(input: RunQuietReleaseInput): Promise<{ st
   try {
     if (new HumanQuietStore(input.queueRepo.db).quietStateFor(entityId, now).active) return { state: "quiet", released: 0, dispositions: 0 };
   } catch {
-    // Can't tell whether quiet is on: that isn't a quiet window. Each held ask is decided on the rest, and the gateway's
-    // post-time check posts a current one saying its quiet hours couldn't be read (a relay, which can't, keeps waiting).
+    return { state: "pending", released: 0, dispositions: 0 }; // can't tell whether quiet is on: release nothing, try again
   }
 
   // Every ask held under this window, whichever occurrence or revision held it.
@@ -272,7 +232,7 @@ export async function runQuietRelease(input: RunQuietReleaseInput): Promise<{ st
     const verdict = alerts === null
       ? { kind: "unavailable" as const, detail: "the human registry couldn't be loaded" }
       : await releaseVerdict({ queueRepo: input.queueRepo, home: input.home, registry: input.registry, entityId, qitemId,
-        notificationKey: key, now, alerts, pastUnreadableQuiet: true });
+        notificationKey: key, now, alerts });
     if (verdict.kind === "quiet" || verdict.kind === "unavailable") { open++; continue; }
     if (verdict.kind === "post") {
       open++;

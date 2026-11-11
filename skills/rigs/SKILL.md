@@ -100,10 +100,7 @@ person needs in their project or home folder and name that path.
   dashboard-only fallback; explain the failure and help with the chosen fallback. Herdr is visible only in a terminal
   the person can see; switching the shared TUI to `:terminals` does not open one. No and headless/SSH use are valid
   background outcomes. Provider-only `--provider herdr`, `--provider cmux` or `--provider rex` is for a provider that's
-  already running, not the first desktop window, and each such open adds a new workspace. `--provider herdr-app` opens
-  the view in the herdr-app window you run it in (it adds OpenRig's mods there first). Inside a herdr-app
-  terminal, plain `rig terminal open <view>` does the same when that window is answering. `--window` always asks for a
-  new desktop window.
+  already running, not the first desktop window, and each such open adds a new workspace.
 - **If the window can't open, or over headless SSH:** say plainly that no visible terminal was opened, and ask the
   person to open a new terminal window or tab on the daemon's host. Over SSH, that's a new SSH session to it with the
   known account. If you only know an HTTP daemon address, ask for the SSH details rather than inventing them. Then
@@ -155,26 +152,11 @@ person needs in their project or home folder and name that path.
   way. The operator helps them pick a team that fits their logins, starts it (`rig up`) only on their yes to the plan it
   shows, and gives the goal to the team's lead. Before that yes, it says what launching into their folder changes for their own agent there; relay
   that with the question. Show them where the operator answers, and don't build the project yourself.
-- **If you start a team yourself** instead of through the operator, do its fit check first. A built-in team can need a
-  sign-in the person doesn't have: `starter` runs its reviewer on Codex, so someone on Claude Code alone stops at a Codex
-  sign-in just when the review should start. `rig specs preview <team> --kind rig --json` lists each seat's runtime.
-  Check those logins (`claude auth status`, `codex login status`), or go by what the person told you. If one is missing
-  or you can't tell, say so before launching and let them choose: the operator adapts the team to the logins they have,
-  or they sign in first.
 - **Relay the operator's questions** unless the person declined the Codex offer below and explicitly chose the operator route: the operator asks in its own pane, and the person may not be looking there.
   After each step you hand it, read its screen with `rig capture <canonicalSessionName>`. When it asks the person
   something (start this team? which folder? which option?), ask them here in the operator's words and send their
   answer back with `rig send`, or tell them to answer in the operator's pane. Unlike a prompt or a menu, a question
   doesn't show up as a stopped seat, so don't leave it to a background wait.
-- **If the operator answers with a model error,** such as "… not supported when using Codex with a ChatGPT account", its
-  Codex sign-in works but that account can't run the model. OpenRig put the operator on Codex because the sign-in
-  passed. Tell the person which model failed. If Claude Code is signed in, offer to move the operator to it; on their
-  yes, run
-  `rig seat set-runtime <canonicalSessionName> --runtime claude-code --reason "<model> isn't available to this Codex account"`
-  (`--dry-run` first). If it isn't, or you can't tell, say so and offer their choices: sign in to Claude Code, or give the
-  seat a model their account can run with `rig seat set-model`, then start it again with
-  `rig seat launch <seat> --fresh --stop --reason "…"` and check the model it reports. Either way the operator starts a
-  new conversation without your handoff, so send it again: the goal, folder, branch, constraints and declined choices.
 - **Installation is finished** when the operator is ready and the person is talking to it; a healthy daemon alone isn't
   that. If they'd rather talk later, keep that choice, leave them the exact connection step and say the handoff to the
   operator is still pending.
@@ -182,8 +164,7 @@ person needs in their project or home folder and name that path.
   running in that repository, tell the operator.
 - **Check it's ready before you say so:** `rig ps --nodes --rig <rig>`. If an agent is stopped at a prompt or a menu,
   read it with `rig capture <seat>@<rig>`. A permission prompt is the person's to answer: show it to them, with any
-  others waiting, one line each (seat, exact action, the choices offered). For a commit, also say whether the team's
-  review has run; they may be expecting one. Before sending their choice, capture that
+  others waiting, one line each (seat, exact action, the choices offered). Before sending their choice, capture that
   seat again: if its prompt changed, don't reuse the answer. Then send exactly the choice they made for that prompt
   (`rig send --help` says how to send a digit, a letter or Escape to a prompt). A yes to one prompt isn't a
   yes to the next, and never pick a "don't ask again" choice they didn't pick. If they've told you outright to decide a

@@ -202,21 +202,6 @@ export class SessionRegistry {
     return resolveCurrentSessionAddress(this.db, address);
   }
 
-  /** #2895 (a): whether `rig send <sender>` can find this sender, by the transport's own resolution (a current
-   *  address, or a session row on a node of a rig). A three-part `member@rig@host` label is a cross-host origin that
-   *  `rig send` forwards, so it counts. A stopped seat still has its rows, so it counts too. Any lookup error ⇒ true,
-   *  which keeps today's reply line. */
-  senderIsSendable(sender: string): boolean {
-    if (sender.split("@").length === 3) return true;
-    try {
-      if (this.resolveAddress(sender)) return true;
-      return this.db.prepare(`SELECT 1 FROM sessions s JOIN nodes n ON n.id = s.node_id JOIN rigs r ON r.id = n.rig_id
-        WHERE s.session_name = ? LIMIT 1`).get(sender) !== undefined;
-    } catch {
-      return true;
-    }
-  }
-
   /** Current queue equivalence, not a rewrite of recorded identity. A raw name
    * reused by another node has ambiguous history: do not newly attribute its
    * old rows through the logical spelling. Exact raw access stays unchanged. */
@@ -413,18 +398,6 @@ export class SessionRegistry {
     ).get(nodeId, generationUuid));
   }
 
-  /** True when this generation is registered for this node and only no-launch adoptions ('adopt': reconcile, bind,
-   * self-attach) were registered after it. Adoption registers the same live process again without replacing it, so
-   * that occupant is still the seat's; a launch kind after it (initial, fresh, handover) replaced it. Throws on ledger
-   * faults, like isOccupantGenerationRegistered. */
-  isOccupantContinuedByAdoption(nodeId: string, generationUuid: string): boolean {
-    return Boolean(this.db.prepare(
-      `SELECT 1 FROM occupant_tenures e WHERE e.node_id = ? AND e.generation_uuid = ? AND NOT EXISTS (
-         SELECT 1 FROM occupant_tenures l WHERE l.node_id = e.node_id AND l.generation_ordinal > e.generation_ordinal
-           AND l.kind <> 'adopt') LIMIT 1`,
-    ).get(nodeId, generationUuid));
-  }
-
   mintOccupantTenure(
     nodeId: string,
     kind: OccupantKind,
@@ -541,13 +514,11 @@ export class SessionRegistry {
   // ignore it; the adoption-capture path uses it so its audit event never
   // falsely claims a captured write when the provenance guard refused it.
   /** Record that this session was launched for a community harness, selected through its preset. With `runner`, also
-   *  record what that launch's preset declared: `runner: true` (1), OpenRig's hosted Pi-protocol runner for
-   *  `protocol: pi-rpc` ("pi-rpc", 2), or neither (0), so activity reads the launched occupant's declaration, never a
-   *  later preset edit. Without it (a restore carrying only the selection) the field is left as is. */
-  recordCommunityHarnessSelection(sessionId: string, app: string, runner?: boolean | "pi-rpc"): void {
+   *  record what that launch's preset declared (`runner: true` or not), so activity reads the launched occupant's
+   *  declaration, never a later preset edit. Without it (a restore carrying only the selection) the field is left as is. */
+  recordCommunityHarnessSelection(sessionId: string, app: string, runner?: boolean): void {
     if (runner !== undefined && sessionCommunityRunnerSelect(this.db, "sessions") !== "NULL") {
-      this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?")
-        .run(app, runner === "pi-rpc" ? AGENT_RUNNER_HOSTED_PI_RPC : runner ? AGENT_RUNNER_PRESET : 0, sessionId);
+      this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?").run(app, runner ? 1 : 0, sessionId);
       return;
     }
     this.db.prepare("UPDATE sessions SET agent_app = ? WHERE id = ?").run(app, sessionId);
@@ -982,15 +953,6 @@ const sessionsHaveCommunityRunner = new WeakMap<Database.Database, boolean>();
 
 /** The SQL that reads whether a session's community app was launched as a runner: 1, 0, or NULL. NULL also on a schema
  *  without the column, so a legacy database reads every seat as before (never a runner opt-in). */
-/** `sessions.agent_runner`: 1, a preset's own runner (`runner: true`); 2, OpenRig's hosted Pi-protocol runner for a
- *  `protocol: pi-rpc` preset. Both are runners; only the second speaks Pi's RPC protocol. */
-export const AGENT_RUNNER_PRESET = 1;
-export const AGENT_RUNNER_HOSTED_PI_RPC = 2;
-/** The session was launched for a runner of either kind. */
-export function recordedRunner(value: number | null | undefined): boolean {
-  return value === AGENT_RUNNER_PRESET || value === AGENT_RUNNER_HOSTED_PI_RPC;
-}
-
 export function sessionCommunityRunnerSelect(db: Database.Database, alias = "s"): string {
   let has = sessionsHaveCommunityRunner.get(db);
   if (has === undefined) {

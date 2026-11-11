@@ -138,23 +138,19 @@ unseen — which makes messages the one delivery channel that never gets skipped
   (`transport.draft_delivery` `deliver`): the message is pasted at the cursor and the combined input
   submitted as one prompt, and the result says when it joined a draft OpenRig saw. Tell the person.
   `rig config set transport.draft_delivery refuse` brings back the refusal (`prompt_draft`) from the
-  next send. Menus and permission prompts still refuse ordinary input under either value.
-  A seat's typing guard and `--wait-for-idle` retain their checks. Managed compaction follows the
-  ordinary draft default and explicit operator protections; it separately reconciles its own
-  uncertain `/compact` write before sending restore input. Draft detection isn't complete.
+  next send. Menus, permission prompts, a seat's typing guard, managed compaction and
+  `--wait-for-idle` refuse or wait under either value. Draft detection isn't complete.
 - **`rig send --raw`** — send exact text or keystrokes without the From/To envelope;
   the interactive-prompt guard still applies. To deliberately drive an interactive prompt,
   **`--dangerously-interact --reason "<why>"`** is the explicit override and implies raw text.
   Inspect the prompt and establish authority for its effect before using that override. It types
-  exactly the bytes and keys you give it: Enter is added for a complete answer staged in a
-  recognised Claude Code or Codex input box and, away from a recognised prompt or menu, when the
-  input box can't be found or read (the result says so). Anywhere else, put CR in the payload.
+  exactly the bytes and keys you give it: Enter is added only for a complete answer
+  staged in a recognised Claude Code or Codex input box, so anywhere else put CR in the payload.
   **On a managed seat it stops before typing into an input box that already holds typed or pasted
   text**, and shows you that text, apart from a recognised dim suggestion; it types nothing. Clear
   the box and retry, or add `--type-without-checking`, which reads and clears nothing and may join
   or submit the existing text. Keys for a recognised native menu are sent as before, and collapsed
-  paste contents or an unrecognised input can't be read. An input it can't read doesn't stop it: it
-  types, clears nothing, and says the input couldn't be read. Not yet checked on a live seat whose box
+  paste contents or an unrecognised input can't be read. Not yet checked on a live seat whose box
   holds only a suggestion, or typed text beside one. Don't use it to type over a half-written box:
   to reach a seat with something that can't wait, use `--urgent` where its typing-guard level lets
   urgent input through.
@@ -248,9 +244,14 @@ unseen — which makes messages the one delivery channel that never gets skipped
   YAML, herdr when installed or plain tmux. The layout follows the terminal's width: on a narrow
   one the operator gets the first tab; on a wide one the dashboard and operator sit side by side
   and the advisor gets its own tab. A `kernel` view the person saved still wins.
-  Tiles show their seat's screen without attaching, so whole lines show at any tile width; a
-  writable tile attaches when someone types or pastes and goes back to showing after 30 seconds
-  without a key. Inside herdr it
+  Writable tiles attach as in 0.7.10: the screen in use sizes the seat and text reflows on resize.
+  Read-only tiles show without attaching or resizing it. Fixed web geometry is opt-in through
+  `terminal.fixed_geometry` (off by default). Enter or Ctrl-C during the first attach can close
+  the viewer; the agent keeps running, so reopen it. Kept writable 0.7.8, 0.7.9 or pre-reflow
+  0.7.11 tiles need a manual refresh: close only their owned viewer and reopen with
+  `rig terminal open`; for `--follow`, use `--no-follow` first, then open a fresh view.
+  The agent and conversation are preserved; this is not an automatic migration.
+  Inside herdr it
   opens a focused `openrig kernel` space. It opens where the caller is: Terminal gets a window and
   Ghostty a tab; from Claude Desktop, iTerm or VS Code on a Mac it opens a new Ghostty or Terminal
   window, and only then say that clicking macOS's Allow is fine. Herdr is visible only in a
@@ -1239,6 +1240,11 @@ reaching them is ordinary work rather than an escalation.
   person can settle an ask that was asked of someone else, recorded as themselves beside the person
   asked. The first committed answer wins; a later one gets 409 `qitem_already_terminal` and records
   nothing. A park addressed to a registered person can be resolved.
+  Denying or dropping a host pairing request in Steering now gives the requesting machine no access; in 0.7.9 and 0.7.10, that action could return the daemon access token. ([#2884](https://github.com/mvschwarz/openrig/pull/2884))
+  **Pairing answers now reach the target's kernel operator.** On a 0.7.11 target with a receiving kernel operator, typed words and Approve or Deny choices in the TUI, Steering or Slack are replies for that agent to read. Receiving a reply neither grants nor denies access. The operator acts on clear intent with `rig host approve <code>` or `rig host deny <code>` and asks back when the answer is unclear. The commands also work from a plain terminal on the target; they use its operator bearer (`OPENRIG_AUTH_BEARER_TOKEN`, or `--bearer <token>`). ([#2900](https://github.com/mvschwarz/openrig/pull/2900))
+  **An Approve click on an operator-owned request waits for the operator to act.** A stopped operator keeps ownership; the answer waits in its queue. A stopped or unknown running state is named with the terminal route, without claiming the answer was read. If there is no operator, it cannot receive answers, or OpenRig cannot determine one, the request names that case and uses the agent-free path: Approve and Deny decide directly, and replies lead to another ask rather than denial. File-only replies and the literal `[file reply]` have no words stored on the agent-free ask; they still do not deny it.
+  **TUI answers use the daemon's operator bearer when configured.** Ordinary terminal calls keep their separate terminal credential. A missing or wrong action credential leaves the answer unrecorded and shows what to set; this does not weaken the daemon's authentication.
+  **Receipt, clarification and outcome are separate steps.** Receipts, agent-free re-asks and outcomes inferred from clicks or closes need the requesting machine to keep polling. An explicit `rig host approve` or `rig host deny` attempts its outcome update directly. An expiry timer closes the ask even if polling stopped; an unanswered expired ask gets no further update. Requests and decisions live in daemon memory, so a restart drops an open request. Approval still must be collected before expiry. This target-side change does not change older targets.
 - **`rig gateway channel add <id> --display-name <name> --binding
   slack:<connectorRef>:<secretsRef>:<channelId>`** — a Slack shared channel as one participant,
   `<id>@external` (Slack only). Anyone writing there reaches the team, registered or not. Each row
@@ -1406,8 +1412,8 @@ your circumstances is configuration, and the ones that are not, another agent ca
   tested with stubs, not real accounts, before 0.7.2: check a moved seat's account and conversation
   yourself after the first move.
 - **Move to an existing account home** with `rig provider switch --seat <seat> --to-account <name>
-  --account-home <dir> --reason "<why>"` (preview with `--dry-run`). It starts a fresh conversation with a handover
-  and retains the seat's address and work. `--clear-account-home --reason "<why>"` returns to configured defaults.
+  --account-home <dir>` (preview with `--dry-run`). It starts a fresh conversation with a handover
+  and retains the seat's address and work. `--clear-account-home` returns to configured defaults.
 - **Claude subscription/API-key switching resumes the same conversation and interrupts work:**
   `rig provider switch --seat <seat> --to-account api --api-key-file <abs>`; return with
   `--to-account plan --token-file <abs>`. The API-key path remains unqualified; verify the resulting

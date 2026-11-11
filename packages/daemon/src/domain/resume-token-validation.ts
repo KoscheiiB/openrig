@@ -64,11 +64,8 @@ function validateIdShapedToken(resumeType: ResumeType, token: string): ResumeTok
   return { ok: true, resumeType, token };
 }
 
-export function validateSessionFileFormat(rawToken: unknown, label = "Pi"): { ok: true; token: string } | { ok: false; error: string } {
-  if (typeof rawToken !== "string") {
-    return { ok: false, error: `${label} session file must be a string.` };
-  }
-  const token = rawToken.trim();
+function validateSessionFileToken(resumeType: "pi_session_file" | "omp_session_file", token: string): ResumeTokenValidationOk | ResumeTokenValidationErr {
+  const label = resumeType === "pi_session_file" ? "Pi" : "OMP";
   if (token.length > MAX_SESSION_FILE_LEN) {
     return { ok: false, error: `${label} session-file token is too long (max ${MAX_SESSION_FILE_LEN} characters).` };
   }
@@ -87,14 +84,7 @@ export function validateSessionFileFormat(rawToken: unknown, label = "Pi"): { ok
   if (!token.endsWith(SESSION_FILE_SUFFIX)) {
     return { ok: false, error: `${label} session-file token must end with '${SESSION_FILE_SUFFIX}'.` };
   }
-  return { ok: true, token };
-}
-
-function validateSessionFileToken(resumeType: "pi_session_file" | "omp_session_file", token: string): ResumeTokenValidationOk | ResumeTokenValidationErr {
-  const label = resumeType === "pi_session_file" ? "Pi" : "OMP";
-  const res = validateSessionFileFormat(token, label);
-  if (!res.ok) return res;
-  return { ok: true, resumeType, token: res.token };
+  return { ok: true, resumeType, token };
 }
 
 export function validateResumeToken(

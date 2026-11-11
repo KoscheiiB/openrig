@@ -750,8 +750,8 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     expect(log).not.toHaveBeenCalled();
   });
 
-  // A final disposition holds the alert tag and this exact episode tag. A handoff transfers custody;
-  // it cannot tombstone the successor's episode.
+  // A closed disposition is a terminal row whose valid JSON tags hold the alert tag and this exact episode tag as
+  // values. It keeps the episode final; anything short of that leaves the episode free to alert again.
   function episodeKey(id: string) {
     return notes(id).find(n => n.startsWith(REFUSED_PREFIX))!.slice(REFUSED_PREFIX.length).trim().split(";")[0]!.trim();
   }
@@ -766,7 +766,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
   it.each([
     ["exact tags on a done row", exact, "done", false],
     ["exact tags on a canceled row", exact, "canceled", false],
-    ["exact tags on a handed-off row without a local tagged successor", exact, "handed-off", false],
+    ["exact tags on a handed-off row", exact, "handed-off", false],
     ["exact tags on a failed row", exact, "failed", false],
     ["exact tags on a denied row", exact, "denied", false],
     ["fully escaped tags", (k: string) => escaped(["wake-prompt-refusal", `prompt-episode:${k}`]), "done", false],
@@ -801,7 +801,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     let lookups = -1;
     try {
       await tick(engine([], false));
-      lookups = prepare.mock.calls.filter(([sql]) => String(sql).includes("WITH alerts AS MATERIALIZED")).length;
+      lookups = prepare.mock.calls.filter(([sql]) => String(sql).includes("state NOT IN ('pending','in-progress','blocked')")).length;
     } finally { prepare.mockRestore(); }
     expect(lookups).toBe(1); // one per tick; the per-episode lookup ran once per open episode (3 here)
     expect(alerts()).toHaveLength(1);
@@ -869,15 +869,12 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     expect(posts).toEqual([]); expect(notes(id).join("\n")).not.toContain("slack-owner-notification-posted");
   });
 
-  it("closed original work cannot imply its still-blocked prompt cleared", async () => {
+  it("closed original work cancels the pending alert before a route returns", async () => {
     const row = await refusal(); const posts: unknown[] = []; let reg: LoadResult = { ok: true, entities: [] };
     const port = engine(posts, () => reg); await tick(port); const id = alerts()[0]!.qitemId;
     repo.update({ qitemId: row.qitemId, actorSession: seat, state: "done", closureReason: "no-follow-on" });
     reg = registry; await tick(port);
-    expect(repo.getById(id)?.state).toBe("pending"); expect(posts).toEqual([]);
-    expect(notes(id)).toContain("prompt escalation retained: original episode ended; prompt blocked; not evidence of clearing");
-    state = "clear"; await tick(port);
-    expect(repo.getById(id)?.state).toBe("done");
+    expect(repo.getById(id)?.state).toBe("done"); expect(posts).toEqual([]);
   });
 
   it("closing work during aggregate creation prevents dispatch at the final boundary", async () => {
@@ -1085,164 +1082,18 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     return { jobId, record };
   }
 
-  it.each(["blocked", "unknown", "clear"] as const)("a handed-off choice alert preserves its owner's hold and wake when prompt state is %s", async observed => {
-    reminder(["refused"]);
-    const port = engine([], false);
-    await tick(port);
-    const original = alerts()[0]!;
-    const { created: held } = await repo.handoff({ qitemId: original.qitemId,
-      fromSession: original.destinationSession, toSession: "desk@fixture", nudge: false });
-    repo.claim({ qitemId: held.qitemId, destinationSession: held.destinationSession });
-    repo.update({ qitemId: held.qitemId, actorSession: held.destinationSession, state: "blocked",
-      blockedOn: "external:owner-decision", wakeAfterSeconds: 21_600 });
-    const before = db.prepare("SELECT * FROM queue_transition_wakes WHERE qitem_id = ?").all(held.qitemId);
-    expect(before).toHaveLength(1);
-    state = observed;
-    await tick(port);
-    await tick(port);
-    expect(repo.getById(held.qitemId)).toMatchObject({ state: "blocked", blockedOn: "external:owner-decision" });
-    expect(db.prepare("SELECT * FROM queue_transition_wakes WHERE qitem_id = ?").all(held.qitemId)).toEqual(before);
-    expect(alerts().map(row => row.qitemId)).toEqual([held.qitemId]);
-    // A retained choice refusal older than one retry interval still positively reads blocked when the oracle is unknown.
-    expect(notes(held.qitemId).filter(note => note.startsWith("prompt escalation retained:"))).toHaveLength(observed === "clear" ? 1 : 0);
-  });
-
-  it("a handed-off choice alert remains the same open escalation", async () => {
-    reminder(["refused"]);
-    const port = engine([], false);
-    await tick(port);
-    const original = alerts()[0]!;
-    const { created } = await repo.handoff({ qitemId: original.qitemId,
-      fromSession: original.destinationSession, toSession: "desk@fixture", nudge: false });
-    await tick(port);
-    expect(alerts().map(row => row.qitemId)).toEqual([created.qitemId]);
-    state = "clear";
-    await tick(port);
-    expect(repo.getById(created.qitemId)?.state).toBe("done");
-    expect(notes(created.qitemId)).toContain("prompt escalation retired: the seat's prompt read clear; not a delivery receipt");
-  });
-
-  it("a held clear then owner close cannot suppress the same watchdog's later prompt", async () => {
-    const epoch = Date.parse("2030-01-01T00:00:00Z");
-    const at = (seconds: number) => new Date(epoch + seconds * 1000);
-    vi.useFakeTimers({ toFake: ["Date"], now: at(0) });
-    try {
-      const { jobId, record } = reminder([]);
-      const port = engine([], false);
-      record("refused", "selection_prompt", at(0).toISOString());
-      vi.setSystemTime(at(60));
-      await tick(port, { now: at(60) });
-      const original = alerts()[0]!;
-      const { created: held } = await repo.handoff({ qitemId: original.qitemId,
-        fromSession: original.destinationSession, toSession: "desk@fixture", nudge: false });
-      repo.claim({ qitemId: held.qitemId, destinationSession: held.destinationSession });
-      repo.update({ qitemId: held.qitemId, actorSession: held.destinationSession, state: "blocked",
-        blockedOn: "external:owner-decision", wakeAfterSeconds: 21_600 });
-      const wake = db.prepare("SELECT * FROM queue_transition_wakes WHERE qitem_id = ?").all(held.qitemId);
-      vi.setSystemTime(at(90)); state = "clear";
-      await tick(port, { now: at(90) });
-      vi.setSystemTime(at(91));
-      await tick(port, { now: at(91) });
-      expect(repo.getById(held.qitemId)?.state).toBe("blocked");
-      expect(db.prepare("SELECT * FROM queue_transition_wakes WHERE qitem_id = ?").all(held.qitemId)).toEqual(wake);
-      vi.setSystemTime(at(95));
-      repo.update({ qitemId: held.qitemId, actorSession: held.destinationSession, state: "done",
-        closureReason: "no-follow-on", transitionNote: "owner finished the held decision" });
-      vi.setSystemTime(at(100)); state = "unknown";
-      record("refused", "selection_prompt", at(100).toISOString()); // No intervening delivered reminder.
-      vi.setSystemTime(at(160));
-      await tick(port, { now: at(160) });
-      expect(alerts()).toHaveLength(1);
-      expect(alerts()[0]!.qitemId).not.toBe(held.qitemId);
-      expect(alerts()[0]!.tags).toContain(`prompt-episode:${seat}|watchdog:${jobId}|after:alert:${held.qitemId}`);
-      expect(repo.getById(held.qitemId)?.state).toBe("done");
-      expect(notes(held.qitemId).filter(note => note === "prompt escalation: the seat's prompt read clear")).toHaveLength(1);
-    } finally { vi.useRealTimers(); }
-  });
-
-  it("a handoff with replaced tags and a manually closed successor stays final", async () => {
-    reminder(["refused"]);
-    const port = engine([], false);
-    await tick(port);
-    const original = alerts()[0]!;
-    const { created } = await repo.handoff({ qitemId: original.qitemId,
-      fromSession: original.destinationSession, toSession: "desk@fixture", tags: ["owner-decision"], nudge: false });
-    repo.update({ qitemId: created.qitemId, actorSession: created.destinationSession,
-      state: "done", closureReason: "no-follow-on" });
-    await tick(port);
-    expect(alerts()).toEqual([]);
-  });
-
-  it("a handed-off alert with no local successor does not re-alert locally", async () => {
-    reminder(["refused"]);
-    const port = engine([], false);
-    await tick(port);
-    const original = alerts()[0]!;
-    db.prepare("UPDATE queue_items SET state = 'handed-off' WHERE qitem_id = ?").run(original.qitemId);
-    await tick(port);
-    expect(alerts()).toEqual([]);
-  });
-
-  it.each(["blocked", "unknown"] as const)("an ended watchdog episode retains its notice when prompt state is %s", async observed => {
-    const { record } = reminder(["refused"]);
-    const port = engine([], false);
-    await tick(port);
-    const alert = alerts()[0]!;
-    record("sent");
-    state = observed;
-    await tick(port);
-    await tick(port);
-    expect(repo.getById(alert.qitemId)?.state).toBe("pending");
-    expect(notes(alert.qitemId).filter(note => note.startsWith("prompt escalation retained:"))).toEqual([
-      `prompt escalation retained: original episode ended; prompt ${observed}; not evidence of clearing`,
-    ]);
-  });
-
-  it("an unknown prompt read is recorded without clearing the alert", async () => {
-    await refusal();
-    const port = engine([], false);
-    await tick(port);
-    const alert = alerts()[0]!;
-    state = "unknown";
-    await tick(port);
-    await tick(port);
-    expect(repo.getById(alert.qitemId)?.state).toBe("pending");
-    expect(notes(alert.qitemId).filter(note => note.startsWith("prompt escalation retained:"))).toEqual([
-      "prompt escalation retained: prompt state unknown; not evidence of clearing",
-    ]);
-  });
-
-  it.each(["automatic-ended", "automatic-cleared", "manual"] as const)("only an unproven automatic retirement can restart a still-blocked reminder: %s", async kind => {
-    reminder(["refused"]);
-    const port = engine([], false);
-    await tick(port);
-    const alert = alerts()[0]!;
-    if (kind === "automatic-cleared") repo.transitionLog.append({ qitemId: alert.qitemId, state: alert.state,
-      actorSession: "wake-ladder@system", transitionNote: "prompt escalation: the seat's prompt read clear" });
-    const manual = kind === "manual";
-    repo.update({ qitemId: alert.qitemId, actorSession: manual ? alert.destinationSession : alert.sourceSession,
-      state: "done", closureReason: "no-follow-on", transitionNote: manual ? "owner resolved" :
-        "prompt escalation retired: prompt cleared or original episode ended; not a delivery receipt" });
-    await tick(port);
-    expect(alerts()).toHaveLength(kind === "automatic-ended" ? 1 : 0);
-    if (kind === "automatic-ended") expect(alerts()[0]!.qitemId).not.toBe(alert.qitemId);
-  });
-
-  it("a reminder refused at a confirmed prompt reaches the seat's orchestrator without waiting for its next scheduled attempt", async () => {
+  it("a reminder refused twice at the prompt reaches the seat's orchestrator, and the alert stands down once one lands", async () => {
     const posts: unknown[] = []; const port = engine(posts); const wakes: string[] = [];
     const opts = { resolveOrchestrator: () => "lead@fixture", attemptWake: async (_id: string, target: string) => { wakes.push(target); return "verified"; } };
     const { jobId, record } = reminder(["refused"]);
     await tick(port, opts);
-    expect(alerts()).toHaveLength(1);
+    expect(alerts()).toEqual([]);
     record("refused");
     await tick(port, opts);
     expect(alerts()).toHaveLength(1);
     expect(alerts()[0]?.destinationSession).toBe("lead@fixture");
     expect(alerts()[0]?.body).toContain(jobId);
     record("sent");
-    await tick(port, opts);
-    expect(alerts()).toHaveLength(1); // Delivery ended this job's run, not the positively observed prompt.
-    state = "clear";
     await tick(port, opts);
     expect(alerts()).toEqual([]);
     expect(wakes).toEqual(["lead@fixture"]); expect(posts).toEqual([]);
@@ -1272,7 +1123,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     expect(wakes).toEqual(["lead@fixture"]);
   });
 
-  it.each([-1, 0])("a prompt that clears and comes back between reminders gets a fresh choice age (last old refusal at clear %i ms)", async lastOldOffset => {
+  it.each([-1, 0])("a prompt that clears and comes back between reminders raises a new alert after two new refusals (last old refusal at clear %i ms)", async lastOldOffset => {
     const clearAt = Date.parse("2030-01-01T00:00:00Z");
     const at = (offset: number) => new Date(clearAt + offset).toISOString();
     vi.useFakeTimers({ toFake: ["Date"], now: clearAt - 3 });
@@ -1286,18 +1137,18 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
       const [first] = alerts();
       state = "clear"; await tick(port, toLead(wakes));
       expect(alerts()).toEqual([]);
-      state = "unknown"; await tick(port, toLead(wakes));
+      state = "blocked"; await tick(port, toLead(wakes));
       vi.setSystemTime(clearAt + 1);
-      record("refused", "selection_prompt", at(1)); await tick(port, { ...toLead(wakes), now: new Date(clearAt + 1) });
+      record("refused", "selection_prompt", at(1)); await tick(port, toLead(wakes));
       expect(alerts()).toEqual([]);
-      await tick(port, { ...toLead(wakes), now: new Date(clearAt + 60_001) });
+      record("refused", "selection_prompt", at(1)); await tick(port, toLead(wakes));
       expect(alerts()).toHaveLength(1);
       expect(alerts()[0]?.qitemId).not.toBe(first!.qitemId);
       expect(wakes).toEqual(["lead@fixture", "lead@fixture"]);
     } finally { vi.useRealTimers(); }
   });
 
-  it("another job stopping while the prompt stays blocked doesn't restart an episode closed by hand", async () => {
+  it("another job's alert retiring while the prompt stays blocked doesn't restart an episode closed by hand", async () => {
     const port = engine([]); const wakes: string[] = [];
     const a = reminder(["sent", "refused", "refused"]);
     await tick(port, toLead(wakes));
@@ -1306,14 +1157,12 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     const b = reminder(["refused", "refused"]);
     await tick(port, toLead(wakes));
     expect(alerts()).toHaveLength(1);
-    const retained = alerts()[0]!.qitemId;
     new WatchdogJobsRepository(db).stop(b.jobId);
     await tick(port, toLead(wakes));
-    expect(alerts().map(row => row.qitemId)).toEqual([retained]);
+    expect(alerts()).toEqual([]);
     a.record("refused"); a.record("refused");
     await tick(port, toLead(wakes));
-    expect(alerts().map(row => row.qitemId)).toEqual([retained]);
-    expect(alerts()[0]!.tags!.some(tag => tag.includes(`|watchdog:${a.jobId}|`))).toBe(false);
+    expect(alerts()).toEqual([]);
     expect(wakes).toEqual(["lead@fixture", "lead@fixture"]);
   });
 
@@ -1359,72 +1208,6 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
   // #81: a Claude seat at a choice prompt no hook announces (its weekly usage-limit dialog) holds open rows. Its own
   // evidence stays unknown, so before this only the transport's refusal knew, and nothing escalated.
   const choiceRefusal = `Refused: '${seat}' is at an interactive prompt (selection_prompt). A message must not select or approve it.`;
-
-  it.each([1, 2])("a watchdog-only choice refusal reaches an owner after the bounded interval with %i recorded attempts and no hook", async count => {
-    const { jobId } = reminder(Array(count).fill("refused")); state = "unknown";
-    const posts: unknown[] = []; const to: string[] = []; const port = engine(posts, true, to);
-    await tick(port, { now: new Date() });
-    expect(alerts()).toEqual([]);
-    await tick(port);
-    expect(alerts()).toHaveLength(1);
-    await vi.waitFor(() => expect(posts).toHaveLength(1));
-    expect(to).toEqual(["human-owner@external"]);
-    expect(JSON.stringify(posts)).toContain(jobId);
-  });
-
-  it("frequent watchdog choice refusals keep their original age beyond the retained history window", async () => {
-    const now = Date.now(); const { record } = reminder([]);
-    for (let i = 69; i >= 0; i--) record("refused", "selection_prompt", new Date(now - i * 1000).toISOString());
-    state = "unknown"; const posts: unknown[] = []; const port = engine(posts);
-    await tick(port, { now: new Date(now + 1) });
-    expect(alerts()).toHaveLength(1);
-    await vi.waitFor(() => expect(posts).toHaveLength(1));
-  });
-
-  it.each([1, 70])("a choice returning after a clear without a prior alert ages from its first uncleared refusal (%i returns)", async count => {
-    const initial = Date.now() - 120_000; const clearAt = initial + 1_000; const returnedAt = clearAt + 1_000;
-    const { jobId, record } = reminder([]); const posts: unknown[] = []; const port = engine(posts);
-    let observedClear = false;
-    const readPromptState = (_dest: string, refusedAt: string) => observedClear ? classifyPromptAfterRefusal({
-      activity: "idle-at-prompt", needsInput: { count: 0, reason: null },
-      needsInputEvidence: { rung: "lifecycle-hooks", observedAt: new Date(clearAt).toISOString() },
-    }, refusedAt) : "unknown";
-    record("refused", "selection_prompt", new Date(initial).toISOString());
-    await tick(port, { readPromptState, now: new Date(initial) });
-    observedClear = true;
-    await tick(port, { readPromptState, now: new Date(clearAt) });
-    expect(alerts()).toEqual([]); // Nothing existed for the clear tick to retire.
-    for (let i = 0; i < count; i++) record("refused", "selection_prompt", new Date(returnedAt + i * 10).toISOString());
-    await tick(port, { readPromptState, now: new Date(returnedAt + 59_999) });
-    expect(alerts()).toEqual([]); expect(posts).toEqual([]);
-    await tick(port, { readPromptState, now: new Date(returnedAt + 60_000) });
-    expect(alerts()).toHaveLength(1);
-    const alertId = alerts()[0]!.qitemId;
-    await vi.waitFor(() => expect(posts).toHaveLength(1));
-    expect(JSON.stringify(posts)).toContain(jobId);
-    await tick(port, { readPromptState, now: new Date(returnedAt + 120_000) });
-    expect(alerts().map(a => a.qitemId)).toEqual([alertId]); expect(posts).toHaveLength(1);
-  });
-
-  it("a watchdog choice refusal with current clearing evidence stays quiet", async () => {
-    reminder(["refused"]); state = "clear"; const posts: unknown[] = [];
-    await tick(engine(posts));
-    expect(alerts()).toEqual([]); expect(posts).toEqual([]);
-  });
-
-  it("a watchdog's other refusal with unknown evidence cannot borrow a choice refusal's age", async () => {
-    const now = Date.now(); const { record } = reminder([]);
-    record("refused", "selection_prompt", new Date(now - 120_000).toISOString());
-    record("refused", "permission_prompt", new Date(now - 1).toISOString());
-    state = "unknown"; const posts: unknown[] = []; const port = engine(posts);
-    await tick(port, { now: new Date(now) });
-    expect(alerts()).toEqual([]);
-    record("refused", "selection_prompt", new Date(now).toISOString());
-    await tick(port, { now: new Date(now + 1) });
-    expect(alerts()).toEqual([]); expect(posts).toEqual([]);
-    await tick(port, { now: new Date(now + 60_000) });
-    await vi.waitFor(() => expect(posts).toHaveLength(1));
-  });
 
   it("#81: a choice prompt no hook announces reaches the registry's first human after one retry interval, never the seat", async () => {
     const row = await refusal(1, choiceRefusal); state = "unknown";

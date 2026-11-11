@@ -86,15 +86,14 @@ class Server:
     def seat_screen(self):
         return self.call("capture-pane", "-p", "-J", "-t", "seat:")
 
-    def wait_for(self, predicate, expected, seconds=6, detail=None):
+    def wait_for(self, predicate, expected, seconds=6):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             self.drain()
             if predicate():
                 return
             time.sleep(0.05)
-        raise AssertionError(expected + "; window=" + self.geometry() + "; clients=" + repr(self.client_ttys())
-                             + ("; " + detail() if detail else ""))
+        raise AssertionError(expected + "; window=" + self.geometry() + "; clients=" + repr(self.client_ttys()))
 
     def stop(self):
         try:

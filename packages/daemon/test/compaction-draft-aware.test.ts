@@ -4,7 +4,7 @@
 // in-memory database; the tmux adapter records commands instead of running them.
 import Database from "better-sqlite3";
 import stringWidth from "string-width";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,7 +12,7 @@ import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { migrate } from "../src/db/migrate.js";
 import type { ComposerSnapshot } from "../src/domain/composer-prompts.js";
-import { ClaudeCompactionEnforcer, COMPACTION_RECORD_FILE } from "../src/domain/claude-compaction-enforcer.js";
+import { ClaudeCompactionEnforcer } from "../src/domain/claude-compaction-enforcer.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
@@ -27,7 +27,7 @@ function frame(body: string): ComposerSnapshot {
     cursor: { x: 2 + stringWidth(body), y: 2, width: 100000, height: 60 }, inMode: false };
 }
 
-async function fixture(opts: { pane: string | null; mode?: "off" | "draft-aware"; footer?: boolean; refuseDraft?: boolean; suggestion?: "faint" | "plain" } = { pane: "%1" }) {
+async function fixture(opts: { pane: string | null; mode?: "off" | "draft-aware"; footer?: boolean; suggestion?: "faint" | "plain" } = { pane: "%1" }) {
   const db = new Database(":memory:");
   migrate(db, ALL_MIGRATIONS);
   db.exec(`INSERT INTO rigs(id,name) VALUES ('rig','test');
@@ -59,7 +59,6 @@ async function fixture(opts: { pane: string | null; mode?: "off" | "draft-aware"
   vi.spyOn(tmux, "capturePaneContent").mockImplementation(async () => snapshot().screen);
   vi.spyOn(tmux, "getPaneCursorPosition").mockImplementation(async () => snapshot().cursor);
   const transport = new SessionTransport({ db, tmuxAdapter: tmux, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db),
-    deliverOverDraft: () => !opts.refuseDraft,
     sleep: (ms) => new Promise((r) => setTimeout(r, Math.min(ms, 5))), waitForIdlePollMs: 5 });
   // Readiness is the variable under test: the pane says idle or working.
   let activity = "idle";
@@ -90,18 +89,18 @@ async function fixture(opts: { pane: string | null; mode?: "off" | "draft-aware"
 it.each([
   { footer: false, skipMap: false }, { footer: false, skipMap: true },
   { footer: true, skipMap: false }, { footer: true, skipMap: true },
-])("default managed preparation joins a draft with typing guard off (footer=$footer, skipMap=$skipMap)", async ({ footer, skipMap }) => {
+])("managed preparation preserves a draft with typing guard off (footer=$footer, skipMap=$skipMap)", async ({ footer, skipMap }) => {
   const f = await fixture({ pane: "%1", mode: "off", footer });
   f.draft("an unsent message");
   const outcome = await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap });
   f.e.cancelPreparation(seat);
-  expect(outcome).toMatchObject(skipMap ? { triggered: true } : { preparation: { delivery: "delivered", compact: "not_sent" } });
-  expect(f.body()).toBe("");
-  expect(f.effects()).toEqual({ compactPastes: skipMap ? 1 : 0, prepPastes: 1, enters: skipMap ? 2 : 1 });
+  expect(outcome).toMatchObject({ triggered: false, reason: "draft_input_busy", preparation: { delivery: "not_sent", compact: "not_sent" } });
+  expect(f.body()).toBe("an unsent message");
+  expect(f.effects()).toEqual({ compactPastes: 0, prepPastes: 0, enters: 0 });
 });
 
 it("checks the composer after buffer setup, immediately before the preparation paste", async () => {
-  const f = await fixture({ pane: "%1", mode: "draft-aware", footer: true });
+  const f = await fixture({ pane: "%1", mode: "off", footer: true });
   f.onStage(() => f.draft("typed while the buffer was prepared"));
   const outcome = await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true });
   expect(outcome).toMatchObject({ reason: "draft_input_busy", preparation: { delivery: "not_sent" } });
@@ -109,44 +108,29 @@ it("checks the composer after buffer setup, immediately before the preparation p
   expect(f.writes).toEqual([]);
 });
 
-it("an explicit draft refusal records its existing reading without draft text", async () => {
-  const f = await fixture({ pane: "%1", mode: "off", refuseDraft: true });
-  f.draft("an unsent message");
-  await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true });
-  const state = f.e.getPreparationState(seat)!;
-  expect(state).toMatchObject({ delivery: "not_sent", inputBox: { status: "typed", confidence: "medium",
-    cursor: { x: 19, y: 2, width: 100000, height: 60 } } });
-  expect(Object.keys(state.inputBox!).sort()).toEqual(["confidence", "cursor", "evidence", "status"]);
-  expect(JSON.parse(readFileSync(join(dirname(state.mapPath), COMPACTION_RECORD_FILE), "utf8"))).toMatchObject({ delivery: "not_sent", inputBox: state.inputBox });
+it("an unreadable composer holds managed preparation without input", async () => {
+  const f = await fixture({ pane: "%1", mode: "off" });
+  vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null);
+  const outcome = await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true });
+  expect(outcome).toMatchObject({ reason: "draft_input_unknown", preparation: { delivery: "not_sent" } });
   expect(f.writes).toEqual([]);
 });
 
-it.each([null, { x: 0, y: 0, width: 100000, height: 60 }])("an unreadable cursor does not impose a default preparation hold (cursor=%j)", async cursor => {
+it("a draft arriving after preparation prevents the managed command paste", async () => {
   const f = await fixture({ pane: "%1", mode: "off" });
-  vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(cursor);
-  vi.spyOn(f.tmux, "captureComposerSnapshot").mockResolvedValue({ ...frame(""), cursor });
-  const outcome = await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true });
-  expect(outcome).toMatchObject({ triggered: true });
-  // This is not a held send: do not invent a refusal reading in the preparation record.
-  expect(f.e.getPreparationState(seat)?.inputBox).toBeUndefined();
-  expect(f.effects()).toEqual({ compactPastes: 1, prepPastes: 1, enters: 2 });
-});
-
-it("an opted-in draft refusal also protects the managed command", async () => {
-  const f = await fixture({ pane: "%1", mode: "off", refuseDraft: true });
   const send = f.transport.send.bind(f.transport);
   vi.spyOn(f.transport, "send").mockImplementation(async (s, text, opts) => {
     if (text.startsWith("/compact")) f.draft("draft before command");
     return send(s, text, opts);
   });
   const outcome = await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true });
-  expect(outcome).toMatchObject({ preparation: { compact: "not_sent" } });
+  expect(outcome).toMatchObject({ reason: "draft_input_busy", preparation: { compact: "not_sent" } });
   expect(f.body()).toBe("draft before command");
   expect(f.effects()).toEqual({ compactPastes: 0, prepPastes: 1, enters: 1 });
 });
 
-it("an opted-in draft refusal protects owed restore input", async () => {
-  const f = await fixture({ pane: "%1", mode: "off", refuseDraft: true });
+it("an owed restore stage holds its place while the composer has a draft", async () => {
+  const f = await fixture({ pane: "%1", mode: "off" });
   expect(await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true })).toMatchObject({ triggered: true });
   f.draft("draft before restore");
   const before = f.writes.length;
@@ -155,29 +139,6 @@ it("an opted-in draft refusal protects owed restore input", async () => {
   expect(f.writes.length).toBe(before);
   expect(f.e.getOwedRestore(seat)?.stage).toBe("turn_boundary");
 });
-
-// #2845: a person's restore notice leaves the map path out and points to rig compact <seat> --state, so the owed restore
-// names the map the restore request uses; under --skip-map, only a map the seat completed anyway.
-it.each([{ skipMap: false, written: true }, { skipMap: true, written: false }, { skipMap: true, written: true }])(
-  "the owed restore names the map the restore request uses (skipMap=$skipMap, map written=$written)", async ({ skipMap, written }) => {
-    const f = await fixture({ pane: "%1", mode: "off" });
-    let mapPath: string | null = null;
-    const real = f.transport.send.bind(f.transport);
-    vi.spyOn(f.transport, "send").mockImplementation(async (s: string, t: string, o?: any) => {
-      const r = await real(s, t, o);
-      if (mapPath === null) { mapPath = f.e.getPreparationState(seat)!.mapPath; if (written) f.stageMap(); }
-      return r;
-    });
-    expect(await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap })).toMatchObject({ triggered: true });
-    // The same answer while the restore request and then the audit are owed: the request landing ends the in-memory carry.
-    for (const stage of ["restore_prompt", "compliance_prompt"]) {
-      expect(await f.e.maybeAutoCompact(input)).toEqual({ triggered: true });
-      const owed = f.e.getOwedRestore(seat)!;
-      expect(owed.stage).toBe(stage);
-      if (written) expect(owed.mapPath).toBe(skipMap ? `${mapPath}.tmp` : mapPath);
-      else expect(owed).not.toHaveProperty("mapPath");
-    }
-  });
 
 it.each([false, true])("empty composer still permits managed preparation and command (footer=%s)", async footer => {
   const f = await fixture({ pane: "%1", mode: "off", footer });
@@ -191,10 +152,10 @@ it("a high-confidence faint suggestion still permits managed input", async () =>
   expect(f.effects()).toEqual({ compactPastes: 1, prepPastes: 1, enters: 2 });
 });
 
-it("default delivery does not hold possible suggestion words without faint styling", async () => {
+it("possible suggestion words without faint styling do not authorize managed input", async () => {
   const f = await fixture({ pane: "%1", mode: "off", suggestion: "plain" });
-  expect(await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true })).toMatchObject({ triggered: true });
-  expect(f.effects()).toEqual({ compactPastes: 1, prepPastes: 1, enters: 2 });
+  expect(await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true })).toMatchObject({ reason: "draft_input_unknown" });
+  expect(f.writes).toEqual([]);
 });
 
 it("automatic, recorded pane (existing-behaviour control, green before this PR's fixes): busy then idle, the lifecycle lease refuses before any send, so no /compact and no held row", async () => {
@@ -280,20 +241,84 @@ it("a draft-aware seat with a recorded pane is not affected by the pane check", 
 });
 
 // #2575: a seat whose empty input box OpenRig can't read used to sit unrestored, retried on every poll. After two idle
-describe("managed restore uses ordinary draft defaults", () => {
+// polls that can't read the box, a post-compaction step goes in and is recorded as over an unreadable box; a typed draft
+// still holds it, and so does the stricter check after a /compact whose result was lost.
+describe("#2575: a post-compaction step OpenRig can't read the input box for", () => {
+  const restorePastes = (f: Awaited<ReturnType<typeof fixture>>) =>
+    f.writes.filter((w) => w.startsWith("paste:") && w.includes("Please respond to this normal user message now")).length;
   async function owedRestore(f: Awaited<ReturnType<typeof fixture>>) {
     expect(await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true })).toMatchObject({ triggered: true });
-    expect(await f.e.maybeAutoCompact(input)).toEqual({ triggered: true });
+    expect(await f.e.maybeAutoCompact(input)).toEqual({ triggered: true }); // the turn boundary, into an empty box
     expect(f.e.getOwedRestore(seat)?.stage).toBe("restore_prompt");
   }
-  it.each(["typed", "unreadable"] as const)("delivers the owed restore and audit over %s input without idle-poll counting", async kind => {
-    const f = await fixture({ pane: "%1", mode: "off" }); await owedRestore(f);
-    if (kind === "typed") f.draft("an unsent message");
-    else vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null);
-    expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: true });
-    expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: true });
-    expect(f.e.getOwedRestore(seat)).toBeNull();
+
+  it("goes in after two idle polls that can't read the box, recorded as over an unreadable box, never as empty", async () => {
+    const f = await fixture({ pane: "%1", mode: "off" });
+    await owedRestore(f);
+    const cursor = vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null); // an empty box that can't be confirmed live
+    const held: Array<ReturnType<typeof f.e.getOwedRestore>> = [];
+    for (let i = 1; i <= 2; i++) {
+      expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
+      held.push(f.e.getOwedRestore(seat));
+    }
+    expect(restorePastes(f)).toBe(0);
+    expect(await f.e.maybeAutoCompact(input)).toEqual({ triggered: true });
+    expect(restorePastes(f)).toBe(1);
+    // What the two held polls showed: each counted, and the state said what would happen next.
+    held.forEach((owed, i) => expect(owed?.lastDelivery).toMatchObject({ stage: "restore_prompt", ok: false, reason: "draft_input_unknown", unreadable: i + 1 }));
+    expect(held[1]?.detail).toContain("After 2 idle polls that can't read the input box, the step goes in anyway; a typed draft still holds it.");
+    const owed = f.e.getOwedRestore(seat)!;
+    expect(owed.stage).toBe("compliance_prompt");
+    expect(owed.lastDelivery).toEqual({ stage: "restore_prompt", at: expect.any(String), ok: true,
+      reason: "delivered_over_unreadable_input_box", inputBox: "unknown", failures: 0 });
+    expect(owed.detail).toContain("The restore request went in at");
+    expect(owed.detail).toContain("over an input box OpenRig couldn't read (it read unknown); a draft there, if any, may hold its text.");
+    expect(cursor).toHaveBeenCalled();
   });
+
+  it("a typed draft still holds it after two unreadable polls, and the run starts again", async () => {
+    const f = await fixture({ pane: "%1", mode: "off" });
+    await owedRestore(f);
+    const cursor = vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null);
+    for (let i = 0; i < 2; i++) await f.e.maybeAutoCompact(input);
+    f.draft("half a sentence");
+    cursor.mockResolvedValue({ x: 2 + "half a sentence".length, y: 2, width: 100000, height: 60 }); // typed, cursor after it
+    for (let i = 0; i < 3; i++) expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
+    expect(f.body()).toBe("half a sentence");
+    expect(restorePastes(f)).toBe(0);
+    expect(f.e.getOwedRestore(seat)).toMatchObject({ stage: "restore_prompt", lastDelivery: { ok: false, reason: "draft_input_busy" } });
+    expect(f.e.getOwedRestore(seat)?.lastDelivery?.unreadable).toBeUndefined();
+  });
+
+  it("typed text with Claude's suggestion after it still holds it after two unreadable polls", async () => {
+    const f = await fixture({ pane: "%1", mode: "off" });
+    await owedRestore(f);
+    const cursor = vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null);
+    for (let i = 0; i < 2; i++) await f.e.maybeAutoCompact(input);
+    f.draft("fix\x1b[2m the typecheck errors\x1b[22m");
+    cursor.mockResolvedValue({ x: 2 + "fix".length, y: 2, width: 100000, height: 60 });
+    for (let i = 0; i < 3; i++) expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
+    expect(restorePastes(f)).toBe(0);
+    expect(f.body()).toBe("fix\x1b[2m the typecheck errors\x1b[22m");
+    expect(f.e.getOwedRestore(seat)?.stage).toBe("restore_prompt");
+  });
+
+  it("held drafts with Claude's suggestion don't count: one unreadable poll after them still holds the step", async () => {
+    const f = await fixture({ pane: "%1", mode: "off" });
+    await owedRestore(f);
+    f.draft("fix\x1b[2m the typecheck errors\x1b[22m");
+    const cursor = vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue({ x: 2 + "fix".length, y: 2, width: 100000, height: 60 });
+    for (let i = 0; i < 2; i++) await f.e.maybeAutoCompact(input);
+    const mixed = f.e.getOwedRestore(seat)?.lastDelivery;
+    f.draft("");
+    cursor.mockResolvedValue(null);
+    expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
+    expect(restorePastes(f)).toBe(0);
+    expect(mixed).toMatchObject({ reason: "draft_input_unknown", inputBox: "typed-with-suggestion" });
+    expect(mixed?.unreadable).toBeUndefined();
+    expect(f.e.getOwedRestore(seat)?.lastDelivery).toMatchObject({ reason: "draft_input_unknown", inputBox: "unknown", unreadable: 1 });
+  });
+
   it("a step held as retained reads as still owed, never as gone in", async () => {
     const f = await fixture({ pane: "%1", mode: "off" });
     await owedRestore(f);
@@ -308,56 +333,18 @@ describe("managed restore uses ordinary draft defaults", () => {
     expect(owed.detail).not.toContain("goes in anyway");
   });
 
-  it("reconciles its own written compact before restoring, then resumes ordinary delivery", async () => {
-    const f = await fixture({ pane: "%1", mode: "off" }); const real = f.transport.send.bind(f.transport);
-    let commands = 0;
-    vi.spyOn(f.transport, "send").mockImplementation(async (s: string, text: string, opts?: any) => {
-      if (text.startsWith("/compact")) { commands++; f.draft(text); return { ok: false, sessionName: s, sent: true, inputPhase: "written", reason: "submit_failed" } as any; }
-      return real(s, text, opts);
-    });
+  it("after a /compact whose result was lost, an unreadable box still holds every step, however many polls", async () => {
+    const f = await fixture({ pane: "%1", mode: "off" });
+    const real = f.transport.send.bind(f.transport);
+    vi.spyOn(f.transport, "send").mockImplementation(async (s: string, text: string, opts?: any) => text.startsWith("/compact")
+      ? { ok: false, sessionName: s, sent: false, inputPhase: "written", reason: "submit_failed" } as any : real(s, text, opts));
     await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true });
     expect(f.e.getPreparationState(seat)).toMatchObject({ compact: "uncertain" });
-    const written = f.body(); expect(written).toMatch(/^\/compact /);
+    expect(f.e.getOwedRestore(seat)?.stage).toBe("turn_boundary");
+    vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null);
     const before = f.writes.length;
-    for (let i = 0; i < 3; i++) expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
-    expect(f.body()).toBe(written); expect(f.writes.length).toBe(before);
+    for (let i = 0; i < 5; i++) expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
+    expect(f.writes.length).toBe(before);
     expect(f.e.getOwedRestore(seat)).toMatchObject({ stage: "turn_boundary", held: true });
-    // Even after a clear read, the final input check protects a write that appears before the paste.
-    f.draft(""); f.onStage(() => f.draft(written));
-    expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: false });
-    expect(f.body()).toBe(written); expect(f.writes.length).toBe(before);
-    expect(f.e.getOwedRestore(seat)).toMatchObject({ stage: "turn_boundary", held: true });
-    // External resolution of the original write, not a speculative Enter from the enforcer.
-    f.onStage(() => {}); f.draft("");
-    expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: true });
-    f.draft("unrelated ordinary draft");
-    for (let i = 0; i < 2; i++) expect(await f.e.maybeAutoCompact(input)).toMatchObject({ triggered: true });
-    expect(commands).toBe(1); expect(f.e.getOwedRestore(seat)).toBeNull();
   });
-});
-
-// Managed input follows the ordinary product default, not an internal composer policy.
-it.each(["typed", "unreadable"] as const)("default managed preparation delivers over %s input", async kind => {
-  const f = await fixture({ pane: "%1", mode: "off" });
-  if (kind === "typed") f.draft("an unsent message");
-  else vi.spyOn(f.tmux, "getPaneCursorPosition").mockResolvedValue(null);
-  await f.e.maybeAutoCompact(input);
-  expect(f.e.getPreparationState(seat)).toMatchObject({ delivery: "delivered" });
-  expect(f.effects()).toMatchObject({ prepPastes: 1, compactPastes: 0, enters: 1 });
-});
-
-it("explicit transport draft refusal still protects managed preparation", async () => {
-  const f = await fixture({ pane: "%1", mode: "off", refuseDraft: true });
-  f.draft("an unsent message");
-  await f.e.maybeAutoCompact(input);
-  expect(f.e.getPreparationState(seat)).toMatchObject({ delivery: "not_sent" });
-  expect(f.writes).toEqual([]);
-  expect(f.body()).toBe("an unsent message");
-});
-
-it("the managed idle wait treats only a recognized draft according to the ordinary default", async () => {
-  const f = await fixture({ pane: "%1", mode: "off" }); f.draft("an unsent message");
-  (f.transport as any).classifySendReadiness = async () => ({ state: "needs_input", reason: "prompt_draft", evidenceSource: "pane_heuristic" });
-  expect(await f.e.triggerManualCompact(input, { operatorInitiated: true, skipMap: true })).toMatchObject({ triggered: true });
-  expect(f.effects()).toMatchObject({ prepPastes: 1, compactPastes: 1, enters: 2 });
 });

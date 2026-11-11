@@ -61,8 +61,6 @@ export interface EnvelopeMeta {
   /** Twin of pane-envelope's field: the row a person's (@external) message delivers, named in the
    *  reply hint with --reply-to so the answer joins its Slack thread. ABSENT ⇒ the plain hint. */
   replyToQitem?: string;
-  /** Twin of pane-envelope's field (#2895 (a)): false ⇒ the reply line names no `rig send`. ABSENT or true ⇒ today's hint. */
-  senderReachable?: boolean;
 }
 
 /** The To-line projection + anti-storm scale (header-alone distinguishability). */
@@ -110,9 +108,7 @@ export function wrapSendBody(
     ? `↩ Reply if needed: rig queue create --destination ${senderLabel}${meta?.replyToQitem ? ` --human-intent update --reply-to ${meta.replyToQitem}` : ""} --summary "<one line>" --body "..." --verify`
     : isHumanSeatSessionRef(personAddress)
       ? `↩ Reply if needed: rig queue create --destination ${senderLabel} --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify`
-      : meta?.senderReachable === false
-        ? `↩ No reply by rig send: ${senderLabel} has no session.`
-        : `↩ Reply: rig send ${senderLabel} "..."`;
+      : `↩ Reply: rig send ${senderLabel} "..."`;
   return [...header, "---", body, "---", reply].join("\n");
 }
 
@@ -250,7 +246,7 @@ export function sendCommand(depsOverride?: SendDeps): Command {
     .option("--force", "Back-compat no-op: a mid-task/busy pane already sends-with-advisory by default; --force never bypasses the interactive-prompt/permission guard")
     .option("--wait-for-idle <seconds>", "Wait until the target is explicitly idle before sending. If it's still busy, or its activity is unknown, when the wait ends, nothing is sent (exit 1) and nothing is kept to send later; put separate work in a queue row (rig queue create)")
     .option("--raw", "Send exact text/keystrokes without the From/To messaging envelope (still guarded against interactive prompts)")
-    .option("--dangerously-interact", "DANGEROUS: type an answer as keystrokes into an interactive prompt (implies --raw; requires --reason). Letters can select menu shortcuts; CR/ESC act as keys. Enter is added for the complete visibly staged answer, or away from a recognized prompt when the input box can't be found or read.")
+    .option("--dangerously-interact", "DANGEROUS: type an answer as keystrokes into an interactive prompt (implies --raw; requires --reason). Letters can select menu shortcuts; CR/ESC act as keys. Enter is added only for the complete visibly staged answer.")
     .option("--type-without-checking", "With --dangerously-interact: type without reading or clearing existing input; may join or submit that text")
     .option("--reason <text>", "Why the prompt is being driven (required with --dangerously-interact; recorded in the audit log)")
     .option("--urgent", "Mark this message urgent: it types at seats whose interruption level holds other messages. Anyone may mark one; the recipient sees who did")
@@ -326,10 +322,8 @@ would run the envelope lines; the output says so. Use
 --dangerously-interact --reason "<why>" to DELIBERATELY drive a prompt (select an
 option or approve a permission) — the only override of the prompt guard; it
 implies --raw and is audit-logged. The answer is typed as keystrokes: letters may
-be menu shortcuts, and CR/ESC act as keys. An Enter is added when the complete
-answer is visibly staged in a recognized text input, and, away from a recognized
-prompt or menu, when the input box can't be found or read (the result says so).
-Combining --verify with
+be menu shortcuts, and CR/ESC act as keys. An Enter is added only when the complete
+answer is visibly staged in a recognized text input. Combining --verify with
 --dangerously-interact never adds an automatic submit retry, even when the daemon
 did not detect a prompt or did not report its disposition. Unknown consumption
 is not a send failure. On a managed seat with the delivery guard attached, a
@@ -338,10 +332,7 @@ pasted text stops the send and is shown only to you, separately from recognized
 dim suggestions. Collapsed paste contents and unrecognized inputs are not known.
 Inspect the native terminal, deliberately clear its prompt with native/tmux
 controls, then retry. Manual clearing runs outside OpenRig's lease and observation
-checks and is not recorded. An input that can't be read doesn't stop the send:
-the answer is typed, nothing is cleared, the result says the input couldn't be
-read, and the answer may join or submit what is there.
---type-without-checking explicitly skips this read;
+checks and is not recorded. --type-without-checking explicitly skips this read;
 it does not clear anything and may join or submit existing text. Human typing
 can still race a capture and paste; the check is not atomic.
 
@@ -1143,11 +1134,9 @@ async function runFanOutSend(params: {
   }
 
   const data = res.data;
-  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; outcome?: string; envelopeOmitted?: boolean; managedCompaction?: { notice?: unknown }; existingInput?: unknown; warning?: string }>) ?? [];
-  // Context beside a recipient's own result: its own advisory (such as unreadable input), and whether
-  // it was in a managed compaction or restore when the send ran.
+  const results = (data["results"] as Array<{ sessionName: string; ok: boolean; error?: string; outcome?: string; envelopeOmitted?: boolean; managedCompaction?: { notice?: unknown }; existingInput?: unknown }>) ?? [];
+  // Context beside a recipient's own result: it was in a managed compaction or restore when the send ran.
   const printNotice = (r: (typeof results)[number]) => {
-    if (r.warning) console.log(`${r.sessionName}: Advisory: ${r.warning}`);
     if (typeof r.managedCompaction?.notice === "string") console.log(`Notice: ${r.managedCompaction.notice}`);
   };
   // Round-2 F1 (desk-binding): ONE verdict line per recipient. A
