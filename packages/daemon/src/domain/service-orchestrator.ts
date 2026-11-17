@@ -30,8 +30,8 @@ export class ServiceOrchestrator {
   }
 
   /** Whether Docker Compose v2 is available, before anything that needs it is set up. */
-  composeAvailable(): Promise<{ ok: true } | { ok: false; message: string }> {
-    return this.composeAdapter.composeAvailable();
+  composeAvailable(dockerContext?: string): Promise<{ ok: true } | { ok: false; message: string }> {
+    return this.composeAdapter.composeAvailable(dockerContext);
   }
 
   /**
@@ -56,6 +56,7 @@ export class ServiceOrchestrator {
     const upResult = await this.composeAdapter.up({
       composeFile: record.composeFile,
       projectName: record.projectName,
+      dockerContext: spec.dockerContext,
       profiles: spec.profiles,
     });
 
@@ -75,6 +76,7 @@ export class ServiceOrchestrator {
         const statusResult = await this.composeAdapter.status({
           composeFile: record.composeFile,
           projectName: record.projectName,
+          dockerContext: spec.dockerContext,
           profiles: spec.profiles,
         });
 
@@ -124,6 +126,7 @@ export class ServiceOrchestrator {
     const statusResult = await this.composeAdapter.status({
       composeFile: record.composeFile,
       projectName: record.projectName,
+      dockerContext: spec.dockerContext,
       profiles: spec.profiles,
     });
     if (!statusResult.ok) {
@@ -147,17 +150,18 @@ export class ServiceOrchestrator {
     if (!record) {
       return { ok: true }; // No services — nothing to tear down
     }
-    const successor = this.rigRepo.getLiveServicesSuccessor(rigId, record.projectName);
+    const spec = this.parseSpec(record);
+    const successor = this.rigRepo.getLiveServicesSuccessor(rigId, record.projectName, spec?.dockerContext);
     if (successor) {
       return { ok: true, kept: `kept project ${record.projectName}: still used by rig ${successor.name} (${successor.id})` };
     }
 
-    const spec = this.parseSpec(record);
     const policy = opts?.policyOverride ?? spec?.downPolicy ?? "down";
 
     const result = await this.composeAdapter.down({
       composeFile: record.composeFile,
       projectName: record.projectName,
+      dockerContext: spec?.dockerContext,
       profiles: spec?.profiles,
       policy,
     });
@@ -182,6 +186,7 @@ export class ServiceOrchestrator {
     const statusResult = await this.composeAdapter.status({
       composeFile: record.composeFile,
       projectName: record.projectName,
+      dockerContext: spec?.dockerContext,
       profiles: spec?.profiles,
     });
     if (!statusResult.ok) {
