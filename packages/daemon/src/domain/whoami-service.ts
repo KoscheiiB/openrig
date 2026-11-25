@@ -4,6 +4,8 @@ import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { resolveWorkspaceContext, type WhoamiWorkspaceBlock } from "./workspace/workspace-resolver.js";
+import { rigStillBeingBuilt } from "./rigs-being-built.js";
+import { shownHubUrl } from "./network/network-requests.js";
 
 export interface WhoamiResult {
   resolvedBy: "node_id" | "session_name";
@@ -26,6 +28,10 @@ export interface WhoamiResult {
     profile: string | null;
     resolvedSpecName: string | null;
     resolvedSpecVersion: string | null;
+    /** The seat's active network binding (`rig network connect`), present only while it has one: the binding id, the
+     *  seat's address on the hub, and the hub, with any query hidden as `rig network status` shows it. The peers it can
+     *  ask are `rig network peers`'. */
+    networkBinding?: { id: string; hubSeat: string; hubUrl: string };
   };
   peers: Array<{
     logicalId: string;
@@ -43,6 +49,9 @@ export interface WhoamiResult {
    * Additive note only — `peers[]` name and shape are unchanged.
    */
   peersNote: string;
+  /** Present only while `rig up` is still creating this rig's seats and edges (#2871): the peers and edges are the ones
+   *  created so far, and more may come. Absent once the rig is built, and for every rig not being built now. */
+  rosterState?: "building";
   edges: {
     outgoing: Array<{ kind: string; to: { logicalId: string; sessionName: string | null } }>;
     incoming: Array<{ kind: string; from: { logicalId: string; sessionName: string | null } }>;
@@ -141,6 +150,11 @@ interface WhoamiDeps {
   contextUsageStore?: import("./context-usage-store.js").ContextUsageStore;
 }
 
+/** Said first in `peersNote` while the rig is still being built, so a seat doesn't plan around a teammate that hasn't been
+ *  created yet. Exported for the CLI's bounded note. */
+export const ROSTER_BUILDING_NOTE = "rosterState = building: `rig up` is still creating this team's seats and edges, so the peers and edges "
+  + "below are only the ones created so far and more may come; run `rig whoami` again once `rig up` finishes. ";
+
 export class WhoamiService {
   private db: Database.Database;
   private rigRepo: RigRepository;
@@ -154,6 +168,15 @@ export class WhoamiService {
     this.sessionRegistry = deps.sessionRegistry;
     this.transcriptStore = deps.transcriptStore;
     this.contextUsageStore = deps.contextUsageStore ?? null;
+  }
+
+  /** A node has at most one active binding (idx_network_bindings_active_node). A database from before the network
+   *  connector has no table, and so no binding. */
+  private activeNetworkBinding(nodeId: string): WhoamiResult["identity"]["networkBinding"] {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'network_bindings'").get()) return undefined;
+    const row = this.db.prepare("SELECT id, hub_seat AS hubSeat, hub_url AS hubUrl FROM network_bindings WHERE node_id = ? AND state = 'active'")
+      .get(nodeId) as { id: string; hubSeat: string; hubUrl: string } | undefined;
+    return row && { id: row.id, hubSeat: row.hubSeat, hubUrl: shownHubUrl(row.hubUrl) };
   }
 
   private senderAddress(sessionName: string, nodeId: string): string {
@@ -259,6 +282,8 @@ export class WhoamiService {
       resolvedSpecName: nodeRow.resolved_spec_name,
       resolvedSpecVersion: nodeRow.resolved_spec_version,
     };
+    const networkBinding = this.activeNetworkBinding(nodeRow.id);
+    if (networkBinding) identity.networkBinding = networkBinding;
 
     // Build peers — other nodes in this rig with their current sessions
     const peers: WhoamiResult["peers"] = [];
@@ -356,11 +381,14 @@ export class WhoamiService {
       envOverride: query.targetRepoOverride ?? process.env["OPENRIG_TARGET_REPO"] ?? null,
     });
 
+    const building = rigStillBeingBuilt(this.db, nodeRow.rig_id);
     return {
       resolvedBy,
       identity,
       peers,
-      peersNote: "peers = this rig's roster excluding self (no edge filter); edges = directional relationships; use `rig ps --nodes` for node inventory including self + live state",
+      ...(building ? { rosterState: "building" as const } : {}),
+      peersNote: (building ? ROSTER_BUILDING_NOTE : "")
+        + "peers = this rig's roster excluding self (no edge filter); edges = directional relationships; use `rig ps --nodes` for node inventory including self + live state",
       edges: { outgoing, incoming },
       transcript,
       commands: { sendExamples, captureExamples },

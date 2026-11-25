@@ -7,6 +7,7 @@
 import type { Screen } from "./types.js";
 import type { Style } from "./theme.js";
 import { reducedMotion } from "./motion.js";
+import { columnIndex } from "./visual-layout.js";
 
 const STATUS_TOKENS: Array<[RegExp, "ok" | "warn" | "error" | "dim"]> = [
   [/\b(running|active|ready|verified|working)\b/g, "ok"],
@@ -47,6 +48,10 @@ function paintExplorerBody(text: string, s: Style): string {
   if (/\(unreachable\)/.test(text)) {
     const at = text.indexOf("(unreachable)");
     return text.slice(0, at) + s.paint("error", "(unreachable)") + text.slice(at + "(unreachable)".length);
+  }
+  if (text.includes("(unknown)")) {
+    const at = text.indexOf("(unknown)");
+    return text.slice(0, at) + s.paint("dim", "(unknown)") + text.slice(at + "(unknown)".length);
   }
   if (/\((recoverable|degraded|stopped|attention_required)\)/.test(text)) {
     return text.replace(/\((recoverable|degraded|stopped|attention_required)\)/, (m) => s.paint("warn", m));
@@ -187,9 +192,8 @@ export function stylizeLines(screen: Screen, s: Style): string[] {
     // The pane border lives at the rendered L2 boundary — located
     // positionally, never by scanning: the navigator's │ rails would shadow
     // a first-index search (slice-17 locked-rail resolution).
-    const explW = screen.explorerWidth;
-    const border = line.charAt(explW) === "┃" ? explW : -1;
-    if (border === explW) {
+    const border = columnIndex(line, screen.explorerWidth);
+    if (line[border] === "┃") {
       const left = line.slice(0, border);
       const marker = line.slice(border + 1, border + 2);
       const right = line.slice(border + 2);

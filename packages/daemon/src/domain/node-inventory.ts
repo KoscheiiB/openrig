@@ -1,4 +1,6 @@
-import { sessionCommunityRunnerSelect } from "./session-registry.js";
+import { recordedRunner, sessionCommunityRunnerSelect } from "./session-registry.js";
+import { configuredAccount } from "./configured-account.js";
+import { restoreOutcomesByIntendedNode } from "./restore-topology.js";
 import { physicalSessionName } from "./session-registry.js";
 import fs from "node:fs";
 import type { CaptureObserver, ObservedBinding } from "./capture-observer.js";
@@ -10,11 +12,12 @@ import { identityVerdictConfirmsSessionMissing, identityVerdictConfirmsExecutorS
 import { resolveSeatEffort } from "./seat-effort.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { buildOrientedMap } from "./startup-proof.js";
+import { getLatestStartupFailedEvent } from "./startup-orchestrator.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import type { ContextUsageStore } from "./context-usage-store.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import type { AgentActivityStore } from "./agent-activity-store.js";
-import { isClaudeRateLimitHook } from "./provider/claude-interruption.js";
+import { claudeProviderFailureReason, isClaudeRateLimitHook } from "./provider/claude-interruption.js";
 import type { SeatActivityService } from "./seat-activity-service.js";
 import { deriveDisplayActivity, type ArbitratedSeatState, type EvidenceRungId } from "./activity-taxonomy.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
@@ -24,8 +27,19 @@ import { RigRepository, findLatestUsableSnapshot, findLatestUsableSnapshotsForAl
 import { hasCompleteGuidanceBlock, seatGuidanceFile } from "./restore-guidance.js";
 import { resolveNodeWorkspace } from "./workspace/workspace-resolver.js";
 import { deriveCanonicalSessionName } from "./session-name.js";
-import { buildNativeResumeCommand, buildCodexResumeCore } from "./native-resume-probe.js";
-import { AppliedLaunchObservationStore } from "./applied-launch-observation-store.js";
+import {
+  buildCodexResumeDisplay,
+  buildNativeResumeCommand,
+  buildNativeResumeDisplay,
+  type CodexResumeDisplayInput,
+} from "./native-resume-probe.js";
+import { AppliedLaunchObservationStore, type StoredAppliedLaunchObservation } from "./applied-launch-observation-store.js";
+import { resolveLaunchOverrideFromFacts, type LaunchOverrideSelectionFact } from "./native-permission-store.js";
+import {
+  readRegularCustomPolicyFile,
+  resolveDisplayedRestorePosture,
+  resolvePersistedRestorePosture,
+} from "./permission-policy/persisted-restore-posture.js";
 import { readReadyFreshLaunchFences } from "./fresh-occupant-relation.js";
 import { daemonTmuxServerArgs, daemonTmuxServerInfo, tmuxAttachCommand } from "../adapters/tmux-server.js";
 import { communityHarnessLabel } from "./community-harness-presets.js";
@@ -46,12 +60,32 @@ interface InventoryRow {
   pod_namespace: string | null;
   role: string | null;
   runtime: string | null;
+  claude_token_ref: string | null;
+  has_claude_token_ref: number;
+  account_home: string | null;
   model: string | null;
   effort: string | null;
   effort_choice: string | null;
   codex_config_profile: string | null;
+  codex_permissions_json: string | null;
+  node_permission_policy: string | null;
+  node_policy_origin: string | null;
+  node_policy_resolved_target: string | null;
+  node_policy_declaring_dir: string | null;
+  node_policy_launch_posture: string | null;
+  rig_permission_policy: string | null;
+  rig_policy_origin: string | null;
+  rig_policy_resolved_target: string | null;
+  rig_policy_declaring_dir: string | null;
+  rig_policy_launch_posture: string | null;
+  rig_non_interruptive: number | null;
   claude_mcp: ClaudeMcp | null;
   launch_wrapper: string | null;
+  keep_alive: number | null;
+  keep_alive_attempts: number | null;
+  keep_alive_exhausted_at: string | null;
+  keep_alive_last_error: string | null;
+  keep_alive_last_attempt_at: string | null;
   agent_ref: string | null;
   profile: string | null;
   cwd: string | null;
@@ -72,6 +106,7 @@ interface InventoryRow {
   session_community_harness?: string | null;
   session_community_runner?: number | null;
   intentionally_stopped: number | null;
+  stop_attempt: string | null;
   startup_status: string | null;
   resume_type: string | null;
   resume_token: string | null;
@@ -114,8 +149,144 @@ interface BindingRow {
 
 // -- Helpers --
 
-function computeResumeCommand(runtime: string | null, resumeToken: string | null, codexConfigProfile?: string | null, codexDaemonOptOut?: boolean, claudeMcp?: ClaudeMcp | null): string | null {
-  return buildNativeResumeCommand(runtime, resumeToken, null, codexConfigProfile, codexDaemonOptOut, claudeMcp);
+function readCustomPolicyCached(
+  target: string,
+  cache: Map<string, string | null>,
+): string {
+  if (cache.has(target)) {
+    const cached = cache.get(target)!;
+    if (cached === null) throw new Error(`Cached unreadable custom policy target: ${target}`);
+    return cached;
+  }
+  try {
+    const content = readRegularCustomPolicyFile(target);
+    cache.set(target, content);
+    return content;
+  } catch (error) {
+    cache.set(target, null);
+    throw error;
+  }
+}
+
+function resolveBasePolicyPosture(
+  row: InventoryRow,
+  customPolicyCache: Map<string, string | null>,
+): { posture: "floor" | "full_bypass" | "auto"; emptySavedPosture: boolean } {
+  const snapshot = {
+    nodeOrigin: row.node_policy_origin,
+    nodeLaunchPosture: row.node_policy_launch_posture,
+    nodeResolvedTarget: row.node_policy_resolved_target,
+    nodeDeclaringDir: row.node_policy_declaring_dir,
+    nodeRef: row.node_permission_policy,
+    rigOrigin: row.rig_policy_origin,
+    rigLaunchPosture: row.rig_policy_launch_posture,
+    rigResolvedTarget: row.rig_policy_resolved_target,
+    rigDeclaringDir: row.rig_policy_declaring_dir,
+    rigRef: row.rig_permission_policy,
+  };
+  const readFile = (target: string) => readCustomPolicyCached(target, customPolicyCache);
+  const posture = resolveDisplayedRestorePosture(snapshot, { readFile });
+  const raw = row.node_policy_launch_posture === "" || row.rig_policy_launch_posture === ""
+    ? resolvePersistedRestorePosture({
+        getNodeProvenance: () =>
+          snapshot.nodeOrigin != null && snapshot.nodeLaunchPosture != null
+            ? {
+                origin: snapshot.nodeOrigin,
+                launchPosture: snapshot.nodeLaunchPosture,
+                resolvedTarget: snapshot.nodeResolvedTarget,
+                declaringDir: snapshot.nodeDeclaringDir,
+                nodeRef: snapshot.nodeRef,
+              }
+            : null,
+        getFallbackRigRef: () => snapshot.rigRef,
+        getRigProvenance: () =>
+          snapshot.rigOrigin != null && snapshot.rigLaunchPosture != null
+            ? {
+                origin: snapshot.rigOrigin,
+                launchPosture: snapshot.rigLaunchPosture,
+                resolvedTarget: snapshot.rigResolvedTarget,
+                declaringDir: snapshot.rigDeclaringDir,
+                rigRef: snapshot.rigRef,
+              }
+            : null,
+        readFile,
+      })
+    : posture;
+  return { posture, emptySavedPosture: raw === "" };
+}
+
+type PermissionSelectionsLookup =
+  | { state: "available"; byNodeId: Map<string, { runtime: string; mode: string }> }
+  | { state: "unavailable"; error: unknown };
+
+type CodexResumeResolution =
+  | { ok: true; input: CodexResumeDisplayInput }
+  | { ok: false; diagnostic: string };
+
+function resolveCodexResumeResolution(
+  row: InventoryRow,
+  recordedLaunch: StoredAppliedLaunchObservation | undefined,
+  permissionSelections: PermissionSelectionsLookup,
+  customPolicyCache: Map<string, string | null>,
+  launchWrapper?: readonly string[] | null,
+): CodexResumeResolution {
+  const selection: LaunchOverrideSelectionFact = permissionSelections.state === "unavailable"
+    ? permissionSelections
+    : { state: "available", value: permissionSelections.byNodeId.get(row.node_id) ?? null };
+  let override: ReturnType<typeof resolveLaunchOverrideFromFacts>;
+  try {
+    override = resolveLaunchOverrideFromFacts({
+      nodeId: row.node_id,
+      logicalId: row.logical_id,
+      runtime: "codex",
+      selection,
+      codexPermissionsJson: row.codex_permissions_json,
+      launchDefaultMetadata: {
+        rigName: row.rig_name,
+        memberPolicy: row.node_permission_policy,
+        rigPolicy: row.rig_permission_policy,
+        codexProfile: row.codex_config_profile,
+      },
+    });
+  } catch (error) {
+    return { ok: false, diagnostic: `Permission selection: ${(error as Error).message}` };
+  }
+  const basePosture = override.codexPermissions || override.launchPosture
+    ? undefined
+    : resolveBasePolicyPosture(row, customPolicyCache);
+  return {
+    ok: true,
+    input: {
+      codexConfigProfile: row.codex_config_profile,
+      codexDaemonOptOut: recordedLaunch?.daemonOptOut,
+      codexPermissions: override.codexPermissions,
+      resolvedPosture: override.codexPermissions
+        ? "floor"
+        : (override.launchPosture ?? basePosture!.posture),
+      ...(basePosture?.emptySavedPosture ? { emptySavedPosture: true } : {}),
+      nonInterruptive: row.rig_non_interruptive === 1,
+      kernelAuthority: override.kernelAuthority === true,
+      teamPermissionDefault: override.teamPermissionDefault === true,
+      recordedLaunch: recordedLaunch ?? null,
+      ...(launchWrapper && launchWrapper.length > 0 ? { launchWrapper } : {}),
+    },
+  };
+}
+
+function readPermissionSelectionsMap(db: Database.Database): PermissionSelectionsLookup {
+  try {
+    const rows = db.prepare("SELECT node_id, runtime, mode FROM node_permission_selections").all() as Array<{
+      node_id: string;
+      runtime: string;
+      mode: string;
+    }>;
+    return {
+      state: "available",
+      byNodeId: new Map(rows.map((row) => [row.node_id, { runtime: row.runtime, mode: row.mode }])),
+    };
+  } catch (error) {
+    return { state: "unavailable", error };
+  }
 }
 
 const CODEX_DAEMON_CHOICE_NOT_RECORDED = "Not recorded whether this seat's last managed launch used --no-daemon. If `codex --help` lists --no-daemon, "
@@ -129,9 +300,10 @@ function computeRecoveryGuidance(input: {
   codexConfigProfile?: string | null;
   /** Codex: the current generation's recorded daemon choice; undefined when none was recorded. */
   codexDaemonOptOut?: boolean;
+  codexResolution?: CodexResumeResolution;
   claudeMcp?: ClaudeMcp;
 }): NodeRecoveryGuidance | null {
-  const { runtime, resumeToken, cwd, sessionName, codexConfigProfile, codexDaemonOptOut, claudeMcp } = input;
+  const { runtime, resumeToken, cwd, sessionName, codexConfigProfile, codexDaemonOptOut, codexResolution, claudeMcp } = input;
 
   if (runtime === "claude-code") {
     const commands: string[] = [];
@@ -161,35 +333,54 @@ function computeRecoveryGuidance(input: {
   }
 
   if (runtime === "codex") {
+    if (codexResolution && !codexResolution.ok) {
+      return {
+        summary: `Cannot derive Codex resume command — ${codexResolution.diagnostic}`,
+        commands: [],
+        notes: [codexResolution.diagnostic],
+      };
+    }
     const commands: string[] = [];
     const notes: string[] = [];
+    const codexDisplay = codexResolution?.input;
+    const displayInput: CodexResumeDisplayInput = {
+      ...codexDisplay,
+      codexConfigProfile: codexDisplay?.codexConfigProfile !== undefined ? codexDisplay.codexConfigProfile : codexConfigProfile,
+      codexDaemonOptOut: codexDisplay?.codexDaemonOptOut !== undefined ? codexDisplay.codexDaemonOptOut : codexDaemonOptOut,
+    };
+    const effectiveDaemonChoice = displayInput.codexDaemonOptOut ?? displayInput.recordedLaunch?.daemonOptOut;
+    const primaryDisplay = resumeToken
+      ? buildCodexResumeDisplay(resumeToken, displayInput)
+      : buildCodexResumeDisplay("", displayInput, { useLast: true });
 
-    const daemonOptOut = codexDaemonOptOut === true;
     if (resumeToken) {
-      commands.push(buildCodexResumeCore(resumeToken, codexConfigProfile, undefined, undefined, undefined, undefined, undefined, daemonOptOut));
+      commands.push(primaryDisplay.command);
     }
     if (cwd) {
       commands.push(`cd ${cwd}`);
     }
     if (!resumeToken) {
-      commands.push(buildCodexResumeCore("", codexConfigProfile, true, undefined, undefined, undefined, undefined, daemonOptOut));
+      commands.push(primaryDisplay.command);
     }
 
+    if (primaryDisplay.label) {
+      notes.push(primaryDisplay.label);
+    }
     notes.push("Use workspace and recent prompt text to identify the right conversation.");
-    if (codexConfigProfile) {
-      notes.push(`Preserve Codex config profile: ${codexConfigProfile}`);
+    if (displayInput.codexConfigProfile) {
+      notes.push(`Preserve Codex config profile: ${displayInput.codexConfigProfile}`);
     }
     if (sessionName) {
       notes.push(`If the identity anchor was captured, the picker may include: ${sessionName}`);
     }
-    if (codexDaemonOptOut === undefined) {
+    if (effectiveDaemonChoice === undefined) {
       notes.push(CODEX_DAEMON_CHOICE_NOT_RECORDED);
     }
 
     return {
       summary: resumeToken
-        ? "Try native Codex resume first; the managed launch sets the explicit -s workspace-write floor flag unless a named config profile is present."
-        : `No stored Codex resume token. Try codex${daemonOptOut ? " --no-daemon" : ""} -s workspace-write resume --last; the managed launch sets the explicit -s workspace-write floor flag unless a named config profile is present.`,
+        ? `Try native Codex resume first (${primaryDisplay.command}).`
+        : `No stored Codex resume token. Try ${primaryDisplay.command} from the seat workspace.`,
       commands,
       notes,
     };
@@ -298,6 +489,8 @@ function deriveContinuityOutcome(
   if (row.continuity_outcome) {
     return row.continuity_outcome as NodeInventoryEntry["continuityOutcome"];
   }
+  // That restore brought back an earlier occupant's conversation, not this one's.
+  if (restore?.retiredOccupant) return null;
   const restoreOutcome = restore?.outcome ?? "n-a";
   if (restoreOutcome === "n-a") return null;
   // Acknowledgment and responsiveness clear attention, not conversation lineage.
@@ -317,7 +510,9 @@ function deriveContinuityOutcome(
 
 interface RestoreProjection {
   outcome: NodeRestoreOutcome;
-  resumedRuntime?: "claude-code" | "codex";
+  resumedRuntime?: "claude-code" | "codex" | "pi" | "omp";
+  /** The attempt started before the node's latest completed handover, so it restored an earlier occupant. */
+  retiredOccupant?: true;
 }
 
 function restoreKey(rigId: string, nodeId: string): string {
@@ -378,11 +573,8 @@ function buildRestoreOutcomeMap(db: Database.Database, rigId?: string): Map<stri
         && typeof start?.snapshotId === "string"
         && event?.snapshotId === start.snapshotId && result?.snapshotId === start.snapshotId
         && Array.isArray(result?.nodes) && Array.isArray(roster)) {
-        const intended = new Set(roster.map((node: any) => node?.nodeId));
-        for (const node of result.nodes) {
-          if (typeof node?.nodeId === "string" && intended.has(node.nodeId)) {
-            attempt.outcomes.set(node.nodeId, node.status);
-          }
+        for (const node of restoreOutcomesByIntendedNode(roster, result.nodes).values()) {
+          attempt.outcomes.set(node.nodeId, node.status);
         }
       }
     }
@@ -394,11 +586,13 @@ function buildRestoreOutcomeMap(db: Database.Database, rigId?: string): Map<stri
         && event.to === "operator_recovered" && (event.from === "failed" || event.from === "attention_required")
         && !!attempt && attempt.seq === event.attemptId && attempt.outcomes.get(event.nodeId) === event.from
         && evidence?.tmux === true && evidence.resumeTokenUsed === true && evidence.paneState === "usable"
-        && (evidence.fgProcess === "claude" || evidence.fgProcess === "codex");
+        && (evidence.fgProcess === "claude" || evidence.fgProcess === "codex"
+          || ((evidence.fgProcess === "pi" || evidence.fgProcess === "omp")
+            && evidence.runner?.rpcConfirmed === true && evidence.runner?.identityConfirmed === true));
       const key = restoreKey(row.rig_id, event.nodeId);
       map.set(key, {
         outcome: mapStatus(event.to),
-        ...(strict ? { resumedRuntime: evidence!.fgProcess === "claude" ? "claude-code" : "codex" } : {}),
+        ...(strict ? { resumedRuntime: evidence!.fgProcess === "claude" ? "claude-code" as const : evidence!.fgProcess as "codex" | "pi" | "omp" } : {}),
       });
       // A zero attemptId names no attempt (every subset clear writes it): it acknowledges the outcome it
       // replaces, so it is as current as that outcome. With nothing replaced, it describes no attempt.
@@ -424,7 +618,27 @@ function buildRestoreOutcomeMap(db: Database.Database, rigId?: string): Map<stri
     const fence = fences.get(entry.nodeId);
     if (fence !== undefined && entry.seq < fence) map.delete(key);
   }
+  // A completed handover (a discovered successor included) put a new occupant in the seat. An attempt that started before
+  // it keeps its restore outcome, but its conversation isn't the current occupant's. History is unchanged.
+  const handovers = readHandoverFences(db, rigId);
+  for (const [key, entry] of attemptOf) {
+    const fence = handovers.get(entry.nodeId);
+    const projection = map.get(key);
+    if (projection && fence !== undefined && entry.seq < fence) projection.retiredOccupant = true;
+  }
   return map;
+}
+
+/** Each node's latest completed handover, by event seq. */
+function readHandoverFences(db: Database.Database, rigId?: string): Map<string, number> {
+  // Through each node into its own handover events (idx_events_node_type_seq), as the fresh-launch fence reads.
+  const rows = db.prepare(`
+    SELECT n.id AS nodeId, MAX(e.seq) AS seq FROM nodes n
+    CROSS JOIN events e ON e.node_id = n.id AND e.type = 'seat.handover_completed'
+    ${rigId ? "WHERE n.rig_id = ?" : ""}
+    GROUP BY n.id
+  `).all(...(rigId ? [rigId] : [])) as Array<{ nodeId: string; seq: number }>;
+  return new Map(rows.map((row) => [row.nodeId, row.seq]));
 }
 
 function mapStatus(status: string): NodeRestoreOutcome {
@@ -581,8 +795,8 @@ export function nodeSessionConfirmedMissing(db: Database.Database, nodeId: strin
 
 /** Current positive stopped-executor evidence, without conflating a retained pane with a missing session. */
 export function nodeExecutorStoppedReason(db: Database.Database, nodeId: string): "session_missing" | "pane_exited" | null {
-  const reason = currentIdentityVerdict(db, nodeId)?.reason;
-  return reason === "session_missing" || reason === "pane_exited" ? reason : null;
+  const verdict = currentIdentityVerdict(db, nodeId);
+  return identityVerdictConfirmsSessionMissing(verdict) ? "session_missing" : verdict?.reason === "pane_exited" ? "pane_exited" : null;
 }
 
 export function nodeExecutorConfirmedStopped(db: Database.Database, nodeId: string): boolean {
@@ -591,11 +805,7 @@ export function nodeExecutorConfirmedStopped(db: Database.Database, nodeId: stri
 
 // -- Public API --
 
-/**
- * Get the canonical node inventory for a rig.
- * Single source of truth consumed by CLI, UI, and MCP.
- */
-export function getNodeInventory(db: Database.Database, rigId: string): NodeInventoryEntry[] {
+function projectRigInventoryItems(db: Database.Database, rigId: string): ProjectedNodeInventoryItem[] {
   // Resolve the rig's latest usable snapshot once for the whole projection so per-node
   // recoverability checks share the same source of truth without N extra queries.
   const usableSnapshot = findLatestUsableSnapshot(db, rigId);
@@ -611,13 +821,32 @@ export function getNodeInventory(db: Database.Database, rigId: string): NodeInve
   // map = the prior WHERE rig_id=? filter; oriented history follows the rig's nodes.
   const restoreOutcomes = buildRestoreOutcomeMap(db, rigId);
   const orienteds = buildOrientedMap(db, rigId);
-  const codexDaemonOptOuts = new AppliedLaunchObservationStore(db).readCurrentDaemonOptOuts();
+  const currentLaunchObservations = new AppliedLaunchObservationStore(db).readCurrentObservations();
+  const permissionSelections = readPermissionSelectionsMap(db);
+  const customPolicyCache = new Map<string, string | null>();
 
   const rows = queryInventoryRows(db, rigId);
 
   return rows.map((row) =>
-    buildInventoryEntry(db, row, { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts }),
+    buildInventoryItem(db, row, {
+      usableSnapshot,
+      workspaceSpec,
+      identityVerdicts,
+      restoreOutcomes,
+      orienteds,
+      currentLaunchObservations,
+      permissionSelections,
+      customPolicyCache,
+    }),
   );
+}
+
+/**
+ * Get the canonical node inventory for a rig.
+ * Single source of truth consumed by CLI, UI, and MCP.
+ */
+export function getNodeInventory(db: Database.Database, rigId: string): NodeInventoryEntry[] {
+  return projectRigInventoryItems(db, rigId).map((item) => item.entry);
 }
 
 /**
@@ -640,7 +869,16 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
   const nodeColumns = new Set(db.prepare("PRAGMA table_info(nodes)").all()
     .map((row) => (row as { name?: string }).name));
   const nodeColumnOrNull = (name: string) => nodeColumns.has(name) ? `n.${name}` : "NULL";
+  const rigColumns = new Set(db.prepare("PRAGMA table_info(rigs)").all()
+    .map((row) => (row as { name?: string }).name));
+  const rigColumnOrNull = (name: string) => rigColumns.has(name) ? `r.${name}` : "NULL";
   const codexConfigProfileSelect = nodeColumnOrNull("codex_config_profile");
+  // #2940: a keep_alive seat's recovery incident, on a database that has the budget table.
+  const keepAliveBudget = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_keep_alive_budget'").get();
+  const keepAliveColumn = (name: string) => keepAliveBudget ? `kb.${name}` : "NULL";
+  // #2940: the attempt that recorded a session's stop request, on a database that has it.
+  const sessionStopAttemptSelect = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name?: string }>)
+    .some((column) => column.name === "stop_attempt") ? "s.stop_attempt" : "NULL";
   const stmt = db.prepare(`
     SELECT
       n.id as node_id,
@@ -651,12 +889,32 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       p.namespace as pod_namespace,
       n.role,
       n.runtime,
+      ${nodeColumnOrNull("claude_token_ref")} as claude_token_ref,
+      ${nodeColumns.has("claude_token_ref") ? 1 : 0} as has_claude_token_ref,
+      ${nodeColumnOrNull("account_home")} as account_home,
       n.model,
       ${nodeColumnOrNull("effort")} as effort,
       ${nodeColumnOrNull("effort_choice")} as effort_choice,
       ${codexConfigProfileSelect} as codex_config_profile,
+      ${nodeColumnOrNull("codex_permissions_json")} as codex_permissions_json,
+      ${nodeColumnOrNull("permission_policy")} as node_permission_policy,
+      ${nodeColumnOrNull("policy_origin")} as node_policy_origin,
+      ${nodeColumnOrNull("policy_resolved_target")} as node_policy_resolved_target,
+      ${nodeColumnOrNull("policy_declaring_dir")} as node_policy_declaring_dir,
+      ${nodeColumnOrNull("policy_launch_posture")} as node_policy_launch_posture,
+      ${rigColumnOrNull("permission_policy")} as rig_permission_policy,
+      ${rigColumnOrNull("rig_policy_origin")} as rig_policy_origin,
+      ${rigColumnOrNull("rig_policy_resolved_target")} as rig_policy_resolved_target,
+      ${rigColumnOrNull("rig_policy_declaring_dir")} as rig_policy_declaring_dir,
+      ${rigColumnOrNull("rig_policy_launch_posture")} as rig_policy_launch_posture,
+      ${rigColumnOrNull("non_interruptive")} as rig_non_interruptive,
       ${nodeColumnOrNull("claude_mcp")} as claude_mcp,
       ${nodeColumnOrNull("launch_wrapper")} as launch_wrapper,
+      ${nodeColumnOrNull("keep_alive")} as keep_alive,
+      ${keepAliveColumn("attempts")} as keep_alive_attempts,
+      ${keepAliveColumn("exhausted_at")} as keep_alive_exhausted_at,
+      ${keepAliveColumn("last_error")} as keep_alive_last_error,
+      ${keepAliveColumn("last_attempt_at")} as keep_alive_last_attempt_at,
       n.agent_ref,
       n.profile,
       n.cwd,
@@ -676,6 +934,7 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       ${sessionCommunityHarnessSelect(db)} as session_community_harness,
       ${sessionCommunityRunnerSelect(db)} as session_community_runner,
       s.intentionally_stopped,
+      ${sessionStopAttemptSelect} as stop_attempt,
       s.startup_status,
       s.resume_type,
       s.resume_token,
@@ -690,6 +949,7 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
     LEFT JOIN sessions s ON s.node_id = n.id
       AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
     LEFT JOIN bindings b ON b.node_id = n.id
+    ${keepAliveBudget ? "LEFT JOIN node_keep_alive_budget kb ON kb.node_id = n.id" : ""}
     ${whereClause}
     ORDER BY ${orderClause}
   `);
@@ -729,8 +989,18 @@ interface InventoryBuildContext {
   // batched path) and looked up O(1) here instead of a query per node.
   restoreOutcomes: Map<string, RestoreProjection>;
   orienteds: Map<string, NodeOriented>;
-  /** Each node's current recorded Codex daemon choice (one read per projection); absent = not recorded. */
-  codexDaemonOptOuts: Map<string, boolean>;
+  /** Each node's current recorded launch observation (one read per projection); absent = not recorded. */
+  currentLaunchObservations: Map<string, StoredAppliedLaunchObservation>;
+  /** Explicit per-seat native permission selections (one read per projection), or table-unavailable state. */
+  permissionSelections: PermissionSelectionsLookup;
+  /** Per-inventory-build custom-policy target cache so shared targets are probed/read at most once per build. */
+  customPolicyCache: Map<string, string | null>;
+}
+
+interface ProjectedNodeInventoryItem {
+  entry: NodeInventoryEntry;
+  codexResolution?: CodexResumeResolution;
+  codexDaemonOptOut?: boolean;
 }
 
 /**
@@ -738,17 +1008,48 @@ interface InventoryBuildContext {
  * Apply only current-occupant identity evidence and retain stored status alongside
  * effective status so readers can distinguish absence from registration history.
  */
-function buildInventoryEntry(
+function buildInventoryItem(
   db: Database.Database,
   row: InventoryRow,
   ctx: InventoryBuildContext,
-): NodeInventoryEntry {
-  const { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts } = ctx;
+): ProjectedNodeInventoryItem {
+  const {
+    usableSnapshot,
+    workspaceSpec,
+    identityVerdicts,
+    restoreOutcomes,
+    orienteds,
+    currentLaunchObservations,
+    permissionSelections,
+    customPolicyCache,
+  } = ctx;
   const launchWrapper = parseStoredLaunchWrapper(row.launch_wrapper, `Seat ${row.node_id} launch_wrapper`);
   if (launchWrapper && !isLaunchWrapperRuntime(row.runtime)) {
-    throw new Error(`Seat ${row.node_id} launch_wrapper: only valid when runtime is "pi", "codex" or "claude-code"`);
+    throw new Error(`Seat ${row.node_id} launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness`);
   }
   const effortResolution = resolveSeatEffort({ effort: row.effort, effortChoice: row.effort_choice });
+  const recordedLaunch = currentLaunchObservations.get(row.node_id);
+  const codexResolution = row.runtime === "codex"
+    ? resolveCodexResumeResolution(
+      row,
+      recordedLaunch,
+      permissionSelections,
+      customPolicyCache,
+      launchWrapper,
+    )
+    : undefined;
+  const resumeDisplay = codexResolution && !codexResolution.ok
+    ? { command: null, label: row.resume_token ? codexResolution.diagnostic : null }
+    : buildNativeResumeDisplay(
+      row.runtime,
+      row.resume_token,
+      null,
+      row.codex_config_profile,
+      codexResolution?.input.codexDaemonOptOut,
+      row.claude_mcp,
+      codexResolution?.input,
+      launchWrapper,
+    );
   // FS-1 W1.3 S1 — O(1) lookup into the once-per-rig restore-outcome map
   // (byte-identical to the prior per-node deriveRestoreOutcome; "n-a" when a node
   // is referenced by no restore event, matching the prior fall-through).
@@ -773,7 +1074,17 @@ function buildInventoryEntry(
     : row.session_status === "running" && identityVerdictConfirmsSessionMissing(identityVerdict) ? "detached" : row.session_status;
   const startupStatus = paneExited || (sessionStatus === "running" && identityVerdictDownranksRunning(identityVerdict?.verdict))
     ? "attention_required" : row.startup_status as NodeInventoryEntry["startupStatus"];
-  const lifecycleState = deriveNodeLifecycleState({
+  // #2940: a keep_alive seat whose recovery ran out waits for a person while it isn't running. A stop (requested or
+  // confirmed) is that person's answer: the incident no longer shows, even before the supervisor ends it.
+  const keepAliveIncident = row.keep_alive === 1 && row.keep_alive_attempts !== null && row.intentionally_stopped !== 1
+    ? { attempts: row.keep_alive_attempts, exhausted: row.keep_alive_exhausted_at !== null,
+      lastError: row.keep_alive_last_error, lastAttemptAt: row.keep_alive_last_attempt_at }
+    : null;
+  // #2940: a stop is confirmed once its request no longer carries the attempt that recorded it (a confirmation clears it;
+  // a row recorded before attempts were kept has none), the session reads exited or superseded, and no binding is left.
+  const stopConfirmed = row.intentionally_stopped === 1 && row.stop_attempt === null
+    && (row.session_status === "exited" || row.session_status === "superseded") && row.binding_id === null;
+  const lifecycleState = keepAliveIncident?.exhausted && sessionStatus !== "running" ? "attention_required" : deriveNodeLifecycleState({
     sessionStatus,
     startupStatus,
     restoreOutcome,
@@ -781,7 +1092,7 @@ function buildInventoryEntry(
     usableSnapshot,
     identityVerdict: identityVerdict?.verdict ?? null,
   });
-  return {
+  const entry: NodeInventoryEntry = {
     nodeId: row.node_id,
     rigId: row.rig_id,
     rigName: row.rig_name,
@@ -796,13 +1107,19 @@ function buildInventoryEntry(
     attachmentType: (row.binding_attachment_type as NodeInventoryEntry["attachmentType"]) ?? null,
     nodeKind: deriveNodeKind(row.runtime),
     runtime: row.runtime,
-    ...(communityHarnessOf(row.session_community_harness, row.runtime) ? { communityHarness: communityHarnessLabel(row.runtime!, undefined, { resumeType: row.resume_type, resumeToken: row.resume_token, resumeProvenance: row.resume_provenance ?? null, runner: row.session_community_runner === 1 }) } : {}),
+    configuredAccount: configuredAccount(row.runtime, Boolean(row.has_claude_token_ref), row.claude_token_ref, row.account_home),
+    ...(communityHarnessOf(row.session_community_harness, row.runtime) ? { communityHarness: communityHarnessLabel(row.runtime!, undefined, { resumeType: row.resume_type, resumeToken: row.resume_token, resumeProvenance: row.resume_provenance ?? null, runner: recordedRunner(row.session_community_runner) }) } : {}),
     ...(launchWrapper ? { launchWrapper } : {}),
     sessionStatus,
     storedSessionStatus: row.session_status,
     // An explicit down records a failed start's rolled-back session without changing its superseded status.
-    intentionallyStopped: row.intentionally_stopped === 1
-      && (row.session_status === "exited" || row.session_status === "superseded") && row.binding_id === null,
+    intentionallyStopped: stopConfirmed,
+    // #2940: a stop recorded but not confirmed yet (the session not yet gone, the daemon lost mid-stop, or a request
+    // recorded on a row already exited or superseded that no probe has proven absent: its attempt is still set).
+    ...(row.intentionally_stopped === 1 && !stopConfirmed ? { stopRequested: true } : {}),
+    // #2940: the seat declares keep_alive (absent = off, so other seats' output is unchanged).
+    ...(row.keep_alive === 1 ? { keepAlive: true } : {}),
+    ...(keepAliveIncident ? { keepAliveIncident } : {}),
     // Match the graph's current-status projection without rewriting the startup
     // result. Applicable mismatch (including ambiguity) or pane_missing overrides it.
     storedStartupStatus: row.startup_status as NodeInventoryEntry["startupStatus"],
@@ -823,7 +1140,8 @@ function buildInventoryEntry(
       ? { tmuxServerArgs: [...daemonTmuxServerArgs()] } : {}),
     ...(row.binding_attachment_type === "tmux" && row.session_name && daemonTmuxServerInfo()
       ? { tmuxServerMode: daemonTmuxServerInfo()!.mode } : {}),
-    resumeCommand: computeResumeCommand(row.runtime, row.resume_token, row.codex_config_profile, codexDaemonOptOuts.get(row.node_id), row.claude_mcp),
+    resumeCommand: resumeDisplay?.command ?? null,
+    resumeCommandLabel: resumeDisplay?.label ?? null,
     // OPR.0.4.0.26: recoveryGuidance is NOT inlined per node in the LIST
     // payload. It duplicated ~47KB of templated prose across all nodes and
     // no node-list consumer reads it. The full guidance is recomputed on
@@ -831,6 +1149,10 @@ function buildInventoryEntry(
     // /api/rigs/:rigId/nodes/:logicalId) — relocation, not loss.
     recoveryGuidance: null,
     latestError: row.startup_status === "ready" ? null : getLatestError(db, row.rig_id, row.node_id),
+    // The stage of this session's own startup failure, when it is the node's newest startup event: a later launch's
+    // attention never inherits an earlier session's stage.
+    latestErrorStage: row.startup_status === "attention_required" && row.session_id
+      ? getLatestStartupFailedEvent(db, row.node_id, row.session_id)?.stage ?? null : null,
     // Extended fields
     model: row.model,
     // Configured launch effort only; an observed level is reported by the
@@ -858,6 +1180,19 @@ function buildInventoryEntry(
     heldReason: deriveHeldReason(db, row.rig_id, row.node_id, sessionStatus),
     ...(row.handover_at ? startedWithoutRequired(db, row.node_id, row.session_id) : {}),
   };
+  return {
+    entry,
+    codexResolution,
+    codexDaemonOptOut: recordedLaunch?.daemonOptOut,
+  };
+}
+
+function buildInventoryEntry(
+  db: Database.Database,
+  row: InventoryRow,
+  ctx: InventoryBuildContext,
+): NodeInventoryEntry {
+  return buildInventoryItem(db, row, ctx).entry;
 }
 
 /** #2456: the required startup files the seat's current occupant started without, as its handover recorded them. Only
@@ -920,7 +1255,9 @@ function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]):
   // events, so each node's value equals the single-rig path.
   const restoreOutcomes = buildRestoreOutcomeMap(db); // one fleet restore-outcome scan
   const orienteds = buildOrientedMap(db);             // one fleet startup-orientation scan
-  const codexDaemonOptOuts = new AppliedLaunchObservationStore(db).readCurrentDaemonOptOuts(); // one launch-fact read
+  const currentLaunchObservations = new AppliedLaunchObservationStore(db).readCurrentObservations(); // one launch-fact read
+  const permissionSelections = readPermissionSelectionsMap(db);
+  const customPolicyCache = new Map<string, string | null>();
   const out = new Map<string, NodeInventoryEntry[]>();
   for (const row of rows) {
     const entry = buildInventoryEntry(db, row, {
@@ -929,7 +1266,9 @@ function buildInventoryMapFromRows(db: Database.Database, rows: InventoryRow[]):
       identityVerdicts: verdictsByRig.get(row.rig_id) ?? new Map(),
       restoreOutcomes,
       orienteds,
-      codexDaemonOptOuts,
+      currentLaunchObservations,
+      permissionSelections,
+      customPolicyCache,
     });
     let list = out.get(row.rig_id);
     if (!list) { list = []; out.set(row.rig_id, list); }
@@ -983,10 +1322,12 @@ export function getNodeDetail(
     installedResourcesOverride?: Array<{ id: string; category: string; targetPath: string }>;
   },
 ): NodeDetailEntry | null {
-  // Get the inventory entry first
-  const allEntries = getNodeInventory(db, rigId);
-  const entry = allEntries.find((e) => e.logicalId === logicalId);
-  if (!entry) return null;
+  // Project the rig's inventory once and reuse the target seat's resolved Codex inputs for recoveryGuidance.
+  const allItems = projectRigInventoryItems(db, rigId);
+  const allEntries = allItems.map((item) => item.entry);
+  const targetItem = allItems.find((item) => item.entry.logicalId === logicalId);
+  if (!targetItem) return null;
+  const entry = targetItem.entry;
 
   // Find the node ID
   const nodeRow = db.prepare(
@@ -1135,7 +1476,8 @@ export function getNodeDetail(
       cwd: entry.cwd,
       sessionName: entry.canonicalSessionName,
       codexConfigProfile: entry.codexConfigProfile,
-      codexDaemonOptOut: entry.runtime === "codex" ? new AppliedLaunchObservationStore(db).readCurrent(nodeId)?.daemonOptOut : undefined,
+      codexDaemonOptOut: targetItem.codexDaemonOptOut,
+      codexResolution: targetItem.codexResolution,
       claudeMcp: entry.runtime === "claude-code" ? readSeatClaudeMcp(db, nodeId) : undefined,
     }),
     binding,
@@ -1242,7 +1584,10 @@ const NEEDS_INPUT_RUNGS: readonly EvidenceRungId[] = ["needs-input-chrome", "lif
  *     (`hookOrPaneActivity`), which sees a prompt no hook reported. Stale hooks
  *     arrive as `unknown` and contribute nothing — never guessed. The rig total
  *     and the seat row must not disagree about the same seat.
- *   - a held seat (`heldReason` present)
+ *   - a fresh Claude authentication or billing failure (`providerFailureNeedsAttention`, #3571). It keeps the
+ *     hook's `unknown` state, so it is never a `needs_input` request and an arbitrated clear doesn't cancel it.
+ *   - a held seat, except an unlaunched hold with no assigned work and no recorded
+ *     launch or restore result (`isUnlaunchedHeldWithoutWork`)
  *   - a recorded startup error (`latestError` present)
  *   - an occupant a handover started without a required startup file (`startedWithoutRequired`, #2456)
  */
@@ -1250,14 +1595,79 @@ export function seatNeedsAttention(
   entry: NodeInventoryEntry,
   activity: AgentActivity | null,
   arbitratedNeedsInput: boolean | null = null,
+  assignedWorkCount?: number,
 ): boolean {
   return entry.lifecycleState === "attention_required"
     || entry.startupStatus === "attention_required"
     || entry.startupStatus === "failed"
     || (arbitratedNeedsInput ?? activity?.state === "needs_input")
-    || entry.heldReason != null
+    || providerFailureNeedsAttention(activity, entry.runtime)
+    || (entry.heldReason != null && !isUnlaunchedHeldWithoutWork(entry, assignedWorkCount))
     || entry.latestError != null
     || (entry.startedWithoutRequired?.length ?? 0) > 0;
+}
+
+/**
+ * An explicit hold on a never-launched seat with no outstanding queue work.
+ *
+ * `restoreOutcome === "n-a"` is the existing fact for "no launch or restore result has ever
+ * named this seat". It keeps a seat that an earlier launch or restore ended `failed` or
+ * `awaiting-decision` out of the exemption: a later subset launch only writes `node.held`
+ * for the seats it did not select and records no result for them, so without this a failure
+ * with no session left and no startup error would silently lose its attention.
+ */
+export function isUnlaunchedHeldWithoutWork(entry: NodeInventoryEntry, assignedWorkCount: number | undefined): boolean {
+  return entry.heldReason != null && entry.sessionStatus === null && entry.storedSessionStatus === null
+    && entry.attachmentType !== "external_cli" && (entry.canonicalSessionName != null || deriveCanonicalFromEntry(entry) != null)
+    && entry.restoreOutcome === "n-a" && assignedWorkCount === 0;
+}
+
+/**
+ * A Claude StopFailure whose typed reason is an authentication or billing failure (#3571), from the seat's own runtime,
+ * still current: fresh, generation-valid and normalized as such (a stale or mismatched row comes back demoted). Only
+ * the documented auth and billing values qualify; a generic or unlisted provider error never asks for a person.
+ */
+export function providerFailureNeedsAttention(activity: AgentActivity | null | undefined, seatRuntime: string | null | undefined): boolean {
+  if (!activity || activity.evidenceSource !== "runtime_hook" || activity.stale === true || activity.fallback === true
+    || activity.state !== "unknown" || !activity.runtime || activity.runtime !== seatRuntime) return false;
+  const reason = claudeProviderFailureReason(activity.runtime, activity.rawEvent, activity.rawSubtype);
+  return (reason === "provider_auth_error" || reason === "provider_billing_error") && activity.reason === reason;
+}
+
+/** #3571: the current occupant's last Claude authentication or billing failure that no newer turn has superseded, for
+ *  a Claude seat whose newest hook isn't a turn. A store that can't read it (a partial double) gives the newest hook,
+ *  which providerFailureActivity still judges as before. */
+export function retainedProviderFailure(
+  store: Partial<Pick<AgentActivityStore, "latestUnsupersededProviderFailure">> | null | undefined,
+  seat: { nodeId?: string | null; sessionName: string | null | undefined; runtime: string | null | undefined; now?: Date },
+  newest: AgentActivity | null | undefined,
+): AgentActivity | null {
+  if (seat.runtime !== "claude-code" || !seat.sessionName || newest?.state === "running" || newest?.state === "needs_input") return null;
+  if (typeof store?.latestUnsupersededProviderFailure !== "function") return newest ?? null;
+  return store.latestUnsupersededProviderFailure({ nodeId: seat.nodeId, sessionName: seat.sessionName, now: seat.now });
+}
+
+/** The pane's own interactive prompts: a picker or question, and a permission or confirmation. A draft in the input
+ *  box is not one. */
+const NATIVE_PROMPT_REASONS: ReadonlySet<string> = new Set(["selection_prompt", "permission_prompt"]);
+
+/**
+ * The served activity for a seat with a current Claude authentication or billing failure (`retainedProviderFailure`):
+ * that hook, ahead of the cached pane reading, so the row shows the reason it counts for attention. Only a native prompt from a
+ * capture that began strictly after the failure outranks it (a capture's completion can lag the bytes it read, and
+ * without a start time the failure stays); a draft in the input box doesn't. Kept out of `hookOrPaneActivity`, whose
+ * other readers (prompt-clear and reachable wake recovery, the usage-limit watchdog) keep the pane's reading: the
+ * report holds no send or wake.
+ */
+export function providerFailureActivity(
+  hookActivity: AgentActivity | null | undefined,
+  structural: StructuralObservation | null,
+  runtime: string | null | undefined,
+): AgentActivity | null {
+  if (!hookActivity || !providerFailureNeedsAttention(hookActivity, runtime)) return null;
+  if (structural?.state === "attention" && NATIVE_PROMPT_REASONS.has(structural.reason)
+    && Date.parse(structural.captureStartedAt ?? "") > Date.parse(hookActivity.eventAt ?? "")) return null;
+  return hookActivity;
 }
 
 /**
@@ -1334,14 +1744,24 @@ export function attachTerminalActivityAndWork(
             decidedBy: arb.decidedBy,
             seq: arb.seq,
             lastSwap: arb.lastSwap,
+            // A typed usage limit and its stated reset, beside the unknown activity it explains.
+            ...(arb.usageLimit ? { usageLimit: arb.usageLimit } : {}),
           }
         : null;
     }
+    // A seat whose tmux this sweep couldn't reach may be gone: an idle at its prompt is the last thing it said, as
+    // attachAgentActivity reads it. Working and waiting readings stay.
+    if (activityState && unseenByTmux(entry) && activityState.activity === "idle-at-prompt" && activityState.needsInput.count === 0) {
+      activityState = { ...activityState, activity: "unknown", display: "unknown" };
+    }
     const work = countAssignedWorkForEntry(entry, assignedByDest);
     const arbitratedNeedsInput = arbitratedNeedsInputSignal(arb);
-    const hook = !sessionMissing && entry.agentActivity == null && entry.canonicalSessionName
+    const latest = !sessionMissing && entry.agentActivity == null && entry.canonicalSessionName
       ? deps.agentActivity?.getLatestForNode({ nodeId: entry.nodeId, sessionName: entry.canonicalSessionName, now,
         order: entry.runtime === "claude-code" ? "source" : "arrival" }) ?? null : null;
+    const hook = !sessionMissing && entry.agentActivity == null
+      ? retainedProviderFailure(deps.agentActivity, { nodeId: entry.nodeId, sessionName: entry.canonicalSessionName,
+        runtime: entry.runtime, now }, latest) ?? latest : latest;
     return {
       ...entry,
       terminalActive,
@@ -1349,7 +1769,7 @@ export function attachTerminalActivityAndWork(
       activityState,
       // The activity this row serves (a live hook, else the cached pane reading) when it was attached, so a prompt
       // only the pane shows counts; the hook store alone where it wasn't.
-      needsAttention: seatNeedsAttention(entry, entry.agentActivity ?? hook, arbitratedNeedsInput),
+      needsAttention: seatNeedsAttention(entry, entry.agentActivity ?? hook, arbitratedNeedsInput, work.assignedWorkCount),
       arbitratedNeedsInput,
       needsInputEvidence: arb?.needsInputEvidence ?? null,
       hasAssignedWork: work.assignedWorkCount > 0,
@@ -1508,7 +1928,7 @@ export function hookOrPaneActivity(
   // beats hook-arrival age) and makes ACTIVITY real on the DEFAULT path for hook-less / Codex /
   // just-finished-a-turn seats: the exact fleet-blindness this fix targets. Structural discrimination
   // is STRUCTURAL (spinner shapes / esc-to-interrupt / idle prompt), never a verb allowlist.
-  if (structural && structural.state !== "unknown") {
+  if (structural && (structural.state !== "unknown" || structural.reason === "unrecognized_client_version")) {
     return {
       source: "pane",
       activity: {
@@ -1561,7 +1981,7 @@ export async function attachAgentActivity(
 ): Promise<NodeInventoryEntry[]> {
   const sampledAt = deps.now ?? new Date();
   const captureFallback = deps.captureFallback ?? false;
-  return Promise.all(entries.map(async (entry) => {
+  const attached = await Promise.all(entries.map(async (entry): Promise<NodeInventoryEntry> => {
     // A cached hook, pane sample or motion cannot revive a confirmed absent executor.
     // Preserve the applicable missing-session or exited-pane observation without probing.
     if (identityVerdictConfirmsExecutorStopped(entry.identityVerdict)) {
@@ -1617,8 +2037,9 @@ export async function attachAgentActivity(
      *
      *     needs_input > running > MOTION > idle / unknown
      *
-     * A current, target-bound complete idle frame is the narrow exception to motion below.
-     * A generic footer or old idle capture is not that evidence; D2 remains unchanged.
+     * A current, target-bound complete idle frame is the narrow idle exception to motion below.
+     * An explicitly unsupported client version also retains unknown rather than inferring work from redraws.
+     * A generic footer or old idle capture is not completed-idle evidence; D2 remains unchanged.
      * Live motion otherwise UPGRADES a verdict of `idle` or `unknown`; it never touches `needs_input` or an
      * already-`running` verdict, and it never MANUFACTURES `idle`. That asymmetry is the whole
      * safety argument, and it is what each half of the defect needs:
@@ -1644,7 +2065,7 @@ export async function attachAgentActivity(
      * signal improving. Silence therefore leaves the prior verdict exactly as it was.
      */
     const withMotion = (activity: AgentActivity, currentIdleFrame = false): AgentActivity => {
-      if (!motionRunning || (currentIdleFrame && activity.state === "idle")) return activity;
+      if (!motionRunning || activity.reason === "unrecognized_client_version" || (currentIdleFrame && activity.state === "idle")) return activity;
       if (activity.state !== "idle" && activity.state !== "unknown") return activity;
       return {
         state: "running",
@@ -1680,9 +2101,15 @@ export async function attachAgentActivity(
       && (!motionRunning || (Number.isFinite(motionMs)
         && Math.floor(capturedMs / 1000) > Math.floor(motionMs / 1000)));
 
+    // A current Claude auth or billing failure stands over the pane reading and motion, as a limit does (#3571).
+    const providerFailure = providerFailureActivity(retainedProviderFailure(deps.activityStore, { nodeId: entry.nodeId,
+      sessionName: entry.canonicalSessionName, runtime: entry.runtime, now: sampledAt }, hookActivity), structural, entry.runtime);
+    if (providerFailure) return { ...entry, agentActivity: providerFailure };
+
     // An idle hook alone still yields to motion (D2); when a current complete idle frame exists, report
     // that frame's provenance instead.
-    const resolved = hookOrPaneActivity(hookActivity, structural, motionRunning && currentIdleFrame, entry.runtime);
+    const resolved = hookOrPaneActivity(hookActivity, structural,
+      motionRunning && (currentIdleFrame || structural?.reason === "unrecognized_client_version"), entry.runtime);
     if (resolved?.source === "hook") return { ...entry, agentActivity: withMotion(resolved.activity) };
     if (resolved?.source === "limit") return { ...entry, agentActivity: resolved.activity };
     if (resolved?.source === "pane") return { ...entry, agentActivity: withMotion(resolved.activity, currentIdleFrame) };
@@ -1733,4 +2160,18 @@ export async function attachAgentActivity(
     })),
     };
   }));
+  return attached.map(unseenIdleIsUnknown);
+}
+
+/** This sweep couldn't reach the seat's tmux, so whether it still runs is unknown. */
+function unseenByTmux(entry: NodeInventoryEntry): boolean {
+  return entry.identityVerdict?.reason === "tmux_unavailable";
+}
+
+/** A seat whose tmux this sweep couldn't reach may be gone: an idle reading is the last thing it said, not what it is
+ *  now, so it reads unknown. Working and waiting readings stay, as the agent's own report of work. */
+function unseenIdleIsUnknown(entry: NodeInventoryEntry): NodeInventoryEntry {
+  if (!unseenByTmux(entry) || entry.agentActivity?.state !== "idle") return entry;
+  return { ...entry, agentActivity: { ...entry.agentActivity, state: "unknown", reason: "tmux_unavailable",
+    evidenceSource: "tmux_session", sampledAt: entry.identityVerdict?.observedAt ?? entry.agentActivity.sampledAt } };
 }

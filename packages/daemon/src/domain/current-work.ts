@@ -44,6 +44,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { parseFrontmatter } from "./slices/slice-indexer.js";
 import { reanchorBuiltinStartupFile } from "./builtin-startup-files.js";
+import { isRosterReadyNotice } from "./roster-ready-notice.js";
 
 export interface RoleOrientation {
   state: "unknown" | "no-record" | "not-declared" | "missing" | "present";
@@ -152,6 +153,10 @@ export interface CurrentWorkRow {
 export interface MissionsRootResolution {
   root: string | null;
   reason?: string;
+  /** The root stands in for the row's own project root, and another root could hold a mission of the same name: the
+   *  catalogue lists other project roots, or it, or the row's project in it, can't be read. Unset when the configured
+   *  root is the only root a row's mission can live in (no catalogue configured), whatever the reason says. */
+  ambiguous?: boolean;
 }
 
 export type MissionsRootResolver = string | null | ((row: CurrentWorkRow) => string | null | MissionsRootResolution);
@@ -205,29 +210,359 @@ function tagValues(tags: string[], prefix: string): string[] {
  * Directories directly under `root` addressed by `wanted` — either because the directory
  * is named that, or because its SPEC.md frontmatter `id` is that. A directory can only
  * match once, so a name hit short-circuits its own frontmatter read.
+ *
+ * `inspectWorkNodeDirs` requires actual subdirectories (`statSync(...).isDirectory()`),
+ * preserves whether `root` could be read as a directory (`ok: true` even when 0 children
+ * match, vs `ok: false` with the OS error code when `readdirSync` fails), and records
+ * whether any child directory check or `SPEC.md` read failed for a reason other than
+ * ordinary absence/non-directory (`incomplete: true` when `statSync` or `readFileSync`
+ * throws anything other than `ENOENT`/`ENOTDIR`). `resolveWorkNodeDirs` keeps the
+ * historical permissive contract for existing `current-work` consumers.
  */
-export function resolveWorkNodeDirs(root: string, wanted: string): Match[] {
+export function inspectWorkNodeDirs(
+  root: string,
+  wanted: string,
+): { ok: true; matches: Match[]; incomplete: boolean } | { ok: false; code?: string } {
   let entries: string[];
   try {
     entries = fs.readdirSync(root);
-  } catch {
-    return [];
+  } catch (err) {
+    return { ok: false, code: (err as NodeJS.ErrnoException)?.code };
   }
   const out: Match[] = [];
+  let incomplete = false;
   for (const dir of entries.sort()) {
+    const childPath = path.join(root, dir);
+    let isDir = false;
+    try {
+      isDir = fs.statSync(childPath).isDirectory();
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") incomplete = true;
+      continue;
+    }
+    if (!isDir) continue;
     if (dir === wanted) {
       out.push({ dir, form: "directory name" });
       continue;
     }
     let raw: string;
     try {
-      raw = fs.readFileSync(path.join(root, dir, "SPEC.md"), "utf8");
-    } catch {
+      raw = fs.readFileSync(path.join(childPath, "SPEC.md"), "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") incomplete = true;
       continue;
     }
     if (parseFrontmatter(raw)["id"] === wanted) out.push({ dir, form: "frontmatter id" });
   }
+  return { ok: true, matches: out, incomplete };
+}
+
+const SPEC_SETTLED_NS = 2_000_000_000n;
+const SPEC_ID_CACHE_ROOTS = 256;
+
+/** A SPEC.md's signature, as `CurrentModelReader.readFact` takes one: device, inode, size and nanosecond times. A file
+ *  changed in the last couple of seconds gets none, because a same-size edit within one coarse timestamp tick wouldn't
+ *  change it; that file is read every time until it settles. Anything but a regular file throws. */
+function specSignature(file: string): string | null {
+  const st = fs.statSync(file, { bigint: true });
+  if (!st.isFile()) throw new Error("not a regular file");
+  const changed = st.mtimeNs > st.ctimeNs ? st.mtimeNs : st.ctimeNs;
+  if (BigInt(Date.now()) * 1_000_000n - changed < SPEC_SETTLED_NS) return null;
+  return [st.dev, st.ino, st.size, st.mtimeNs, st.ctimeNs].join(":");
+}
+
+/** Each root's SPEC.md frontmatter ids by directory, reused only while that file's signature is unchanged. Every call
+ *  still lists the root and stats each SPEC.md, so an edit, add, remove or rename shows on the next call. A root keeps
+ *  entries only for directories its last listing had, and the oldest root goes past the cap. */
+const specIds = new Map<string, Map<string, { signature: string; id: unknown }>>();
+
+/** How much the id cache holds (one root's entries when it's named), for tests of its bound. */
+export function workNodeIdCacheSizeForTests(root?: string): { roots: number; entries: number } {
+  let entries = 0;
+  for (const [cachedRoot, ids] of specIds) if (root === undefined || cachedRoot === root) entries += ids.size;
+  return { roots: specIds.size, entries };
+}
+
+export function resolveWorkNodeDirs(root: string, wanted: string): Match[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    specIds.delete(root);
+    return [];
+  }
+  const previous = specIds.get(root);
+  const next = new Map<string, { signature: string; id: unknown }>();
+  const out: Match[] = [];
+  for (const dir of entries.sort()) {
+    const cached = previous?.get(dir);
+    if (dir === wanted) {
+      out.push({ dir, form: "directory name" });
+      if (cached) next.set(dir, cached);
+      continue;
+    }
+    const file = path.join(root, dir, "SPEC.md");
+    let before: string | null = null;
+    try {
+      before = specSignature(file);
+    } catch {
+      // Gone, not a regular file or not statable: the read below decides, exactly as without the cache.
+    }
+    let id: unknown;
+    if (before !== null && cached?.signature === before) {
+      id = cached.id;
+      next.set(dir, cached);
+    } else {
+      let raw: string;
+      try {
+        raw = fs.readFileSync(file, "utf8");
+      } catch {
+        continue;
+      }
+      id = parseFrontmatter(raw)["id"];
+      // Keep it only if the file didn't change while it was read.
+      if (before !== null) {
+        try {
+          if (specSignature(file) === before) next.set(dir, { signature: before, id });
+        } catch {
+          // Changed under the read: don't keep it.
+        }
+      }
+    }
+    if (id === wanted) out.push({ dir, form: "frontmatter id" });
+  }
+  specIds.delete(root);
+  if (specIds.size >= SPEC_ID_CACHE_ROOTS) specIds.delete(specIds.keys().next().value!);
+  specIds.set(root, next);
   return out;
+}
+
+export type CreateScopeCheck =
+  | { status: "unresolved"; tag: string; count: 0 }
+  | { status: "ambiguous"; tag: string; count: number }
+  | { status: "empty"; tag: "mission:" | "slice:" }
+  | { status: "conflict"; tags: string[] }
+  | { status: "unavailable"; tags: string[]; reason?: "missing-mission" }
+  | { status: "skipped"; tags: string[] };
+
+export type CreateScopeAdvisoryCode =
+  | "unresolved_scope"
+  | "ambiguous_scope"
+  | "empty_scope"
+  | "conflicting_scope"
+  | "scope_check_unavailable"
+  | "scope_check_skipped";
+
+export interface CreateScopeAdvisory {
+  code: CreateScopeAdvisoryCode;
+  message: string;
+}
+
+export interface CreateScopeAdvisoryContext {
+  verb: "handoff" | "handoff-and-complete";
+  tagSource: "inherited" | "explicit" | "unknown";
+  delivery?: "forwarded" | "in-process";
+}
+
+function displayScopeTag(raw: string): string | null {
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, "").trim();
+  return cleaned.startsWith(MISSION_TAG) || cleaned.startsWith(SLICE_TAG) ? cleaned : null;
+}
+
+function displayScopeTags(tags: string[]): string[] {
+  const displayed: string[] = [];
+  for (const raw of tags) {
+    const safe = displayScopeTag(raw);
+    if (safe && !displayed.includes(safe)) displayed.push(safe);
+  }
+  return displayed;
+}
+
+function parseCreateScopeTags(tags: string[] | null | undefined): {
+  missions: string[];
+  slices: string[];
+  emptyPrefixes: Array<"mission:" | "slice:">;
+  scopeTags: string[];
+} {
+  const flat = (tags ?? []).flatMap((t) => t.split(",").map((s) => s.trim())).filter(Boolean);
+  const missions: string[] = [];
+  const slices: string[] = [];
+  const emptyPrefixes: Array<"mission:" | "slice:"> = [];
+  for (const t of flat) {
+    if (t.startsWith(MISSION_TAG)) {
+      const v = t.slice(MISSION_TAG.length).trim();
+      if (!v) {
+        if (!emptyPrefixes.includes(MISSION_TAG)) emptyPrefixes.push(MISSION_TAG);
+      } else if (!missions.includes(v)) {
+        missions.push(v);
+      }
+    } else if (t.startsWith(SLICE_TAG)) {
+      const v = t.slice(SLICE_TAG.length).trim();
+      if (!v) {
+        if (!emptyPrefixes.includes(SLICE_TAG)) emptyPrefixes.push(SLICE_TAG);
+      } else if (!slices.includes(v)) {
+        slices.push(v);
+      }
+    }
+  }
+  const scopeTags: string[] = [];
+  for (const raw of [
+    ...missions.map((m) => `mission:${m}`),
+    ...slices.map((s) => `slice:${s}`),
+    ...emptyPrefixes,
+  ]) {
+    const safe = displayScopeTag(raw);
+    if (safe && !scopeTags.includes(safe)) scopeTags.push(safe);
+  }
+  return { missions, slices, emptyPrefixes, scopeTags };
+}
+
+export function skippedCreateScopeAdvisory(tags: string[] | null | undefined): CreateScopeCheck | null {
+  const { scopeTags } = parseCreateScopeTags(tags);
+  return scopeTags.length > 0 ? { status: "skipped", tags: scopeTags } : null;
+}
+
+export function toCreateScopeAdvisory(check: CreateScopeCheck, context?: CreateScopeAdvisoryContext): CreateScopeAdvisory {
+  let advisory: CreateScopeAdvisory;
+  switch (check.status) {
+    case "unresolved":
+      advisory = { code: "unresolved_scope",
+        message: `queue create scope check: ${displayScopeTag(check.tag) ?? check.tag} is unresolved (resolves to 0 directories); row was created.` };
+      break;
+    case "ambiguous":
+      advisory = { code: "ambiguous_scope",
+        message: `queue create scope check: ${displayScopeTag(check.tag) ?? check.tag} is ambiguous (resolves to ${check.count} directories, cannot uniquely resolve); row was created.` };
+      break;
+    case "empty":
+      advisory = { code: "empty_scope",
+        message: `queue create scope check: ${check.tag} has an empty value; row was created.` };
+      break;
+    case "conflict":
+      advisory = { code: "conflicting_scope",
+        message: `queue create scope check: conflicting scope tags (${displayScopeTags(check.tags).join(", ")}); row was created.` };
+      break;
+    case "unavailable": {
+      const tags = displayScopeTags(check.tags).join(", ");
+      const message = check.reason === "missing-mission"
+        ? `queue create scope check unavailable (${tags}) without mission context: mission tag is missing; row was created.`
+        : `queue create scope check unavailable (${tags}): could not run scope check on this host; row was created.`;
+      advisory = { code: "scope_check_unavailable", message };
+      break;
+    }
+    case "skipped":
+      if (context?.delivery === "in-process") {
+        advisory = { code: "scope_check_skipped",
+          message: `queue ${context.verb} scope check skipped for self-id re-drive (${displayScopeTags(check.tags).join(", ")}); successor was accepted in process.` };
+      } else if (context) {
+        advisory = { code: "scope_check_skipped",
+          message: `queue ${context.verb} scope check skipped for cross-host write (${displayScopeTags(check.tags).join(", ")}); row was forwarded.` };
+      } else {
+        advisory = { code: "scope_check_skipped",
+          message: `queue create scope check skipped for cross-host write (${displayScopeTags(check.tags).join(", ")}); row was forwarded.` };
+      }
+      break;
+    default: {
+      const unreachable: never = check;
+      return unreachable;
+    }
+  }
+  if (!context) return advisory;
+
+  const provenance = context.tagSource === "inherited"
+    ? "requested effective scope tags were inherited from the source item"
+    : context.tagSource === "explicit"
+      ? "requested effective scope tags came from explicit tags supplied on this handoff"
+      : "effective scope tag provenance is unknown";
+  const message = advisory.message.replace(/^queue create/, `queue ${context.verb}`);
+  return {
+    ...advisory,
+    message: `${message.slice(0, -1)}; ${provenance}.`,
+  };
+}
+
+/**
+ * Nonblocking post-create scope check (#2725). Distinguishes a completed check whose
+ * mission/slice tag resolved to 0 or >1 directories from empty/conflicting scope tags
+ * or a check that could not run because the catalogue, missions root, mission context,
+ * or candidate SPEC metadata was unavailable.
+ */
+export function evaluateCreateScope(
+  tags: string[] | null | undefined,
+  resolveRoot: () => string | null,
+): CreateScopeCheck | null {
+  const { missions, slices, emptyPrefixes, scopeTags } = parseCreateScopeTags(tags);
+  if (scopeTags.length === 0) return null;
+  const unavailable = (reason?: "missing-mission", customTags = scopeTags): CreateScopeCheck => ({
+    status: "unavailable",
+    ...(reason ? { reason } : {}),
+    tags: displayScopeTags(customTags),
+  });
+
+  let missionsRoot: string | null = null;
+  try {
+    missionsRoot = resolveRoot();
+  } catch {
+    missionsRoot = null;
+  }
+  if (!missionsRoot) return unavailable();
+
+  try {
+    fs.readdirSync(missionsRoot);
+  } catch {
+    return unavailable();
+  }
+
+  if (emptyPrefixes.length > 0) {
+    return { status: "empty", tag: emptyPrefixes[0]! };
+  }
+  if (missions.length > 1) {
+    return {
+      status: "conflict",
+      tags: displayScopeTags(missions.map((m) => `mission:${m}`)),
+    };
+  }
+  if (slices.length > 1) {
+    return {
+      status: "conflict",
+      tags: displayScopeTags(slices.map((s) => `slice:${s}`)),
+    };
+  }
+
+  let resolvedMissionDir: string | null = null;
+  if (missions.length === 1) {
+    const missionTarget = missions[0]!;
+    const missionTag = displayScopeTag(`mission:${missionTarget}`) ?? scopeTags[0]!;
+    const missionCheck = inspectWorkNodeDirs(missionsRoot, missionTarget);
+    if (!missionCheck.ok || missionCheck.incomplete) return unavailable();
+    if (missionCheck.matches.length === 0) return { status: "unresolved", tag: missionTag, count: 0 };
+    if (missionCheck.matches.length > 1) {
+      return { status: "ambiguous", tag: missionTag, count: missionCheck.matches.length };
+    }
+    resolvedMissionDir = missionCheck.matches[0]!.dir;
+  }
+
+  if (slices.length === 1) {
+    const sliceTarget = slices[0]!;
+    const sliceTag = displayScopeTag(`slice:${sliceTarget}`) ?? scopeTags[0]!;
+    if (!resolvedMissionDir) return unavailable("missing-mission", [sliceTag]);
+    const slicesRoot = path.join(missionsRoot, resolvedMissionDir, "slices");
+    const sliceCheck = inspectWorkNodeDirs(slicesRoot, sliceTarget);
+    if (!sliceCheck.ok) {
+      if (sliceCheck.code === "ENOENT" || sliceCheck.code === "ENOTDIR") {
+        return { status: "unresolved", tag: sliceTag, count: 0 };
+      }
+      return unavailable();
+    }
+    if (sliceCheck.incomplete) return unavailable();
+    if (sliceCheck.matches.length === 0) return { status: "unresolved", tag: sliceTag, count: 0 };
+    if (sliceCheck.matches.length > 1) {
+      return { status: "ambiguous", tag: sliceTag, count: sliceCheck.matches.length };
+    }
+  }
+
+  return null;
 }
 
 interface Candidate {
@@ -373,7 +708,8 @@ export function deriveCurrentWork(
  *   ancestor's mission tag, as a labelled candidate. A retargeted handoff (new body, no tags)
  *   or an ancestor that is not on this host gives no assumed mission.
  * - Pending rows are possible next work; blocked rows are held work with their blocker and
- *   continuation. No order is implied between them.
+ *   continuation. No order is implied between them. Each carries its own scope, resolved the
+ *   same way, so with nothing in progress the trace can compare resolved directories, not names.
  * - A mission named only in body text is never evidence.
  */
 export interface WorkCandidate {
@@ -396,14 +732,47 @@ export interface WorkCandidates {
   candidates: WorkCandidate[];
   /** In-progress rows whose work the queue cannot name. */
   unknown: Array<{ qitemId: string | null; summary: string | null; reason: string }>;
-  next: Array<{ qitemId: string | null; summary: string | null; missions: string[] }>;
-  held: Array<{ qitemId: string | null; summary: string | null; blockedOn: string | null; continuation: string | null }>;
+  /** `openrigNotice` marks the roster-ready notice when it names no mission. Other rows OpenRig sends can carry real
+   *  work (for example, a relayed network request), so sender alone doesn't identify an informational notice. */
+  next: Array<{ qitemId: string | null; summary: string | null; openrigNotice?: true } & RowScope>;
+  held: Array<{ qitemId: string | null; summary: string | null; blockedOn: string | null; continuation: string | null; openrigNotice?: true } & RowScope>;
   /** Mission directories on this host, bounded, so an agent can name one without guessing. */
   missionsOnHost: string[];
   missionsOnHostTruncated: boolean;
+  /** The seat's selected project's missions, under that project's own missions root. The whoami route adds it when it
+   *  selects a healthy catalog project, so a seat whose project lives outside workspace.root can name one there. */
+  projectMissions?: ProjectMissions;
+}
+
+/** A held or pending row's own scope: its tags, and the directories they resolve to through the row's project's
+ *  missions root (resolveTagged, as for an in-progress tag candidate). */
+export interface RowScope {
+  /** The row's `mission:` tag values. Only a single one is resolved. */
+  missions: string[];
+  /** Its `slice:` tag, paired only when the row has exactly one mission and one slice tag. */
+  slice: string | null;
+  /** The resolved mission directory, or null. */
+  missionPath: string | null;
+  /** The resolved slice directory, or null. */
+  slicePath: string | null;
+  /** Why a mission or slice the row names did not resolve here; null when everything it names did. */
+  unresolved: string | null;
+  /** Why the row's tags were resolved under a root that stands in for its project's own while another root could hold
+   *  a mission of the same name (MissionsRootResolution.ambiguous); null otherwise, including when no catalogue is
+   *  configured and the configured root is the only one. Kept even when the mission resolved there. */
+  missionsRootFallback: string | null;
+}
+
+/** One project's mission directories, bounded as missionsOnHost is. */
+export interface ProjectMissions {
+  project: string;
+  missionsRoot: string;
+  names: string[];
+  truncated: boolean;
 }
 
 interface CandidateRow extends TaggedRow {
+  sourceSession?: string | null;
   summary?: string | null;
   body?: string | null;
   blockedOn?: string | null;
@@ -496,6 +865,48 @@ function listMissions(missionsRoot: string | null): { names: string[]; truncated
   }
 }
 
+/** A project's missions as the work packet lists them, read from the missions root its catalog entry resolves. */
+export function listProjectMissions(project: string, missionsRoot: string): ProjectMissions {
+  return { project, missionsRoot, ...listMissions(missionsRoot) };
+}
+
+const SUMMARY_FROM_BODY_CHARS = 240;
+
+/** A held or pending row's summary, or when it has none, its body's first line with a word in it (a leading Markdown
+ *  heading, quote or list marker dropped), bounded: the row still gets a label someone can recognise. */
+function summaryOf(row: CandidateRow): string | null {
+  if (row.summary?.trim()) return row.summary;
+  const line = (row.body ?? "").split(/\r?\n/).map((text) => text.replace(/^[\s#>*+-]+/, "").trim())
+    .find((text) => /[\p{L}\p{N}]/u.test(text));
+  if (!line) return null;
+  return line.length > SUMMARY_FROM_BODY_CHARS ? `${line.slice(0, SUMMARY_FROM_BODY_CHARS - 1)}…` : line;
+}
+
+/** A held or pending row's scope, resolved as an in-progress tag candidate is. Rows sharing a scope resolve it once. */
+function scopeOf(row: CandidateRow, missionsRoot: MissionsRootResolver, resolvedScopes: Map<string, RowScope>): RowScope {
+  const tags = row.tags ?? [];
+  const missions = tagValues(tags, MISSION_TAG);
+  const slices = tagValues(tags, SLICE_TAG);
+  const slice = missions.length === 1 && slices.length === 1 ? slices[0]! : null;
+  const scope: RowScope = { missions, slice, missionPath: null, slicePath: null, unresolved: null, missionsRootFallback: null };
+  if (missions.length === 0) return scope;
+  if (missions.length > 1) return { ...scope, unresolved: `${missions.length} mission tags; none is resolved on its own` };
+  const root = resolveMissionsRoot(missionsRoot, row);
+  const key = JSON.stringify([root.root, root.reason, root.ambiguous === true, missions[0], slice]);
+  const known = resolvedScopes.get(key);
+  if (known) return known;
+  const resolved = resolveTagged(root.root, missions[0]!, slice);
+  // resolveTagged names the deepest node it resolved, and a slice's directory is <mission>/slices/<slice>.
+  const slicePath = slice && !resolved.unresolved ? resolved.workNodePath : null;
+  const result: RowScope = { ...scope,
+    missionPath: slicePath ? path.dirname(path.dirname(slicePath)) : resolved.workNodePath,
+    slicePath,
+    unresolved: resolved.unresolved,
+    missionsRootFallback: root.ambiguous ? root.reason ?? "another root could hold a mission of the same name" : null };
+  resolvedScopes.set(key, result);
+  return result;
+}
+
 export function deriveWorkCandidates(
   rows: CandidateRow[],
   missionsRoot: MissionsRootResolver,
@@ -506,6 +917,7 @@ export function deriveWorkCandidates(
   const unknown: WorkCandidates["unknown"] = [];
   const next: WorkCandidates["next"] = [];
   const held: WorkCandidates["held"] = [];
+  const resolvedScopes = new Map<string, RowScope>();
   const seen = new Set<string>();
   const add = (candidate: WorkCandidate) => {
     const key = `${candidate.kind}|${candidate.projects.join(",")}|${candidate.mission}|${candidate.slice ?? ""}|${candidate.workNodePath ?? ""}`;
@@ -519,13 +931,17 @@ export function deriveWorkCandidates(
     const missions = tagValues(tags, MISSION_TAG);
     const qitemId = row.qitemId ?? null;
     const summary = row.summary ?? null;
+    // The roster notice is information about the team, not work. Reuse its existing identity predicate; the daemon
+    // also sends real work on behalf of other actors, which must still participate in the mission choice.
+    const notice = missions.length === 0 && isRosterReadyNotice({ qitem_id: qitemId ?? "", source_session: row.sourceSession ?? "" })
+      ? { openrigNotice: true as const } : {};
     if (row.state === "pending") {
-      next.push({ qitemId, summary, missions });
+      next.push({ qitemId, summary: summaryOf(row), ...notice, ...scopeOf(row, missionsRoot, resolvedScopes) });
       continue;
     }
     if (row.state === "blocked") {
-      held.push({ qitemId, summary, blockedOn: row.blockedOn ?? null,
-        continuation: qitemId ? lookups.continuationOf(qitemId) : null });
+      held.push({ qitemId, summary: summaryOf(row), blockedOn: row.blockedOn ?? null,
+        continuation: qitemId ? lookups.continuationOf(qitemId) : null, ...notice, ...scopeOf(row, missionsRoot, resolvedScopes) });
       continue;
     }
     if (row.state !== "in-progress") continue;

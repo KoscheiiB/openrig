@@ -69,6 +69,11 @@ export const SETTINGS_VALID_KEYS = [
   "daemon.db_conflict",
   // #2687: the cadence of the seat-activity and structural-activity pollers; startup-only, read once at daemon start.
   "daemon.seat_poll_interval_ms",
+  // #3146: the cadence of the seat identity reconciler; startup-only, read once at daemon start.
+  "daemon.identity_poll_interval_ms",
+  // #3637: how long a start waits for its child's readiness (rig daemon start, rig start, rig up, the TUI); read by
+  // each start, not by the running daemon. Twin of the CLI key.
+  "daemon.start_readiness_wait_seconds",
   // OPR.0.4.6.MH1 FR-1 — the persisted host-selection pointer, ONE
   // static key, lockstep with cli/src/config-store.ts VALID_KEYS (the
   // twins parity test pins both). Default "local" (unset ≡ local host).
@@ -124,7 +129,10 @@ export const SETTINGS_VALID_KEYS = [
   "ui.preview.default_lines",
   "ui.timezone",
   // The web UI and its terminal WebSocket are off unless this is true (read at daemon start).
+  // The web UI and its terminal WebSocket are off unless this is true (read at daemon start).
   "ui.enabled",
+  // TUI topology: whether a remote rig's seats may be read through this daemon (off by default).
+  "ui.topology_remote_seats",
   // OPR.0.4.0.1 — global cap on simultaneously-live terminals (default 2).
   "ui.terminal.max_live_terminals",
   "recovery.auto_drive_provider_prompts",
@@ -134,6 +142,8 @@ export const SETTINGS_VALID_KEYS = [
   // dispatch ACK §4: allowlist-only edit; no migrations / new
   // endpoints / event types.
   "agents.advisor_session",
+  // The default receiving agent: reads what a person answers when nothing else reads it (resolveDefaultReceiver), and the
+  // agent a dead seat's recovery reaches. Unset means the kernel operator, when this host has that seat.
   "agents.operator_session",
   // Explicit operator override; unset means discover the registered human.
   "workspace.operator_seat_name",
@@ -198,6 +208,7 @@ export const SETTINGS_VALID_KEYS = [
   // Slice 15 (OPR.0.7.0.15) — compact command-output defaults; CLI-read, twin of the CLI key.
   "output.compact",
   "output.whoami_peers",
+  "output.rebuild_recaps",
   // Slice 01 (OPR.0.7.0.1) — Codex and Claude usage windows in the provider view; daemon-read, twin of the CLI key.
   "provider.usage_windows",
   // The providers chosen at rig setup --providers; kernel boot counts only these. Twin of the CLI key.
@@ -230,6 +241,12 @@ export const SETTINGS_VALID_KEYS = [
   "retention.usage_samples_days",
   // The history-only event types of `events` (queue-retention PRUNABLE_EVENT_TYPES) older than N days; 0 (default) keeps them.
   "retention.events_days",
+  // Closed queue work (done, canceled, denied, handed-off): its content goes N days after it closed, then the row, keeping
+  // only its id (queue-erasure). 0 (default) keeps them.
+  "retention.closed_content_days",
+  "retention.closed_metadata_days",
+  // Where queue erasure appends each erased id and action (JSON lines), for replaying after a restore; empty keeps none.
+  "retention.erasure_ledger",
   "retention.watchdog_keep_per_job",
   // Slice 22 outcome 9 — stream retention: unreferenced items older than N days or beyond the newest N.
   "retention.stream_days",
@@ -265,6 +282,8 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "daemon.host": { primary: "OPENRIG_HOST", legacy: "RIGGED_HOST" },
   "daemon.db_conflict": { primary: "OPENRIG_DAEMON_DB_CONFLICT" },
   "daemon.seat_poll_interval_ms": { primary: "OPENRIG_SEAT_POLL_INTERVAL_MS" },
+  "daemon.identity_poll_interval_ms": { primary: "OPENRIG_IDENTITY_POLL_INTERVAL_MS" },
+  "daemon.start_readiness_wait_seconds": { primary: "OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS" },
   "db.path": { primary: "OPENRIG_DB", legacy: "RIGGED_DB" },
   "transcripts.enabled": { primary: "OPENRIG_TRANSCRIPTS_ENABLED", legacy: "RIGGED_TRANSCRIPTS_ENABLED" },
   "transcripts.path": { primary: "OPENRIG_TRANSCRIPTS_PATH", legacy: "RIGGED_TRANSCRIPTS_PATH" },
@@ -293,6 +312,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "ui.preview.max_pins": { primary: "OPENRIG_UI_PREVIEW_MAX_PINS" },
   "ui.timezone": { primary: "OPENRIG_UI_TIMEZONE" },
   "ui.enabled": { primary: "OPENRIG_UI_ENABLED" },
+  "ui.topology_remote_seats": { primary: "OPENRIG_UI_TOPOLOGY_REMOTE_SEATS" },
   "ui.preview.default_lines": { primary: "OPENRIG_UI_PREVIEW_DEFAULT_LINES" },
   "ui.terminal.max_live_terminals": { primary: "OPENRIG_UI_TERMINAL_MAX_LIVE_TERMINALS" },
   "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
@@ -339,6 +359,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "terminal.inherit_tmux_environment": { primary: "OPENRIG_TERMINAL_INHERIT_TMUX_ENVIRONMENT" },
   "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
   "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
+  "output.rebuild_recaps": { primary: "OPENRIG_OUTPUT_REBUILD_RECAPS" },
   "provider.usage_windows": { primary: "OPENRIG_PROVIDER_USAGE_WINDOWS" },
   "provider.selected": { primary: "OPENRIG_PROVIDER_SELECTED" },
   "bundle.services_enabled": { primary: "OPENRIG_BUNDLE_SERVICES_ENABLED" },
@@ -357,6 +378,9 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "retention.watchdog_days": { primary: "OPENRIG_RETENTION_WATCHDOG_DAYS" },
   "retention.usage_samples_days": { primary: "OPENRIG_RETENTION_USAGE_SAMPLES_DAYS" },
   "retention.events_days": { primary: "OPENRIG_RETENTION_EVENTS_DAYS" },
+  "retention.closed_content_days": { primary: "OPENRIG_RETENTION_CLOSED_CONTENT_DAYS" },
+  "retention.closed_metadata_days": { primary: "OPENRIG_RETENTION_CLOSED_METADATA_DAYS" },
+  "retention.erasure_ledger": { primary: "OPENRIG_RETENTION_ERASURE_LEDGER" },
   "retention.watchdog_keep_per_job": { primary: "OPENRIG_RETENTION_WATCHDOG_KEEP_PER_JOB" },
   "retention.stream_days": { primary: "OPENRIG_RETENTION_STREAM_DAYS" },
   "retention.stream_max_items": { primary: "OPENRIG_RETENTION_STREAM_MAX_ITEMS" },
@@ -378,6 +402,8 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "daemon.host": ["daemon", "host"],
   "daemon.db_conflict": ["daemon", "dbConflict"],
   "daemon.seat_poll_interval_ms": ["daemon", "seatPollIntervalMs"],
+  "daemon.identity_poll_interval_ms": ["daemon", "identityPollIntervalMs"],
+  "daemon.start_readiness_wait_seconds": ["daemon", "startReadinessWaitSeconds"],
   "db.path": ["db", "path"],
   "transcripts.enabled": ["transcripts", "enabled"],
   "transcripts.path": ["transcripts", "path"],
@@ -406,6 +432,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "ui.preview.max_pins": ["ui", "preview", "maxPins"],
   "ui.timezone": ["ui", "timezone"],
   "ui.enabled": ["ui", "enabled"],
+  "ui.topology_remote_seats": ["ui", "topologyRemoteSeats"],
   "ui.preview.default_lines": ["ui", "preview", "defaultLines"],
   "ui.terminal.max_live_terminals": ["ui", "terminal", "maxLiveTerminals"],
   "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
@@ -445,6 +472,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "terminal.inherit_tmux_environment": ["terminal", "inheritTmuxEnvironment"],
   "output.compact": ["output", "compact"],
   "output.whoami_peers": ["output", "whoamiPeers"],
+  "output.rebuild_recaps": ["output", "rebuildRecaps"],
   "provider.usage_windows": ["provider", "usageWindows"],
   "provider.selected": ["provider", "selected"],
   "bundle.services_enabled": ["bundle", "servicesEnabled"],
@@ -462,6 +490,9 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "retention.watchdog_days": ["retention", "watchdogDays"],
   "retention.usage_samples_days": ["retention", "usageSamplesDays"],
   "retention.events_days": ["retention", "eventsDays"],
+  "retention.closed_content_days": ["retention", "closedContentDays"],
+  "retention.closed_metadata_days": ["retention", "closedMetadataDays"],
+  "retention.erasure_ledger": ["retention", "erasureLedger"],
   "retention.watchdog_keep_per_job": ["retention", "watchdogKeepPerJob"],
   "retention.stream_days": ["retention", "streamDays"],
   "retention.stream_max_items": ["retention", "streamMaxItems"],
@@ -487,6 +518,22 @@ export interface ResolvedSetting {
 
 export function isSettingsValidKey(key: string): key is SettingsValidKey {
   return (SETTINGS_VALID_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * The keys that define what this daemon may reach, and so are worth recording when a caller changes
+ * them over HTTP.
+ *
+ * `files.allowlist` is the allowlist the /api/files routes enforce (domain/files/path-safety.ts) and
+ * `progress.scan_roots` is the tree the progress scan walks. Both are ordinary settings: the Settings
+ * page saves and resets them through `POST`/`DELETE /api/config/:key`, and that stays. What a reader
+ * of the event stream could not see before is that they changed at all, so a change is published as
+ * `settings.changed`. Recording it is the point; refusing it would take away a path people use.
+ */
+export const BOUNDARY_SETTING_KEYS: readonly SettingsValidKey[] = ["files.allowlist", "progress.scan_roots"];
+
+export function isBoundarySettingKey(key: string): boolean {
+  return (BOUNDARY_SETTING_KEYS as readonly string[]).includes(key);
 }
 
 const REMOVED_CONTEXT_KEY = "context.packs_root";
@@ -678,6 +725,8 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "daemon.host": return "127.0.0.1";
     case "daemon.db_conflict": return "warn";
     case "daemon.seat_poll_interval_ms": return 1000;
+    case "daemon.identity_poll_interval_ms": return 5000;
+    case "daemon.start_readiness_wait_seconds": return 180;
     case "db.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "openrig.sqlite");
     case "transcripts.enabled": return true;
     case "transcripts.path": return path.join(path.dirname(DEFAULT_CONFIG_PATH), "transcripts");
@@ -709,6 +758,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "ui.preview.default_lines": return 50;
     case "ui.timezone": return "America/Los_Angeles";
     case "ui.enabled": return false;
+    case "ui.topology_remote_seats": return false;
     case "recovery.auto_drive_provider_prompts": return false;
     case "recovery.provider_auth_env_allowlist": return "";
     // V1 Phase 4 — Advisor default per universal-shell.md L83;
@@ -761,6 +811,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "terminal.inherit_tmux_environment": return false;
     case "output.compact": return false;
     case "output.whoami_peers": return 8;
+    case "output.rebuild_recaps": return 3;
     case "provider.usage_windows": return false;
     case "provider.selected": return "";
     case "bundle.services_enabled": return false;
@@ -785,6 +836,9 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     case "retention.watchdog_days": return 14;
     case "retention.usage_samples_days": return 14;
     case "retention.events_days": return 0; // 0 = keep; pruning is opt-in
+    case "retention.closed_content_days": return 0; // 0 = keep; closed-work erasure is opt-in
+    case "retention.closed_metadata_days": return 0;
+    case "retention.erasure_ledger": return ""; // empty = keep no ledger
     case "retention.watchdog_keep_per_job": return 50;
     case "retention.stream_days": return 30;
     case "retention.stream_max_items": return 20000;
@@ -821,18 +875,26 @@ function coerceValue(key: SettingsValidKey, raw: string, workspaceRoot: string):
 // in `set()`. Lockstep with cli/src/config-store.ts KEY_CONSTRAINTS so the
 // daemon's HTTP write surface (/api/config POST) rejects the same input
 // the CLI rejects.
+/** What a validator can say about the values it accepts, kept on the validator itself so it cannot drift from it. */
+interface ConstraintMeta { choices?: readonly string[]; format?: string }
+type KeyConstraint = ((raw: string, coerced: string | number | boolean) => void) & { meta?: ConstraintMeta };
+function described(meta: ConstraintMeta, check: (raw: string, coerced: string | number | boolean) => void): KeyConstraint {
+  return Object.assign(check, { meta });
+}
+/** A closed list of accepted strings: the list is both what is enforced and what the browser view reports. */
+function choiceConstraint(choices: readonly string[], message: (raw: string) => string, trim = false): KeyConstraint {
+  return described({ choices }, (raw) => {
+    if (!choices.includes(trim ? (raw ?? "").trim() : raw)) throw new Error(message(raw));
+  });
+}
+const PROVIDER_SELECTED_CHOICES: readonly string[] = ["", "claude", "codex", "claude,codex", "codex,claude"];
+
 function positiveIntegerConstraint(key: string) {
   return (raw: string, coerced: string | number | boolean): void => {
     if (!/^\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced <= 0) {
       throw new Error(`Invalid value for ${key}: must be a positive integer, got "${raw}"`);
     }
   };
-}
-
-function wakeHumanRungConstraint(raw: string): void {
-  if (raw !== "always" && raw !== "explicit-only") {
-    throw new Error(`Invalid value for queue.wake_human_rung: must be "always" or "explicit-only", got "${raw}"`);
-  }
 }
 
 function percentageConstraint(key: string) {
@@ -847,15 +909,10 @@ function percentageConstraint(key: string) {
   };
 }
 
-const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: string | number | boolean) => void>> = {
-  "terminal.tmux_server": (raw) => {
-    if (raw !== "inherit" && raw !== "isolated") {
-      throw new Error(`Invalid value for terminal.tmux_server: must be "inherit" or "isolated", got "${raw}"`);
-    }
-  },
-  "daemon.db_conflict": (raw) => {
-    if (raw !== "warn" && raw !== "stop") throw new Error("daemon.db_conflict must be warn or stop");
-  },
+const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, KeyConstraint>> = {
+  "terminal.tmux_server": choiceConstraint(["inherit", "isolated"],
+    (raw) => `Invalid value for terminal.tmux_server: must be "inherit" or "isolated", got "${raw}"`),
+  "daemon.db_conflict": choiceConstraint(["warn", "stop"], () => "daemon.db_conflict must be warn or stop"),
   "daemon.seat_poll_interval_ms": (raw, value) => {
     // Startup-only: the seat pollers read it once when the daemon starts. Only slower than the 1 s default, up to the
     // ceiling the structural observation's expiry allows (seat-activity-service.ts MAX_SEAT_POLL_INTERVAL_MS).
@@ -863,9 +920,23 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error("Invalid daemon.seat_poll_interval_ms: must be a whole number of milliseconds in [1000, 2000]");
     }
   },
-  "transport.draft_delivery": (raw) => {
-    if (raw !== "refuse" && raw !== "deliver") throw new Error(`Invalid value for transport.draft_delivery: must be "refuse" or "deliver", got "${raw}"`);
+  "daemon.identity_poll_interval_ms": (raw, value) => {
+    // Startup-only: the identity reconciler reads it once when the daemon starts. Only slower than the 5 s default, up to
+    // a cap on the cadence of sweep attempts, not a freshness deadline (see the MAX_IDENTITY_POLL_INTERVAL_MS comment in
+    // seat-identity-reconciler.ts).
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 5000 || value > 30000) {
+      throw new Error("Invalid daemon.identity_poll_interval_ms: must be a whole number of milliseconds in [5000, 30000]");
+    }
   },
+  "daemon.start_readiness_wait_seconds": (raw, coerced) => {
+    // The ceiling is the Node timer bound on a caller's budget (DAEMON_START_READINESS_WAIT_MAX_SECONDS in
+    // daemon-shutdown.ts): the TUI's start call can't time out later than 2^31 - 1 ms.
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 1 || coerced > 2147464) {
+      throw new Error(`Invalid value for daemon.start_readiness_wait_seconds: must be a whole number of seconds in [1, 2147464], got "${raw}"`);
+    }
+  },
+  "transport.draft_delivery": choiceConstraint(["refuse", "deliver"],
+    (raw) => `Invalid value for transport.draft_delivery: must be "refuse" or "deliver", got "${raw}"`),
   "transcripts.lines": (raw, value) => {
     if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {
       throw new Error("Invalid transcripts.lines: must be an integer in [1, 1000000]");
@@ -907,37 +978,34 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error(`Invalid value for daemon.port: must be an integer in [0, 65535], got "${raw}"`);
     }
   },
-  "ui.timezone": (_raw, value) => {
+  "ui.timezone": described({ format: "iana-timezone" }, (_raw, value) => {
     try {
       if (typeof value !== "string" || !value || /^[+-]/.test(value)) throw new Error();
       new Intl.DateTimeFormat("en-US", { timeZone: value });
     } catch { throw new Error("Invalid ui.timezone: use an IANA timezone such as America/Los_Angeles or Europe/London"); }
-  },
+  }),
   "health.context_pressure.warning_percent": percentageConstraint("health.context_pressure.warning_percent"),
   "health.context_pressure.critical_percent": percentageConstraint("health.context_pressure.critical_percent"),
   "policies.idle_gate_qitem.scan_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.scan_interval_seconds"),
   "policies.idle_gate_qitem.active_wake_interval_seconds": positiveIntegerConstraint("policies.idle_gate_qitem.active_wake_interval_seconds"),
-  "policies.idle_gate_qitem.auto_register": (raw) => {
-    const v = (raw ?? "").trim();
-    if (v !== "off" && v !== "all") {
-      throw new Error(`Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`);
-    }
-  },
+  "policies.idle_gate_qitem.auto_register": choiceConstraint(["off", "all"],
+    (raw) => `Invalid value for policies.idle_gate_qitem.auto_register: must be "off" or "all", got "${raw}"`, true),
   // Policy threshold: integer in [1, 100]. Documented contract from
   // slice 27 README. parseInt's permissive coercion ("80abc" → 80;
   // "80.5" → 80) is not safe for a key the daemon's compaction trigger
   // reads at every poll tick; runtime validator rejects what the
   // contract forbids per banked feedback_static_gates_mirror_runtime_validators.
-  "provider.selected": (_raw, value) => {
-    if (typeof value !== "string" || !/^(|claude|codex|claude,codex|codex,claude)$/.test(value)) {
+  // Checks the typed value too: a config.json array would otherwise pass as its String() form.
+  "provider.selected": described({ choices: PROVIDER_SELECTED_CHOICES }, (_raw, value) => {
+    if (typeof value !== "string" || !PROVIDER_SELECTED_CHOICES.includes(value)) {
       throw new Error("Invalid provider.selected: use claude, codex, claude,codex, or an empty string for no recorded choice");
     }
-  },
-  "policies.claude_compaction.preparation_root": (_raw, value) => {
+  }),
+  "policies.claude_compaction.preparation_root": described({ format: "absolute-path-or-empty" }, (_raw, value) => {
     if (typeof value !== "string" || (value !== "" && (!path.isAbsolute(value) || value.includes("\0")))) {
       throw new Error("Invalid policies.claude_compaction.preparation_root: use an absolute path or an empty string for the default");
     }
-  },
+  }),
   "policies.claude_compaction.threshold_percent": (raw, coerced) => {
     const trimmed = (raw ?? "").trim();
     if (!/^-?\d+$/.test(trimmed)) {
@@ -985,6 +1053,11 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   // surface rejects exactly what the CLI rejects. `retention.enabled` is a
   // boolean (coerceValue enforces true/false) — no constraint entry needed.
   // Slice 15 P5 — the whoami peer bound; lockstep with the CLI twin.
+  "output.rebuild_recaps": (raw, value) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Invalid value for output.rebuild_recaps: must be an integer >= 0, got "${raw}"`);
+    }
+  },
   "output.whoami_peers": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
       throw new Error(`Invalid value for output.whoami_peers: must be an integer >= 1, got "${raw}"`);
@@ -1011,6 +1084,24 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error(`Invalid value for retention.events_days: must be an integer >= 0 (0 keeps the events), got "${raw}"`);
     }
   },
+  // 0 (the default) keeps closed work; a positive day count turns its erasure on (queue-erasure).
+  "retention.closed_content_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for retention.closed_content_days: must be an integer >= 0 (0 keeps the content), got "${raw}"`);
+    }
+  },
+  "retention.closed_metadata_days": (raw, coerced) => {
+    if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
+      throw new Error(`Invalid value for retention.closed_metadata_days: must be an integer >= 0 (0 keeps the rows), got "${raw}"`);
+    }
+  },
+  // Empty (the default) keeps no erasure ledger; otherwise an absolute file path, kept outside the backed-up data.
+  "retention.erasure_ledger": described({ format: "absolute-path-or-empty" }, (raw) => {
+    const value = (raw ?? "").trim();
+    if (value !== "" && !value.startsWith("/")) {
+      throw new Error(`Invalid value for retention.erasure_ledger: must be empty or an absolute file path, got "${raw}"`);
+    }
+  }),
   "retention.watchdog_keep_per_job": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 0) {
       throw new Error(`Invalid value for retention.watchdog_keep_per_job: must be an integer >= 0, got "${raw}"`);
@@ -1026,12 +1117,12 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
       throw new Error(`Invalid value for retention.stream_max_items: must be an integer >= 1, got "${raw}"`);
     }
   },
-  "stream.intake": (raw) => {
+  "stream.intake": described({ format: "queue.worker, off, or member@rig" }, (raw) => {
     const val = (raw ?? "").trim();
     if (val !== "off" && val !== "queue.worker" && !/^[a-zA-Z0-9\-_.]+@[a-zA-Z0-9\-_.]+$/.test(val)) {
       throw new Error(`Invalid value for stream.intake: must be "queue.worker", a canonical session (<seat>@<rig>), or "off", got "${raw}"`);
     }
-  },
+  }),
   "retention.batch_size": (raw, coerced) => {
     if (!/^-?\d+$/.test((raw ?? "").trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1) {
       throw new Error(`Invalid value for retention.batch_size: must be an integer >= 1, got "${raw}"`);
@@ -1045,18 +1136,19 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   "queue.wake_retry_cap": positiveIntegerConstraint("queue.wake_retry_cap"),
   "queue.wake_unconfirmed_window_minutes": positiveIntegerConstraint("queue.wake_unconfirmed_window_minutes"),
   "queue.wake_swap_grace_seconds": positiveIntegerConstraint("queue.wake_swap_grace_seconds"),
-  "queue.wake_human_rung": wakeHumanRungConstraint,
-  "decisions.template_dir": (_raw, value) => {
+  "queue.wake_human_rung": choiceConstraint(["always", "explicit-only"],
+    (raw) => `Invalid value for queue.wake_human_rung: must be "always" or "explicit-only", got "${raw}"`),
+  "decisions.template_dir": described({ format: "absolute-path-or-empty" }, (_raw, value) => {
     if (typeof value !== "string" || (value !== "" && (!path.isAbsolute(value) || value.includes("\0")))) {
       throw new Error("Invalid decisions.template_dir: use an absolute path, or an empty string for the shipped templates only");
     }
-  },
+  }),
   // rig acp serve's receiver when --to isn't given: a team seat, member@rig, or empty for none.
-  "acp.to": (_raw, value) => {
+  "acp.to": described({ format: "member@rig-or-empty" }, (_raw, value) => {
     if (typeof value !== "string" || (value !== "" && !/^[^@\s]+@[^@\s]+$/.test(value))) {
       throw new Error("Invalid acp.to: use the seat that receives your ACP tasks as member@rig, or an empty string for none");
     }
-  },
+  }),
 };
 
 function validateKeyConstraints(key: SettingsValidKey, raw: string, coerced: string | number | boolean): void {
@@ -1080,6 +1172,58 @@ function validateTypedFileValue(key: SettingsValidKey, value: string | number | 
   if (!check) return;
   const raw = typeof value === "string" ? value : String(value);
   check(raw, value);
+}
+
+/** What the browser view reports about a key's values, read from the rules that govern it. */
+export interface SettingKeyDescription {
+  /** Whether POST and DELETE /api/config/:key accept this key. */
+  writeRoute: boolean;
+  type?: "boolean" | "integer" | "string" | "enum";
+  choices?: string[];
+  range?: { min?: number; max?: number };
+  format?: string;
+}
+
+const ACCEPTED_INTEGER_LIMIT = Number.MAX_SAFE_INTEGER;
+
+/** The interval of whole numbers a key's validator accepts, found by asking the validator itself; a side it does not bound is left out. */
+function acceptedIntegerRange(key: SettingsValidKey, start: number): { min?: number; max?: number } | undefined {
+  const check = KEY_CONSTRAINTS[key];
+  if (!check) return undefined;
+  const accepts = (n: number): boolean => {
+    try { check(String(n), n); return true; } catch { return false; }
+  };
+  if (!accepts(start)) return undefined;
+  const range: { min?: number; max?: number } = {};
+  if (!accepts(ACCEPTED_INTEGER_LIMIT)) {
+    let lo = start, hi = ACCEPTED_INTEGER_LIMIT;
+    while (hi - lo > 1) { const mid = Math.floor(lo + (hi - lo) / 2); if (accepts(mid)) lo = mid; else hi = mid; }
+    range.max = lo;
+  }
+  if (!accepts(-ACCEPTED_INTEGER_LIMIT)) {
+    let lo = -ACCEPTED_INTEGER_LIMIT, hi = start;
+    while (hi - lo > 1) { const mid = Math.floor(lo + (hi - lo) / 2); if (accepts(mid)) hi = mid; else lo = mid; }
+    range.min = hi;
+  }
+  return range.min === undefined && range.max === undefined ? undefined : range;
+}
+
+/** Derived from coerceValue (the type), KEY_CONSTRAINTS (choices, format, range) and the key grammar (write route); no second list. */
+export function describeSettingKey(key: string): SettingKeyDescription {
+  if (parseFeedHostSubscriptionKey(key)) return { writeRoute: true, type: "boolean" };
+  if (!isSettingsValidKey(key)) return { writeRoute: false };
+  const fallback = getDefaultValue(key, "");
+  const meta = KEY_CONSTRAINTS[key]?.meta;
+  const out: SettingKeyDescription = { writeRoute: true };
+  if (typeof fallback === "boolean") out.type = "boolean";
+  else if (typeof fallback === "number") {
+    out.type = "integer";
+    const range = acceptedIntegerRange(key, fallback);
+    if (range) out.range = range;
+  } else out.type = meta?.choices ? "enum" : "string";
+  if (meta?.choices) out.choices = [...meta.choices];
+  if (meta?.format) out.format = meta.format;
+  return out;
 }
 
 /**

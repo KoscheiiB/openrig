@@ -1,15 +1,15 @@
 # Community harness presets
 
 A community harness is a coding harness an outside contributor maintains. You install it as one small data file, and a
-rig member runs it by naming it as its `runtime`. OpenRig doesn't test these harnesses. It shows them as community
-harnesses, and it reads their activity only from what the screen shows.
+rig member runs it by naming it as its `runtime`. OpenRig doesn't qualify every installed harness. It shows them as community
+harnesses; plain presets use screen observations, while declared runners and hosted Pi-RPC programs report their activity.
 
 For what an integration author owns end to end, including a runner's duties and running a harness somewhere else, see
 the draft [integration author contracts](author-contracts.md).
 
 ## What a community harness gets
 
-What OpenRig does for a community-harness seat, capability by capability. **Partly** and **no** mean OpenRig shows that it doesn't know;
+What OpenRig does for a plain community-harness seat, capability by capability. **Partly** and **no** mean OpenRig shows that it doesn't know;
 it never reads an unsupported capability as idle, working, ready or verified.
 
 | Capability | Supported | How it works, or what you see instead |
@@ -21,7 +21,7 @@ it never reads an unsupported capability as idle, working, ready or verified.
 | Activity | partly | Read from the screen only; there are no activity hooks. Work and attention the screen shows are kept, but a screen that looks idle reads `unknown`, never idle, because a quiet prompt can be an approval or a pause. A [runner preset](#runner-presets-runner-true)'s own reports decide it instead. |
 | Attention | partly | Read from the screen: a permission question or numbered choice that OpenRig recognizes reads as needing attention, and `rig send` won't type into it. A prompt it doesn't recognize reads `unknown`. |
 | Approval | no | Approvals stay in the harness's own pane. OpenRig relays none, so a person answers them there. A [runner preset](#runner-presets-runner-true) is the exception: its runner submits the agent's permission requests to OpenRig, which asks a person, and the default is permit (section 7 of the [harness and runner contract](harness-runner-contract.md)). |
-| Cancel | no | OpenRig has no verb that cancels a running turn. `rig seat stop` and `rig down` end the seat's tmux session; anything the harness runs outside its pane, such as a gateway, is its own, and the preset's `limits` should say what keeps running. Restarting in place and switching harness are refused. |
+| Cancel | no | A plain preset has no live native cancellation consumer. Its own manual controls remain available; `/abort` is ordinary input unless that program defines it. An implemented runner can support the [named native command](harness-runner-contract.md#optional-run-bound-native-input-and-wake-version-1), subject to its own capability and turn mapping. `rig seat stop` and `rig down` end the seat's tmux session; work outside that pane, such as a gateway, has separate custody and lifecycle. List those limits in the preset. Restarting in place and switching harness are refused. |
 | Transport | yes | The seat is a tmux pane like any other, so `rig capture`, `rig send` and `--host` work as they do for any seat. |
 
 **Not placed:** guidance, skills and startup files (a launch warns that they weren't delivered), and the model: set it in the harness's own
@@ -53,6 +53,7 @@ startup_assisted: true           # optional: startup submission needs a person's
 first_input: true                # optional: launcher takes the first turn from OPENRIG_FIRST_INPUT (below)
 # runner: true                  # optional, needs launch_result: the launcher reports the seat's activity (below)
 # passes_model: true            # optional: the launcher takes the seat's declared model from OPENRIG_MODEL (below)
+# launch_wrapper: true          # optional: a runner applies OPENRIG_LAUNCH_WRAPPER to its native child (below)
 ```
 
 - **`command`** is a single program and its arguments. Shell syntax such as `|`, `&&`, `;`, redirections or `$(…)`
@@ -164,6 +165,10 @@ and reports what it's doing, as OpenRig's own Pi runner does. The seat's activit
   unavailable.
 - **Input is as for any seat.** A send pastes the text and presses Enter, so a runner should submit everything up to that
   Enter as one prompt.
+- **`launch_wrapper: true` declares wrapper support and requires `runner: true`.** A member with a wrapper and a runner preset without this flag is refused at preflight and launch (not schema validation):
+  `launch_wrapper unsupported: the community preset "<runtime>" runs a runner without launch_wrapper: true; no agent started. Add launch_wrapper: true to the preset if its runner applies OPENRIG_LAUNCH_WRAPPER, or remove launch_wrapper from this member.` See the
+  [harness and runner contract](harness-runner-contract.md#2-declare-it-what-the-preset-says-fixed-at-launch)
+  for the environment handoff, native-child execution and refusal requirements.
 
 **What the runner posts.** The runner posts each event to `POST /api/activity/hooks` with the local activity hook token,
 one at a time and in order, without making the agent wait. It finds the address and token in `OPENRIG_URL` (or
@@ -187,6 +192,40 @@ one at a time and in order, without making the agent wait. It finds the address 
   count for the live seat. The hook token is one local token, so any process that holds it can post for any seat.
 - **A runner's full duties** (liveness, input, cancellation and permissions) are in the draft
   [harness and runner contract](harness-runner-contract.md).
+
+A runner declaration is not a native-input or wake declaration. The optional [run-bound channel](harness-runner-contract.md#optional-run-bound-native-input-and-wake-version-1) advertises implemented operations through an authenticated live hello; Core supports preset-owned consumers plus input-only managed OMP and hosted Pi-RPC consumers. The dsh example implements input, dedicated wake and named cancellation using its own invocation mapping. Typed remains every program's default, native selection is explicit per seat, and a Pi-compatible wrapper does not qualify or adopt another program's native operations.
+
+## Pi-compatible RPC harnesses (`protocol: pi-rpc`)
+
+For a community harness that is a fork of Pi or speaks Pi's CLI and JSONL RPC protocol (such as OmO Native on senpi or Prime Agent), set `protocol: pi-rpc`.
+
+```yaml
+format: 1
+name: omo
+command: omo
+maintainer: Your name or team
+protocol: pi-rpc
+resume: true                   # only after you've checked a real reopen
+limits:
+  - checked with omo 5.1.48 (senpi engine 2026.10.25-2)
+```
+
+- **OpenRig runs the harness through its existing Pi runner.** Instead of screen scraping, the harness runs under `pi-runner` inside the seat's pane. The runner provides input buffering, paste framing, prompt/steer RPC queueing, clean transcript mirroring, and typed activity hook reporting to the daemon.
+- **Native input is optional and input-only for this class.** Typed remains the default. A current hosted kind2 run can advertise the implemented input channel and accept ordered prompts with correlated native responses. It does not inherit builtin Pi wake/cancel or program qualification. See [runtime coverage and qualification](harness-runner-contract.md#runtime-coverage-and-qualification); a preset name, common ABI or stream output alone enables no operation.
+- **`command` is the executable.** OpenRig resolves `command` (e.g. `omo` or `/usr/local/bin/senpi`) against the seat pane's environment, resolving symlinks and version-manager shims (such as `mise`) safely.
+- **Session identity and resume come from the runner.** Transcripts and sessions are persisted as JSONL files under `$OPENRIG_HOME/state/pi/<session>/sessions/`, and the fork's `get_state` reports the session file, so `launch_result` and `names_conversation` aren't needed.
+  - **With `resume: true`** declared, resuming or restoring a seat continues that exact session file via `--session <file>`. Without it, the preset is launch-only; a restore that would resume its saved conversation waits for a fresh-start decision.
+  - **A fork that reports no session file** reads as needing attention, and the launch doesn't read ready.
+  - **A resume that comes up on another session file** is refused, and that file's identity isn't recorded, so the seat keeps the one it asked for. The seat reads as needing attention.
+- **Launch arguments a fork must accept.** When spawned under `pi-runner`, the executable named by `command` must accept Pi's core CLI arguments:
+  - `--mode rpc`
+  - `--session-dir <dir>`
+  - `--name <session-name>`
+  - `--approve` or `--no-approve` (depending on seat trust)
+  - And conditionally when configured or resuming/forking: `--model <provider/id>`, `--thinking <level>`, `--session <sessionFile>`, or `--fork <sessionFile>`.
+  Forks that reject these flags cannot currently run with `protocol: pi-rpc`.
+- **Skills, guidance, and model passthrough.** Skills are projected into `<agentDir>/skills/` and managed guidance into `AGENTS.md`. For a fork that reads Pi's variables (`PI_CODING_AGENT_DIR`, etc.), declared models are passed as `--model provider/id` with provider API key allowlisting, and effort is passed as `--thinking <level>`. Usage is not reported for a fork, and extension dialogs are handled as Pi's (cancelled when an extension requests interactive confirmation in a managed pane).
+- **Mutual exclusions:** `protocol: pi-rpc` manages session identity and activity through the Pi runner; it cannot be combined with `runner: true`, `launch_result: true`, `names_conversation: true`, `startup_assisted: true`, or `first_input: true`.
 
 ## An example: Hermes
 
@@ -258,6 +297,84 @@ CLI.
 
 Copy both and maintain them as your own.
 
+## An example: agy
+
+[`community-harness-examples/agy/`](community-harness-examples/agy/) has two presets for the Antigravity CLI (`agy`).
+Neither is a Google-supported integration.
+- **`agy.yaml` is the default:** a runner over `agy acp`, on Gemini API-key auth.
+- **`agy-plain.yaml` is the fallback:** agy's own terminal UI, read from the screen.
+- **Both use the same key handling:** `"modelProvider": "gemini"` in the seat's agy home, and a key file read into agy's
+  environment. Google's [Authenticate page](https://antigravity.google/docs/install/) ("Using a Gemini API key") says the
+  key variable alone has no effect, and that agy won't start with that setting and no key.
+- **Choose data sharing yourself, for either preset.** In both checks, a fresh agy home's first start of agy's own terminal
+  UI showed a "Terms & Data Use" screen with data sharing already checked. The choice isn't in `settings.json`, so start
+  agy once in the seat's agy home and make it before the seat uses that home.
+
+### The runner: `agy.yaml` and `openrig-agy-runner.mjs`
+
+- **What one run checked,** with agy 1.5.13, a Gemini API key and Gemini 4 Neon High, on OpenRig 0.7.20:
+  - idle and working;
+  - the model line in `rig ps`, `gemini-4-neon-high`, reported by the runner;
+  - a same-conversation resume: the same `nativeRef` before and after, and agy recalled a word given before the restart;
+  - permissions through OpenRig. With no registered person, OpenRig permits each of agy's requests (`allow_once`), so its
+    shell commands run unattended, with `GEMINI_API_KEY` in their environment. Register a person to answer them;
+  - a queue wake, typed in within seconds.
+
+  It didn't rerun the plain preset, `rig acp serve`, or a missing-conversation refusal through a full restore.
+- **Auth, by name:**
+  - **The setting:** in the seat's agy home, `.gemini/antigravity-cli/settings.json` sets `"modelProvider": "gemini"`.
+  - **The key:** the runner reads it from the file `--key-file` names, and sets `GEMINI_API_KEY` in agy's environment
+    only. It never goes in the runner's arguments, its output or the preset.
+  - **The limit:** agy's shell tools inherit `GEMINI_API_KEY`.
+- **Pin the model.** On API-key auth, agy's default is Gemini 3.1 Pro (Low). After the conversation opens, the runner
+  sends `session/set_model` with `--model`, then reports that model. `rig acp run -- agy acp` can't pin a model, so it runs
+  agy's default.
+- **When agy carries on by itself,** after a background task finishes, it sends output or a permission request with no
+  prompt open. The runner treats that as a turn the agent started:
+  - the seat reads working while agy talks, and idle after 20 seconds of quiet;
+  - the permission request goes through OpenRig.
+
+  In the check, this also fired once right after a resume, harmlessly.
+- **The credential:** the runner holds the launch's activity credential and makes the reports, and agy and its tools
+  don't receive it. As with any runner, the credential identifies the reporting launch, not an independently verified
+  native conversation or model.
+- **Resume** uses `session/resume` only, because agy's `session/load` of an unknown id succeeds silently. A conversation
+  that won't reopen is reported missing only when every page of agy's own list was read and none names it. That treats
+  agy's list as complete, which agy doesn't document. Any other failure leaves the resume unconfirmed, and nothing new
+  starts.
+- **Its base:** it's adapted from an earlier version of the [dsh example runner](#an-example-runner-dsh). It takes input
+  typed into the pane and doesn't use the runner channel.
+- **Quote each `limits:` item in your copy.** An unquoted item containing `: ` is read as a mapping, not text, and
+  OpenRig refuses the preset with "limits must be a list of non-empty strings".
+
+### The fallback: `agy-plain.yaml` and `openrig-agy-launch`
+
+The plain preset runs agy's own terminal UI and doesn't use `agy acp`. It was checked twice, with agy 1.5.13 and Gemini 4
+Neon: once on an agy sign-in, and once on a Gemini API key on OpenRig 0.7.20, where a queue wake and a same-conversation
+resume worked.
+- **The key and the model:** `--key-file` and `--model` work as the runner's do. On an agy sign-in, leave them out and
+  don't set `modelProvider`.
+- **A fresh launch spends one small model turn.** agy allocates a conversation id only at its first prompt. So the
+  launcher runs one headless turn (`agy -p "Reply with exactly: ready" --output-format json`), reads `conversation_id`
+  from its JSON, reports it, then opens that conversation with `agy --conversation <id>`. On a key, that turn measured
+  about 8.9k input tokens, about $0.03 at Gemini 4 Neon's list price, once per fresh launch (one launch measured). A
+  resume runs no such turn.
+- **The resume check:** `agy --conversation <unknown id>` doesn't fail; it starts a new conversation without refusing.
+  So on a resume the launcher checks that `conversations/<id>.db` exists in the seat's agy home. When it doesn't, the
+  launcher reports `error: "missing"` and starts nothing. That check was run on the launcher directly, not through an
+  OpenRig restore.
+- **Setup goes in the preset's `command`.** The seat's pane gets only the daemon's minimal environment. So the preset
+  passes the seat's agy home, the agy executable and the folder holding `rig` as the launcher's arguments (`--agy-home`,
+  `--agy`, `--rig-path`), and agy must be reachable from the pane.
+- **Let agy run `rig`, mostly:** agy asks before each shell command. `permissions.allow: ["command(rig)"]` in
+  `.gemini/antigravity-cli/settings.json` under the seat's agy home covers a lone `rig …` command only. Anything with `;`,
+  `&&`, `|` or a redirect still prompts, even when every part is allowed, and agy chains commands often. So a person stays
+  needed at the pane; OpenRig relays no approvals here.
+- **What OpenRig reads:** activity comes from the screen only. In both checks the seat read `working` at rest and at
+  agy's prompt, and the model reads unknown.
+
+Copy what you use and maintain it as your own.
+
 ## An example: Pi's terminal UI
 
 [`community-harness-examples/pi-tui/`](community-harness-examples/pi-tui/) has a preset and a small launcher that run Pi's
@@ -310,8 +427,26 @@ Its [README](community-harness-examples/dsh/README.md) has the setup and a check
 and maintain them as your own.
 
 The launcher is the contributor's code, in the contributor's package. OpenRig runs no code from a preset and loads no
-module into its daemon. A preset that sets `launch_result`, `names_conversation`, `startup_assisted`, `first_input`, `runner` or `passes_model` is refused by an older
+module into its daemon. A preset that sets `launch_result`, `names_conversation`, `startup_assisted`, `first_input`, `runner`, `passes_model` or `launch_wrapper` is refused by an older
 OpenRig that doesn't know the field.
+
+## Community-maintained runner: nodecode (@smota)
+
+A runner preset for [nodecode](https://nodecode.ai), a self-modifying Common Lisp agent with a headless JSON-lines mode
+(`nodecode rpc`). Listed here so it can be found; it isn't certified, shipped with OpenRig or supported by OpenRig's maintainers.
+
+| | |
+|---|---|
+| Maintainer | [@smota](https://github.com/smota) |
+| Repository | [smota/openrig-nodecode](https://github.com/smota/openrig-nodecode), Apache-2.0, no npm dependencies |
+| Tested with | Unreleased OpenRig `main` at `7078c754d` (its package version reads 0.7.1), built from source without fork-only commits; nodecode `0.1.13+98dd6dc80`; Node 22.23.4. Not tested on a released OpenRig (none knows `launch_wrapper`). |
+| Needs | an OpenRig that knows `launch_wrapper` (this file documents it). OpenRig 0.7.10 and earlier refuse the preset with "unknown field launch_wrapper". |
+| Test record | connector `d8dd4e6`: 95 unit checks (fake and native nodecode), `npm run test:live` (6 steps against the author's daemon built from that `main`) and an opt-in native permission-question proof with a seeded `:NOBODY` failure; results are the author's, not reproduced by OpenRig |
+| Declares | `launch_result`, `runner`, `resume`, `first_input`, `passes_model`, `launch_wrapper` |
+| Resume | `nodecode rpc <session>`; a session the gateway doesn't know is refused with `error: "missing"` (exit 3) and never replaced. The installer adds `--resume-policy last-completed`: when the session's last turn failed or was cancelled, the runner moves the head back to the last completed turn before taking input, so a resumed seat continues from its last good state; `--resume-policy head` (the bare runner's default) resumes at the head as left. Pass either flag to `scripts/install-preset.mjs` to choose. |
+| Reports | `active`, `PreToolUse`, `Stop` and `session_identity` to `/api/activity/hooks`; permission questions through `/api/activity/permission-requests` |
+| Fork commits | none needed. Stock `main` accepts the runner's `session_identity` report (the hook answers ok and the identity event is published) but does not persist a community resume token from it; the seat's identity reads unconfirmed, as for any community harness. Two fork-only daemon commits (`be17fa528`, `cbb109b62`) add that plus model and context readings, and are not part of this entry. |
+| Limits | no turn cancel; permissions bridged from nodecode's `organism.questions` only, and that proof is driven by a model prompt, so it is opt-in; a question reaches OpenRig only when every choice reads as allow or reject (once or always), others are answered in the pane by typing the exact choice, and only the first four choices are offered through OpenRig; model, provider and effort apply to fresh sessions, a resumed one stays pinned; its gateway keeps running after `rig down`; the installed preset runs each seat in its own nodecode profile (`--seat-profile auto`, sharing the operator's memories and skills), while the bare runner uses the operator's organism unless `--profile` is set; `node` must be on the pane's `PATH` |
 
 ## Pass the first startup input at launch
 
@@ -351,8 +486,17 @@ model a resumed session runs stays unknown unless the harness's own evidence say
   `config.yaml.example` already has a config, so set its model there. Hermes v0.22.4 fixes a session's
   launch settings when it creates it (its own source), so a resumed Hermes session runs with what it was created with.
 
-Both example presets ship with `passes_model: false` until that mapping has been checked with the real harness. Presets
-without the field and built-in runtimes are unchanged, and older OpenRig versions reject it as unknown.
+The Cursor example ships with `passes_model: true`: it was checked with OpenRig 0.7.19 and Cursor CLI 2026.10.19-6bbf2c4
+for a new chat only, and resume is not verified. The Hermes example still ships with `passes_model: false` until its
+mapping has been checked with the real harness. Notes from the Cursor check, for that version:
+- Cursor keeps the passed model as its own default: the seat's `cli-config.json` changed to it, so later chats in that
+  config folder start on it even without `--model`.
+- A fresh start in a folder whose `.cursor/mcp.json` lists MCP servers stops at Cursor's approval screen for them before
+  the chat opens. The example launcher's approval flags are unchanged.
+- `rig ps` still reads the effective model as unknown for a community harness. The model passed to the launcher and the
+  one shown on Cursor's screen are separate facts.
+
+Presets without the field and built-in runtimes are unchanged, and older OpenRig versions reject it as unknown.
 
 ## Interactive Pi in a terminal seat: the coordination skills
 

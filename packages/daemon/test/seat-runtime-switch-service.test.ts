@@ -1,6 +1,8 @@
+import { ActivityGrantStore } from "../src/domain/activity-grants.js";
 import { piAccountStateRoot, piAccountSwitchStateRoot } from "../src/domain/pi-account-state.js";
 import { piSeatPaths } from "../src/adapters/pi-runner-protocol.js";
 import { PiRuntimeAdapter } from "../src/adapters/pi-runtime-adapter.js";
+import { withCommunityHarnessResolver } from "../src/adapters/community-harness-runtime-adapter.js";
 import { providerRoutes } from "../src/routes/provider.js";
 // Slice 16: a live seat moves between Codex and Claude Code, successor first. Real repositories on an in-memory
 // database; tmux and the runtime adapters are fakes that keep which pane each session holds, so the exchange, the
@@ -16,9 +18,12 @@ import { queueRoutes } from "../src/routes/queue.js";
 import { seatRoutes } from "../src/routes/seat.js";
 import { transportRoutes } from "../src/routes/transport.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
+import { RigTeardownOrchestrator } from "../src/domain/rig-teardown.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
+import { activityRoutes } from "../src/routes/activity.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { DefaultOccupantInvalidator } from "../src/domain/occupant-invalidator.js";
 import { NativePermissionStore } from "../src/domain/native-permission-store.js";
@@ -42,6 +47,8 @@ describe("live seat runtime switch", () => {
   let eventBus: EventBus;
   let queueRepo: QueueRepository;
   let panes: Map<string, string>;
+  let sessionCreated: Map<string, string>;
+  let serverStart: number | null;
   let typed: Array<{ target: string; text: string }>;
   let swaps: Array<{ canonical: string; staged: string }>;
   let clock: number;
@@ -53,11 +60,13 @@ describe("live seat runtime switch", () => {
 
   const tmux = () => ({
     deliveryGuard: undefined,
-    listPanes: vi.fn(async (name: string) => panes.has(name) ? [{ id: panes.get(name)!, index: 0, cwd: "/project", width: 80, height: 24, active: true }] : []),
+    listPanes: vi.fn(async (name: string, _allWindows?: boolean) => panes.has(name) ? [{ id: panes.get(name)!, index: 0, cwd: "/project", width: 80, height: 24, active: true }] : []),
+    listSessions: vi.fn(async () => [...panes.keys()].map((name) => ({ name, windows: 1, created: sessionCreated.get(name) ?? String(Date.parse("2026-10-24T01:00:00Z") / 1000), attached: false }))),
+    serverStartTime: vi.fn(async () => serverStart),
     listWindows: vi.fn(async (name: string) => panes.has(name) ? [{ id: "@1", index: 0, name: "main", panes: 1, active: true }] : []),
     probeSession: vi.fn(async (name: string) => ({ state: panes.has(name) ? "present" : "absent" })),
     capturePaneScreen: vi.fn(async () => "predecessor screen tail"),
-    createSession: vi.fn(async (name: string) => { panes.set(name, "%5"); return { ok: true }; }),
+    createSession: vi.fn(async (name: string, _cwd?: string, _env?: Record<string, string>) => { panes.set(name, "%5"); return { ok: true }; }),
     getDefaultShell: vi.fn(async () => "/bin/zsh"),
     getPaneCommand: vi.fn(async () => "zsh"),
     sendText: vi.fn(async (target: string, text: string) => { typed.push({ target, text }); return { ok: true }; }),
@@ -80,6 +89,9 @@ describe("live seat runtime switch", () => {
     killSession: vi.fn(async (name: string) => { panes.delete(name); return { ok: true }; }),
   });
   let fakeTmux: ReturnType<typeof tmux>;
+
+  // Community harness presets this test writes, standing in for what an install puts on disk.
+  let presetsDir: string;
 
   const adapter = (runtime: string): RuntimeAdapter => ({
     runtime,
@@ -115,11 +127,14 @@ describe("live seat runtime switch", () => {
   beforeEach(async () => {
     db = createFullTestDb();
     home = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-switch-"));
+    presetsDir = path.join(home, "community-harnesses");
     rigRepo = new RigRepository(db);
     sessionRegistry = new SessionRegistry(db);
     eventBus = new EventBus(db);
     queueRepo = new QueueRepository(db, eventBus, { validateRig: () => true, resolveOccupantGeneration: (name) => sessionRegistry.currentOccupantGenerationForSession(name) });
     panes = new Map([[SEAT, "%0"]]);
+    sessionCreated = new Map();
+    serverStart = Date.parse("2026-10-24T01:00:00Z") / 1000;
     typed = [];
     swaps = [];
     clock = Date.parse("2026-10-24T02:00:00Z");
@@ -137,8 +152,8 @@ describe("live seat runtime switch", () => {
   });
   afterEach(() => { db.close(); fs.rmSync(home, { recursive: true, force: true }); });
 
-  it("switches a Pi account only after confirmation, preserves its seat and selects durable isolated state", async () => {
-    db.prepare("UPDATE nodes SET runtime = 'pi', model = 'mistral/devstral', effort_choice = 'max', codex_config_profile = NULL WHERE id = ?").run(nodeId);
+  it.each(["pi", "codex", "claude-code"])("switches %s to Pi only after confirmation and selects durable isolated state", async from => {
+    db.prepare("UPDATE nodes SET runtime = ?, model = 'mistral/devstral', effort_choice = 'max', codex_config_profile = NULL WHERE id = ?").run(from, nodeId);
     const base = path.join(home, "state", "pi");
     const original = piSeatPaths(base, SEAT).agentDir;
     fs.mkdirSync(original, { recursive: true });
@@ -151,12 +166,13 @@ describe("live seat runtime switch", () => {
     const target = adapter("pi");
     vi.mocked(target.launchHarness).mockImplementation(async binding => {
       expect(binding.accountHome).toBe(accountHome);
-      expect(binding.launchWrapper).toEqual(["wrapper", "--"]);
+      expect(binding.launchWrapper).toEqual(from === "claude-code" ? undefined : ["wrapper", "--"]);
       expect(rigRepo.getEffectiveSeatEnv(nodeId).PI_CODING_AGENT_DIR).toBeUndefined();
       expect(piAccountStateRoot(db, base, SEAT)).toBe(base);
       expect(fs.readFileSync(path.join(original, "auth.json"), "utf8")).toBe("original-seat-login");
       const successor = piSeatPaths(piAccountSwitchStateRoot(base, binding.launchGeneration!), SEAT);
-      expect(fs.readFileSync(path.join(successor.agentDir, "models.json"), "utf8")).toBe("{\"providers\":{}}");
+      if (from === "pi") expect(fs.readFileSync(path.join(successor.agentDir, "models.json"), "utf8")).toBe("{\"providers\":{}}");
+      else expect(fs.existsSync(path.join(successor.agentDir, "models.json"))).toBe(false);
       expect(fs.existsSync(path.join(successor.agentDir, "auth.json"))).toBe(false);
       fs.mkdirSync(successor.sessionsDir, { recursive: true });
       const token = path.join(successor.sessionsDir, "conversation.jsonl");
@@ -164,11 +180,13 @@ describe("live seat runtime switch", () => {
       fs.writeFileSync(successor.runnerStatePath, JSON.stringify({ ready: true, sessionFile: token, launchId: "successor", updatedAt: "now" }));
       return { ok: true, resumeType: "pi_session_file", resumeToken: token };
     });
-    db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run(JSON.stringify(["wrapper", "--"]), nodeId);
+    if (from !== "claude-code") db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run(JSON.stringify(["wrapper", "--"]), nodeId);
     const svc = service({ runtimeAdapters: { pi: target } }); successorConfirms(svc);
     expect(await svc.setRuntime({ seatRef: SEAT, runtime: "pi", accountHome, reason: "Change budget" }))
-      .toMatchObject({ ok: true, changed: true, from: "pi", to: "pi", claimsMoved: 1, recoveryPending: false });
-    expect(nodeRow()).toMatchObject({ runtime: "pi", model: "mistral/devstral", effort: "high", effort_choice: "max" });
+      .toMatchObject({ ok: true, changed: true, from, to: "pi", claimsMoved: 1, recoveryPending: false });
+    expect(nodeRow()).toMatchObject(from === "pi"
+      ? { runtime: "pi", model: "mistral/devstral", effort: "high", effort_choice: "max" }
+      : { runtime: "pi", model: null, effort: null, effort_choice: null });
     expect(rigRepo.getEffectiveSeatEnv(nodeId).PI_CODING_AGENT_DIR).toBe(accountHome);
     expect(piAccountStateRoot(db, base, SEAT)).toBe(piAccountSwitchStateRoot(base, openSwitch()!.successor_generation));
     expect(sessionRegistry.getBindingForNode(nodeId)).toMatchObject({ tmuxSession: SEAT, tmuxPane: "%5" });
@@ -234,11 +252,116 @@ describe("live seat runtime switch", () => {
     expect(result.settings.effort.value).toBe("max");
   });
 
-  it("refuses Pi homes without credentials before staging, and keeps cross-runtime Pi switches out of scope", async () => {
+  it("refuses Pi homes without credentials before staging", async () => {
     db.prepare("UPDATE nodes SET runtime = 'pi' WHERE id = ?").run(nodeId);
     expect(await service().setRuntime({ seatRef: SEAT, runtime: "pi", accountHome: home, reason: "No auth", dryRun: true })).toMatchObject({ ok: false, code: "invalid_runtime_settings" });
-    expect(await service().setRuntime({ seatRef: SEAT, runtime: "codex", reason: "Change runtime", dryRun: true })).toMatchObject({ ok: false, code: "runtime_switch_unsupported" });
     expect(fakeTmux.createSession).not.toHaveBeenCalled();
+  });
+
+  it("switches to Pi and back with a confirmed successor and an isolated account", async () => {
+    const accountHome = path.join(home, "mistral-plan");
+    fs.mkdirSync(accountHome);
+    fs.writeFileSync(path.join(accountHome, "auth.json"), "{}");
+    const svc = service();
+    successorConfirms(svc);
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "pi", model: "mistral/devstral-latest", accountHome, reason: "Mistral plan" }))
+      .toMatchObject({ ok: true, changed: true, to: "pi" });
+    expect(rigRepo.getRig((db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(nodeId) as { rig_id: string }).rig_id)?.nodes.find(n => n.id === nodeId)).toMatchObject({ runtime: "pi", accountHome });
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "codex", reason: "Pi allowance ran out" }))
+      .toMatchObject({ ok: true, changed: true, to: "codex" });
+    expect(rigRepo.getRig((db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(nodeId) as { rig_id: string }).rig_id)?.nodes.find(n => n.id === nodeId)).toMatchObject({ runtime: "codex" });
+  });
+
+  it("entering Pi does not revive an earlier Pi occupant's settings or credentials", async () => {
+    const base = path.join(home, "state", "pi");
+    const original = piSeatPaths(base, SEAT).agentDir;
+    fs.mkdirSync(original, { recursive: true });
+    fs.writeFileSync(path.join(original, "settings.json"), '{"defaultModel":"old-pi-model"}');
+    fs.writeFileSync(path.join(original, "auth.json"), "old-pi-login");
+    const target = adapter("pi");
+    vi.mocked(target.launchHarness).mockImplementation(async binding => {
+      const staged = piSeatPaths(piAccountSwitchStateRoot(base, binding.launchGeneration!), SEAT).agentDir;
+      expect(fs.existsSync(path.join(staged, "settings.json"))).toBe(false);
+      expect(fs.existsSync(path.join(staged, "auth.json"))).toBe(false);
+      expect(fs.readFileSync(path.join(original, "auth.json"), "utf8")).toBe("old-pi-login");
+      return { ok: true };
+    });
+    const svc = service({ runtimeAdapters: { pi: target } }); successorConfirms(svc);
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "pi", reason: "Fresh target defaults" })).toMatchObject({ ok: true });
+  });
+
+  const piTransitions = [
+    ["codex", "pi"], ["claude-code", "pi"], ["pi", "codex"], ["pi", "claude-code"],
+  ] as const;
+
+  describe.each(piTransitions)("%s → %s", (from, to) => {
+    it.each(["confirm", "timeout", "launch-failure"])("keeps identity, claims and credentials through %s", async outcome => {
+      const oldToken = JSON.stringify({ label: "source", tokenFile: "/synthetic/source-token" });
+      db.prepare("UPDATE nodes SET runtime = ?, account_home = '/accounts/source', claude_token_ref = ?, effort_choice = 'max', advisor = 'source-advisor' WHERE id = ?")
+        .run(from, oldToken, nodeId);
+      const claimed = await queueRepo.create({ sourceSession: "orch-lead@seat-rig", destinationSession: SEAT, body: "review" });
+      queueRepo.claim({ qitemId: claimed.qitemId, destinationSession: SEAT });
+      const pending = await queueRepo.create({ sourceSession: "orch-lead@seat-rig", destinationSession: SEAT, body: "next" });
+      const accountHome = path.join(home, "target-account");
+      fs.mkdirSync(accountHome);
+      fs.writeFileSync(path.join(accountHome, "auth.json"), "{}");
+      const target = adapter(to);
+      vi.mocked(target.launchHarness).mockImplementation(async binding => {
+        expect(nodeRow().runtime).toBe(from);
+        expect(sessionRegistry.currentOccupantTenure(nodeId)?.generationUuid).toBe(predecessorGeneration);
+        expect(fakeTmux.signalPaneProcess).not.toHaveBeenCalled();
+        expect(binding).toMatchObject({ accountHome, accountToken: null });
+        const stagedEnv = fakeTmux.createSession.mock.calls[0]![2]!;
+        const sourceHomeVar = from === "pi" ? "PI_CODING_AGENT_DIR" : from === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR";
+        expect(stagedEnv[sourceHomeVar]).toBeUndefined();
+        expect(binding.model).toBeUndefined();
+        expect(binding.effort).toBeUndefined();
+        expect(binding.launchWrapper).toBeUndefined();
+        return outcome === "launch-failure" ? { ok: false, error: "synthetic launch failure" } : { ok: true };
+      });
+      const svc = service({ runtimeAdapters: { [to]: target } });
+      if (outcome === "confirm") successorConfirms(svc);
+      const result = await svc.setRuntime({ seatRef: SEAT, runtime: to, accountHome, reason: "Change provider", confirmTimeoutMs: 1 });
+      const committed = outcome === "confirm";
+      expect(result).toMatchObject(committed ? { ok: true, changed: true, from, to, claimsMoved: 1 } : { ok: false, committed: false });
+      expect(nodeRow()).toMatchObject(committed
+        ? { runtime: to, model: null, effort: null, effort_choice: null, advisor: null, codex_config_profile: null }
+        : { runtime: from, model: "gpt-5.5", effort: "high", effort_choice: "max", advisor: "source-advisor" });
+      expect(db.prepare("SELECT account_home, claude_token_ref FROM nodes WHERE id = ?").get(nodeId))
+        .toEqual({ account_home: committed ? accountHome : "/accounts/source", claude_token_ref: committed ? null : oldToken });
+      expect(sessionRegistry.getBindingForNode(nodeId)).toMatchObject({ tmuxSession: SEAT, tmuxPane: committed ? "%5" : "%0" });
+      expect(db.prepare("SELECT state, claimed_by_generation_uuid g FROM queue_items WHERE qitem_id = ?").get(claimed.qitemId))
+        .toMatchObject({ state: "in-progress", g: committed ? openSwitch()!.successor_generation : predecessorGeneration });
+      expect(db.prepare("SELECT state, destination_session FROM queue_items WHERE qitem_id = ?").get(pending.qitemId))
+        .toMatchObject({ state: "pending", destination_session: SEAT });
+      expect([...panes.keys()]).toEqual([SEAT]);
+    });
+
+    it.each([true, false])("clears the source selection and token without reusing it (home selected: %s)", async selected => {
+      db.prepare("UPDATE nodes SET runtime = ?, account_home = ?, claude_token_ref = ? WHERE id = ?")
+        .run(from, selected ? "/accounts/source" : null, JSON.stringify({ label: "source", tokenFile: "/synthetic/token" }), nodeId);
+      const target = adapter(to);
+      vi.mocked(target.launchHarness).mockImplementation(async binding => {
+        expect(binding.accountHome).toBeNull();
+        expect(binding.accountToken).toBeNull();
+        return { ok: true };
+      });
+      const svc = service({ runtimeAdapters: { [to]: target } }); successorConfirms(svc);
+      expect(await svc.setRuntime({ seatRef: SEAT, runtime: to, reason: "Target default", clearAccountHome: selected })).toMatchObject({ ok: true });
+      expect(db.prepare("SELECT account_home, claude_token_ref FROM nodes WHERE id = ?").get(nodeId))
+        .toEqual({ account_home: null, claude_token_ref: null });
+    });
+  });
+
+  it.each(["codex", "pi"] as const)("carries the explicitly configured wrapper from %s to the other supported runtime", async from => {
+    const to = from === "pi" ? "codex" : "pi";
+    db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run(from, nodeId);
+    rigRepo.setNodeLaunchWrapper(nodeId, ["wrapper", "--"]);
+    const target = adapter(to);
+    const svc = service({ runtimeAdapters: { [to]: target } }); successorConfirms(svc);
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: to, reason: "Wrapped switch" })).toMatchObject({ ok: true });
+    expect(vi.mocked(target.launchHarness).mock.calls[0]![0].launchWrapper).toEqual(["wrapper", "--"]);
+    expect(rigRepo.getRig(rigRepo.listRigs()[0]!.id)?.nodes[0]?.launchWrapper).toEqual(["wrapper", "--"]);
   });
 
   it("switches a Codex seat to another account home on the same runtime, committing only after confirmation", async () => {
@@ -300,6 +423,18 @@ describe("live seat runtime switch", () => {
       .toMatchObject({ ok: true, changed: false, accountHome: null });
     expect((db.prepare("SELECT claude_token_ref FROM nodes WHERE id = ?").get(nodeId) as { claude_token_ref: string }).claude_token_ref).toBe(token);
     expect(fakeTmux.createSession).not.toHaveBeenCalled();
+  });
+
+  it("a switched Claude successor records the folder it was launched in, so rig down doesn't name it as unrecorded (#3409)", async () => {
+    const svc = service({ runtimeAdapters: { "claude-code": adapter("claude-code") } }); successorConfirms(svc);
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "claude-code", reason: "Ordinary switch" })).toMatchObject({ ok: true });
+    expect(db.prepare("SELECT origin, launched_cwd FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1").get(nodeId))
+      .toEqual({ origin: "launched", launched_cwd: "/project" });
+    const rigId = (db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(nodeId) as { rig_id: string }).rig_id;
+    const teardown = new RigTeardownOrchestrator({ db, rigRepo, sessionRegistry, eventBus,
+      tmuxAdapter: { killSession: async () => ({ ok: true }) } as never,
+      snapshotCapture: { db, captureSnapshot: () => ({ id: "snap" }) } as never });
+    expect((await teardown.teardown(rigId)).launchFolderUnrecorded).toBeUndefined();
   });
 
   it("an ordinary runtime switch without an account override retains legacy launch semantics", async () => {
@@ -384,7 +519,8 @@ describe("live seat runtime switch", () => {
     }
   });
 
-  it("a target Claude setup-token reference is staged and committed with its home, replacing any previous token", async () => {
+  it.each(["codex", "pi"])("a %s seat stages and commits the target Claude token with its home", async from => {
+    db.prepare("UPDATE nodes SET runtime = ? WHERE id = ?").run(from, nodeId);
     const accountHome = path.join(home, "plan-account"); fs.mkdirSync(accountHome);
     const tokenFile = path.join(home, "plan-token"); fs.writeFileSync(tokenFile, "synthetic-fixture-not-a-token", { mode: 0o600 });
     const accountToken = { label: "claude-plan", tokenFile };
@@ -587,6 +723,8 @@ describe("live seat runtime switch", () => {
   it.each([undefined, "none"] as const)("carries retained Claude rules and MCP selection (%s) into the target successor", async claudeMcp => {
     const rules = { allow: ["Read(./work/**)"], deny: ["Read(./private/**)"] };
     db.prepare("UPDATE nodes SET claude_permissions_json=? WHERE id=?").run(JSON.stringify(rules), nodeId);
+    const claudeAutoMode = { soft_deny: ["$defaults", "Never push to main"] };
+    db.prepare("UPDATE nodes SET claude_auto_mode_json=? WHERE id=?").run(JSON.stringify(claudeAutoMode), nodeId);
     rigRepo.setNodeClaudeMcp(nodeId, claudeMcp ?? null);
     new NativePermissionStore(db).write(nodeId, { runtime: "codex", mode: "floor" }, "operator", "earlier Codex choice");
     const claude = adapter("claude-code");
@@ -595,7 +733,7 @@ describe("live seat runtime switch", () => {
     expect(await svc.setRuntime({ seatRef: SEAT, runtime: "claude-code", permissionMode: "acceptEdits", reason: "switch with retained rules" }))
       .toMatchObject({ ok: true, to: "claude-code" });
     expect(claude.launchHarness).toHaveBeenCalledWith(expect.objectContaining({
-      claudePermissions: rules, permissionMode: "acceptEdits", claudeMcp,
+      claudePermissions: rules, claudeAutoMode, permissionMode: "acceptEdits", claudeMcp,
     }), expect.objectContaining({ name: SEAT }));
   });
 
@@ -763,6 +901,168 @@ describe("live seat runtime switch", () => {
     });
   });
 
+  it("abandons only the staged run grant while the live predecessor keeps its authority", async () => {
+    db.prepare("UPDATE nodes SET runtime = 'pi' WHERE id = ?").run(nodeId);
+    const grants = new ActivityGrantStore(db);
+    const old = grants.issue({ nodeId, generation: predecessorGeneration, issuedBy: "launch", run: { runId: "predecessor",
+      binding: { runtime: "pi", runner: 0, pane: "%0", panePid: 100 } } });
+    expect(grants.activate(old.grantId)).toBe(true);
+    let stagedId = "";
+    const target = adapter("pi");
+    vi.mocked(target.launchHarness).mockImplementation(async binding => {
+      const staged = grants.issue({ nodeId, generation: binding.launchGeneration!, issuedBy: "launch", run: { runId: "staged",
+        binding: { runtime: "pi", runner: 0, pane: binding.tmuxPane!, panePid: 200 } } });
+      stagedId = staged.grantId;
+      return { ok: true, activityGrantId: stagedId };
+    });
+    const accountHome = path.join(home, "next-account"); fs.mkdirSync(accountHome);
+    fs.writeFileSync(path.join(accountHome, "auth.json"), "selected-login");
+    const result = await service({ runtimeAdapters: { pi: target } }).setRuntime({ seatRef: SEAT, runtime: "pi", accountHome,
+      reason: "change account", confirmTimeoutMs: 1_000 });
+    expect(result).toMatchObject({ ok: false, committed: false });
+    expect(stagedId).not.toBe("");
+    expect(grants.standing(stagedId)).toBe("revoked");
+    expect(grants.standing(old.grantId)).toBe("current");
+  });
+
+  it("a community harness target is staged through its installed preset's adapter", async () => {
+    // A preset installed on this daemon defines `cursor`; the switch must reach it even though no seat has run it yet.
+    const community = { ...adapter("cursor"), runtime: "cursor" } as unknown as RuntimeAdapter;
+    const builtIns = { codex: adapter("codex"), "claude-code": adapter("claude-code"), pi: adapter("pi") };
+    const withResolver = withCommunityHarnessResolver(builtIns as Record<string, RuntimeAdapter>, {
+      tmux: fakeTmux as unknown as TmuxAdapter,
+      presetsDir: () => presetsDir,
+    });
+    // The resolver only knows presets it can load, so a real one goes on disk for this case.
+    fs.mkdirSync(presetsDir, { recursive: true });
+    fs.writeFileSync(path.join(presetsDir, "cursor.yaml"),
+      "format: 1\nname: cursor\ncommand: node C:/fixture/cursor.mjs\nmaintainer: test\nlaunch_result: true\n", "utf8");
+
+    const result = await service({ runtimeAdapters: withResolver }).setRuntime({ seatRef: SEAT, runtime: "cursor", reason: "limit", dryRun: true });
+    expect(result).toMatchObject({ ok: true, dryRun: true, changed: true, from: "codex", to: "cursor" });
+    expect(community.runtime).toBe("cursor");
+  });
+
+  it.each([
+    ["community:cursor-token", "community:other"],
+    ["community:cursor bad", "community:cursor"],
+  ])("does not record an unusable community conversation (%s, %s)", async (token, type) => {
+    const community = { ...adapter("cursor"), runtime: "cursor",
+      launchHarness: vi.fn(async () => ({ ok: true, resumeToken: token, resumeType: type })) } as unknown as RuntimeAdapter;
+    fs.mkdirSync(presetsDir, { recursive: true });
+    fs.writeFileSync(path.join(presetsDir, "cursor.yaml"),
+      "format: 1\nname: cursor\ncommand: node C:/fixture/cursor.mjs\nmaintainer: test\nlaunch_result: true\nresume: true\n", "utf8");
+    const svc = service({ runtimeAdapters: { codex: adapter("codex"), cursor: community } });
+    successorConfirms(svc);
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "cursor", reason: "Check reported identity" })).toMatchObject({ ok: true, changed: true });
+    expect(db.prepare("SELECT resume_type, resume_token FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(nodeId))
+      .toMatchObject({ resume_type: null, resume_token: null });
+  });
+
+  it.each([false, true])("uses the rig's recorded source root before the project cwd (install root=%s)", async installed => {
+    const sourceRoot = path.join(home, "source-rig"), project = path.join(home, "project");
+    for (const [root, model] of [[sourceRoot, "source-model"], [project, "project-model"]]) {
+      fs.mkdirSync(path.join(root!, "agents", "impl"), { recursive: true });
+      fs.writeFileSync(path.join(root!, "rig.yaml"), "version: \"0.2\"\nname: seat-rig\npods: []\n");
+      fs.writeFileSync(path.join(root!, "agents", "impl", "agent.yaml"),
+        `name: impl\nversion: "1.0.0"\ndefaults:\n  runtime: claude-code\n  model: ${model}\nprofiles:\n  default:\n    uses:\n      skills: []\n`);
+    }
+    const rigId = (db.prepare("SELECT rig_id FROM nodes WHERE id = ?").get(nodeId) as { rig_id: string }).rig_id;
+    rigRepo.setRigStartupLayers(rigId, { root: installed ? project : sourceRoot });
+    db.prepare("UPDATE rigs SET install_root = ? WHERE id = ?").run(installed ? sourceRoot : null, rigId);
+    db.prepare("UPDATE nodes SET cwd = ?, agent_ref = 'local:agents/impl', profile = 'default', resolved_spec_name = 'impl' WHERE id = ?").run(project, nodeId);
+    db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, '[]', '[]', '[]', 'codex')").run(nodeId);
+    const result = await service().setRuntime({ seatRef: SEAT, runtime: "claude-code", reason: "Read original rig", dryRun: true });
+    expect(result).toMatchObject({ ok: true, dryRun: true, settings: { model: { value: "source-model", source: "agent_spec" } } });
+  });
+
+  it("a pi-rpc staged hook keeps the launcher's community session-file resume at commit", async () => {
+    fs.mkdirSync(presetsDir, { recursive: true });
+    fs.writeFileSync(path.join(presetsDir, "senpi.yaml"),
+      "format: 1\nname: senpi\ncommand: node /fixture/senpi.mjs\nmaintainer: test\nprotocol: pi-rpc\nresume: true\n");
+    const nativeId = "11111111-2222-4333-8444-555555555555";
+    const sessionFile = path.join(home, "native-session.jsonl");
+    fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: nativeId })}\n`);
+    const community = { ...adapter("senpi"), runtime: "senpi",
+      launchHarness: vi.fn(async () => ({ ok: true, resumeToken: sessionFile, resumeType: "community:senpi" })) } as unknown as RuntimeAdapter;
+    const svc = service({ runtimeAdapters: { codex: adapter("codex"), senpi: community } });
+    const hooks = new Hono();
+    hooks.use("*", async (c, next) => {
+      c.set("agentActivityStore" as never, new AgentActivityStore({ db, eventBus }) as never);
+      c.set("activityHookToken" as never, "fixture" as never);
+      c.set("sessionRegistry" as never, sessionRegistry as never);
+      c.set("eventBus" as never, eventBus as never);
+      await next();
+    });
+    hooks.route("/api/activity", activityRoutes);
+    onSleep = async () => {
+      const row = openSwitch();
+      if (row?.phase !== "preparing" || !handoverTyped()) return;
+      // PiRunner's real session_identity payload names the preset and keeps native id and file separate.
+      const response = await hooks.request("/api/activity/hooks", { method: "POST",
+        headers: { "content-type": "application/json", "x-openrig-activity-token": "fixture" },
+        body: JSON.stringify({ eventFamily: "session_identity", hookEvent: "SessionStart", sessionName: SEAT,
+          nodeId, runtime: "senpi", generation: row.successor_generation, sessionId: nativeId, sessionFile }) });
+      expect(await response.json()).toMatchObject({ ok: true, ignored: "staged_successor", tokenPersisted: false });
+      expect(db.prepare("SELECT successor_resume_type, successor_resume_token FROM seat_runtime_switches WHERE id = ?").get(row.id))
+        .toMatchObject({ successor_resume_type: "senpi", successor_resume_token: nativeId });
+      svc.confirm({ seatRef: SEAT, switchId: row.id, note: "Ready", actorSession: SEAT, generation: row.successor_generation });
+    };
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "senpi", reason: "Resume the native conversation" }))
+      .toMatchObject({ ok: true, changed: true, from: "codex", to: "senpi" });
+    expect(db.prepare("SELECT agent_app, resume_type, resume_token FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1").get(nodeId))
+      .toMatchObject({ agent_app: "senpi", resume_type: "community:senpi", resume_token: sessionFile });
+  });
+
+  it.each(["openrig-build-upgrade-1a2b3c4d", "launcher-native-ref-7"])("a switch to a community harness commits the harness and its conversation, and back is accepted (%s)", async nativeRef => {
+    // The successor must carry the harness on its session and the preset's own conversation type, or a relaunch, a
+    // restore, or a switch back can't resolve any of it. This exercises the commit, which nothing covered before.
+    const builtIns = { codex: adapter("codex"), "claude-code": adapter("claude-code"), pi: adapter("pi") };
+    const withResolver = withCommunityHarnessResolver(builtIns as Record<string, RuntimeAdapter>, {
+      tmux: fakeTmux as unknown as TmuxAdapter, presetsDir: () => presetsDir });
+    fs.mkdirSync(presetsDir, { recursive: true });
+    fs.writeFileSync(path.join(presetsDir, "cursor.yaml"),
+      "format: 1\nname: cursor\ncommand: node C:/fixture/cursor.mjs\nmaintainer: test\nlaunch_result: true\nresume: true\n", "utf8");
+    // The harness's launcher reports its conversation as `community:cursor`, the type the built-in validator doesn't know.
+    const community = { ...adapter("cursor"), runtime: "cursor",
+      launchHarness: vi.fn(async () => ({ ok: true, resumeToken: nativeRef, resumeType: "community:cursor" })) } as unknown as RuntimeAdapter;
+
+    const svc = service({ runtimeAdapters: { ...withResolver, cursor: community } });
+    successorConfirms(svc);
+    expect(await svc.setRuntime({ seatRef: SEAT, runtime: "cursor", reason: "Move to the harness" }))
+      .toMatchObject({ ok: true, changed: true, from: "codex", to: "cursor" });
+
+    const committed = db.prepare("SELECT agent_app, resume_type, resume_token FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
+      .get(nodeId) as { agent_app: string | null; resume_type: string | null; resume_token: string | null };
+    expect(committed.agent_app).toBe("cursor");
+    expect(committed.resume_type).toBe("community:cursor");
+    expect(committed.resume_token).toBe(nativeRef);
+
+    // Back to a built-in is accepted now that the successor's selection names the harness, and its token is a built-in's.
+    const back = { ...adapter("codex"), runtime: "codex",
+      launchHarness: vi.fn(async () => ({ ok: true, resumeToken: "0198b1f0-0000-7000-8000-000000000001", resumeType: "codex_id" })) } as unknown as RuntimeAdapter;
+    const svcBack = service({ runtimeAdapters: { ...withResolver, codex: back } });
+    onSleep = () => {
+      const open = openSwitch();
+      if (open?.phase !== "preparing" || !handoverTyped()) return;
+      svcBack.confirm({ seatRef: SEAT, switchId: open.id, note: "back to codex", actorSession: SEAT, generation: open.successor_generation });
+    };
+    const backResult = await svcBack.setRuntime({ seatRef: SEAT, runtime: "codex", reason: "Back to a built-in" });
+    expect(backResult).toMatchObject({ ok: true, changed: true, from: "cursor", to: "codex" });
+  });
+
+  it("a community harness target with an unreadable preset is still refused before any successor starts", async () => {
+    fs.mkdirSync(presetsDir, { recursive: true });
+    fs.writeFileSync(path.join(presetsDir, "broken.yaml"), "format: 1\nname: broken\n", "utf8");
+    const builtIns = { codex: adapter("codex"), "claude-code": adapter("claude-code"), pi: adapter("pi") };
+    const withResolver = withCommunityHarnessResolver(builtIns as Record<string, RuntimeAdapter>, {
+      tmux: fakeTmux as unknown as TmuxAdapter,
+      presetsDir: () => presetsDir,
+    });
+    expect(await service({ runtimeAdapters: withResolver }).setRuntime({ seatRef: SEAT, runtime: "broken", reason: "x", dryRun: true }))
+      .toMatchObject({ ok: false, code: "runtime_target_unavailable" });
+  });
+
   it("without a confirmation in time nothing changes: the current occupant keeps the seat and its claim, and the staged successor is retired", async () => {
     const claimed = await queueRepo.create({ sourceSession: "orch-lead@seat-rig", destinationSession: SEAT, body: "review" });
     queueRepo.claim({ qitemId: claimed.qitemId, destinationSession: SEAT });
@@ -822,7 +1122,18 @@ describe("live seat runtime switch", () => {
     it("a seat on another runtime", async () => {
       db.prepare("UPDATE nodes SET runtime = 'omp' WHERE id = ?").run(nodeId);
       expect(await service().setRuntime({ seatRef: SEAT, runtime: "claude-code", reason: "x", dryRun: true }))
-        .toMatchObject({ ok: false, code: "runtime_switch_unsupported", message: expect.stringMatching(/only Codex and Claude Code seats can change runtime/) });
+        .toMatchObject({ ok: false, code: "runtime_switch_unsupported", message: expect.stringMatching(/only Codex, Claude Code, Pi and community-harness seats can change runtime/) });
+    });
+    it("a community harness target whose preset this daemon doesn't have", async () => {
+      // The runtime name alone doesn't prove a preset is installed: an unknown name and an uninstalled harness both refuse.
+      expect(await service().setRuntime({ seatRef: SEAT, runtime: "cursor", reason: "x", dryRun: true }))
+        .toMatchObject({ ok: false, code: "runtime_target_unavailable" });
+    });
+    it("a source seat on a community harness only switches once its preset is installed", async () => {
+      db.prepare("UPDATE nodes SET runtime = 'cursor' WHERE id = ?").run(nodeId);
+      // No preset loaded, so nothing resolves this harness: the seat isn't switched as if it were a built-in one.
+      expect(await service().setRuntime({ seatRef: SEAT, runtime: "codex", reason: "x", dryRun: true }))
+        .toMatchObject({ ok: false, code: "runtime_switch_unsupported" });
     });
     it("a target this daemon can't start", async () => {
       expect(await service({ runtimeAdapters: { codex: adapter("codex") } }).setRuntime({ seatRef: SEAT, runtime: "claude-code", reason: "x", dryRun: true }))
@@ -843,10 +1154,23 @@ describe("live seat runtime switch", () => {
   describe("recovery after an interrupted switch", () => {
     const record = (phase: "preparing" | "confirmed" | "committed") => {
       db.prepare(`INSERT INTO seat_runtime_switches (id, node_id, canonical_session, staging_session, predecessor_pane, successor_pane, predecessor_generation,
-        successor_generation, from_runtime, to_runtime, phase, reason, plan_json, deadline_at, committed_at)
-        VALUES ('sw1', ?, ?, 'openrig-switch-sw1', '%0', '%5', ?, 'g-next', 'codex', 'claude-code', ?, 'r', '{}', '2026-10-24T03:00:00Z', ?)`)
+        successor_generation, from_runtime, to_runtime, phase, reason, plan_json, deadline_at, committed_at, created_at)
+        VALUES ('sw1', ?, ?, 'openrig-switch-sw1', '%0', '%5', ?, 'g-next', 'codex', 'claude-code', ?, 'r', '{}', '2026-10-24T03:00:00Z', ?, '2026-10-24T02:00:00.000Z')`)
         .run(nodeId, SEAT, predecessorGeneration, phase, phase === "committed" ? "2026-10-24T02:01:00Z" : null);
     };
+
+    it("withdraws only the interrupted operation's pending issuance before recovery awaits", async () => {
+      record("preparing"); panes.set("openrig-switch-sw1", "%5");
+      const grants = new ActivityGrantStore(db);
+      const predecessor = grants.issue({ nodeId, generation: predecessorGeneration, issuedBy: "legacy" });
+      const issue = (generation: string, runId: string) => grants.issue({ nodeId, generation, issuedBy: "launch", run: {
+        runId, binding: { runtime: "pi", runner: 0, pane: "%5", panePid: 200 } } });
+      const abandoned = issue("g-next", "abandoned"), unrelated = issue("other-reservation", "unrelated");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: true });
+      expect(grants.standing(abandoned.grantId)).toBe("revoked");
+      expect(grants.standing(unrelated.grantId)).toBe("pending");
+      expect(grants.get(predecessor.grantId)?.revokedAt).toBeNull();
+    });
 
     it("stopped before commit, panes not exchanged: the staged successor is retired and the old runtime keeps the seat", async () => {
       record("preparing");
@@ -890,12 +1214,182 @@ describe("live seat runtime switch", () => {
       expect(piAccountStateRoot(db, home, SEAT)).toBe(phase === "committed" ? piAccountSwitchStateRoot(home, "g-next") : home);
     });
 
+    describe.each(piTransitions)("recover %s → %s", (from, to) => {
+      it.each(["preparing", "confirmed", "committed"] as const)("retains the durable runtime and state after %s", async phase => {
+        record(phase);
+        const committed = phase === "committed";
+        db.prepare("UPDATE seat_runtime_switches SET from_runtime = ?, to_runtime = ?").run(from, to);
+        db.prepare("UPDATE nodes SET runtime = ?, account_home = ? WHERE id = ?")
+          .run(committed ? to : from, committed ? "/accounts/target" : "/accounts/source", nodeId);
+        panes.set(SEAT, phase === "preparing" ? "%0" : "%5");
+        panes.set("openrig-switch-sw1", phase === "preparing" ? "%5" : "%0");
+        expect(await service().recover(nodeId)).toMatchObject({ ok: true });
+        expect(nodeRow().runtime).toBe(committed ? to : from);
+        expect(db.prepare("SELECT account_home FROM nodes WHERE id = ?").get(nodeId))
+          .toEqual({ account_home: committed ? "/accounts/target" : "/accounts/source" });
+        expect(panes.get(SEAT)).toBe(committed ? "%5" : "%0");
+        expect([...panes.keys()]).toEqual([SEAT]);
+        expect(piAccountStateRoot(db, home, SEAT)).toBe(committed && to === "pi" ? piAccountSwitchStateRoot(home, "g-next") : home);
+      });
+    });
+
     it("panes that match neither side: nothing is touched, and the seat's status says why", async () => {
       record("preparing");
       panes.set(SEAT, "%9");
       expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
       expect(fakeTmux.killSession).not.toHaveBeenCalled();
       expect(runtimeSwitchSummary(db, { nodeId })).toMatchObject({ id: "sw1", committed: false, attention: expect.stringMatching(/neither the predecessor's nor the successor's/) });
+    });
+
+    it("#3103: past its deadline with the staging session gone, a seat restored on a new pane settles the switch as abandoned", async () => {
+      record("preparing");
+      panes.set(SEAT, "%9"); // a host reboot renumbered the restored seat's pane; the staged successor ended with tmux
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recoverAll()).toEqual([]);
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+      expect(panes.get(SEAT)).toBe("%9");
+      expect(runtimeSwitchSummary(db, { nodeId })).toBeNull();
+      expect(openSwitch()).toMatchObject({ phase: "abandoned", attention: null, outcome: expect.stringMatching(/one pane is at the seat, not identified as the codex occupant; the staged claude-code successor was already gone/) });
+      expect(openSwitch()).not.toMatchObject({ outcome: expect.stringMatching(/occupant holds the seat/) });
+      expect(await service().recover(nodeId)).toMatchObject({ ok: true, outcome: "No runtime switch needs recovery." });
+    });
+
+    it("#3103: past its deadline, an expired switch with the predecessor's pane at the seat names the codex occupant", async () => {
+      record("preparing");
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: true, outcome: expect.stringMatching(/the codex occupant holds the seat; the staged claude-code successor was already gone/) });
+      expect(panes.get(SEAT)).toBe("%0");
+    });
+
+    it("#3103: with the successor's pane still at the seat, an expired switch isn't settled by the deadline alone", async () => {
+      record("preparing");
+      panes.set(SEAT, "%5");
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(runtimeSwitchSummary(db, { nodeId })).toMatchObject({ id: "sw1", attention: "The seat's pane (%5) is the staged successor's, but the switch wasn't committed; nothing was touched." });
+    });
+
+    it("#3103: a seat restored after a tmux server restart on the old successor's pane number isn't taken for the successor", async () => {
+      record("preparing");
+      panes.set(SEAT, "%5"); // the new server numbered panes from zero again
+      serverStart = Date.parse("2026-10-24T03:30:00Z") / 1000;
+      sessionCreated.set(SEAT, String(Date.parse("2026-10-24T03:30:00Z") / 1000));
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: true, outcome: expect.stringMatching(/one pane is at the seat, not identified as the codex occupant; the staged claude-code successor was already gone/) });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+      expect(panes.get(SEAT)).toBe("%5");
+      expect(runtimeSwitchSummary(db, { nodeId })).toBeNull();
+    });
+
+    it("#3103: a successor that survives in a session newer than the switch, on the same tmux server, still holds the switch", async () => {
+      record("preparing");
+      panes.set(SEAT, "%5"); // the successor's pane, linked or moved into a session made after the switch
+      sessionCreated.set(SEAT, String(Date.parse("2026-10-24T03:30:00Z") / 1000));
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(openSwitch()).toMatchObject({ phase: "preparing" });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+    });
+
+    it("#3103: a successor in another window of the seat's session is seen, and an expired switch isn't settled", async () => {
+      record("preparing");
+      // tmux's list-panes on a session lists only its current window; -s lists every window.
+      fakeTmux.listPanes.mockImplementation(async (name: string, allWindows?: boolean) =>
+        name === SEAT ? (allWindows ? [{ id: "%9" }, { id: "%5" }] : [{ id: "%9" }]) as never : []);
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(openSwitch()).toMatchObject({ phase: "preparing" });
+    });
+
+    it("#3103: with the successor's pane current and the all-windows read failing, an expired switch isn't settled", async () => {
+      record("preparing");
+      fakeTmux.listPanes.mockImplementation(async (name: string, allWindows?: boolean) => {
+        if (name !== SEAT) return [];
+        if (allWindows) throw new Error("tmux: server busy");
+        return [{ id: "%5" }] as never;
+      });
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(openSwitch()).toMatchObject({ phase: "preparing" });
+      expect(runtimeSwitchSummary(db, { nodeId })).toMatchObject({ id: "sw1", attention: expect.stringMatching(/The seat's pane \(%5\) is the staged successor's, but the switch wasn't committed/) });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+    });
+
+    it("#3103: with several current-window panes, one the successor's, and the all-windows read failing, an expired switch isn't settled", async () => {
+      record("preparing");
+      fakeTmux.listPanes.mockImplementation(async (name: string, allWindows?: boolean) => {
+        if (name !== SEAT) return [];
+        if (allWindows) throw new Error("tmux: server busy");
+        return [{ id: "%9" }, { id: "%5" }] as never;
+      });
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(openSwitch()).toMatchObject({ phase: "preparing" });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+    });
+
+    it("#3103: with the original pane current and the successor in another window, an expired switch isn't settled", async () => {
+      record("preparing");
+      fakeTmux.listPanes.mockImplementation(async (name: string, allWindows?: boolean) =>
+        name === SEAT ? (allWindows ? [{ id: "%0" }, { id: "%5" }] : [{ id: "%0" }]) as never : []);
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(openSwitch()).toMatchObject({ phase: "preparing" });
+      expect(runtimeSwitchSummary(db, { nodeId })).toMatchObject({ id: "sw1", attention: expect.stringMatching(/successor's pane \(%5\) is still in another window/) });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+    });
+
+    it("#3103: with several panes at the seat and none the successor's, an expired switch settles with its occupant unknown", async () => {
+      record("preparing");
+      fakeTmux.listPanes.mockImplementation(async (name: string) => name === SEAT ? [{ id: "%9" }, { id: "%8" }] as never : []);
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      const result = await service().recover(nodeId);
+      expect(result).toMatchObject({ ok: true, outcome: expect.stringMatching(/the seat's current occupant is unknown \(it has several panes\); the staged claude-code successor was already gone/) });
+      expect(result).not.toMatchObject({ outcome: expect.stringMatching(/occupant holds the seat/) });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+      expect(runtimeSwitchSummary(db, { nodeId })).toBeNull();
+    });
+
+    it("#3103: with no successor pane recorded and the seat's pane gone, an expired switch settles with no pane found", async () => {
+      record("preparing");
+      db.exec("UPDATE seat_runtime_switches SET successor_pane = NULL");
+      panes.delete(SEAT);
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      const result = await service().recover(nodeId);
+      expect(result).toMatchObject({ ok: true, outcome: expect.stringMatching(/no pane was found at the seat; the staged claude-code successor was already gone/) });
+      expect(panes.has(SEAT)).toBe(false);
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+      expect(openSwitch()).toMatchObject({ phase: "abandoned", attention: null });
+      expect(runtimeSwitchSummary(db, { nodeId })).toBeNull();
+    });
+
+    it("#3103: with several panes at the seat, one of them the successor's, an expired switch isn't settled", async () => {
+      record("preparing");
+      fakeTmux.listPanes.mockImplementation(async (name: string) => name === SEAT ? [{ id: "%9" }, { id: "%5" }] as never : []);
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: false, code: "runtime_switch_pending" });
+      expect(openSwitch()).toMatchObject({ phase: "preparing" });
+    });
+
+    it("#3103: past its deadline, a seat whose panes can't be read settles, and the outcome doesn't name its occupant", async () => {
+      record("preparing");
+      fakeTmux.listPanes.mockImplementation(async (name: string) => { if (name === SEAT) throw new Error("tmux: server busy"); return []; });
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      const result = await service().recover(nodeId);
+      expect(result).toMatchObject({ ok: true, outcome: expect.stringMatching(/the seat's current occupant is unknown \(its panes couldn't be read\); the staged claude-code successor was already gone/) });
+      expect(result).not.toMatchObject({ outcome: expect.stringMatching(/occupant holds the seat/) });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+      expect(runtimeSwitchSummary(db, { nodeId })).toBeNull();
+    });
+
+    it("#3103: interrupted before its successor's pane was recorded, with the staging session gone, an expired switch settles", async () => {
+      record("preparing");
+      db.exec("UPDATE seat_runtime_switches SET successor_pane = NULL");
+      panes.set(SEAT, "%9");
+      clock = Date.parse("2026-10-24T04:00:00Z");
+      expect(await service().recover(nodeId)).toMatchObject({ ok: true, outcome: expect.stringMatching(/one pane is at the seat, not identified as the codex occupant; the staged claude-code successor was already gone/) });
+      expect(fakeTmux.killSession).not.toHaveBeenCalled();
+      expect(openSwitch()).toMatchObject({ phase: "abandoned", attention: null });
     });
   });
 
@@ -1073,6 +1567,21 @@ describe("live seat runtime switch", () => {
   });
 
   describe("launch_wrapper runtime-switch guard and carry", () => {
+    it("refuses a wrapped Pi-to-Claude switch in dry-run and execution before side effects", async () => {
+      db.prepare("UPDATE nodes SET runtime = 'pi' WHERE id = ?").run(nodeId);
+      rigRepo.setNodeLaunchWrapper(nodeId, ["rtk", "--wrap"]);
+      const svc = service();
+      for (const dryRun of [true, false]) {
+        const result = await svc.setRuntime({ seatRef: SEAT, runtime: "claude-code", reason: "try-claude", dryRun });
+        expect(result).toMatchObject({ ok: false, code: "runtime_switch_failed" });
+        expect((result as { message: string }).message).toMatch(/wrapped Pi seat to Claude Code/i);
+        expect(openSwitch()).toBeUndefined();
+        expect(fakeTmux.createSession).not.toHaveBeenCalled();
+        expect(nodeRow().runtime).toBe("pi");
+        expect(rigRepo.getRig(rigRepo.listRigs()[0]!.id)?.nodes[0]?.launchWrapper).toEqual(["rtk", "--wrap"]);
+      }
+    });
+
     it("accepts switching a wrapped Codex seat to Claude Code in the dry run, and the real switch hands the Claude successor the same wrapper", async () => {
       rigRepo.setNodeLaunchWrapper(nodeId, ["rtk", "--to-claude"]);
       // The dry run reports acceptance, as execution does, and changes nothing.

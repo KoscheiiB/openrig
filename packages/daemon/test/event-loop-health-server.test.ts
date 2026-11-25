@@ -4,6 +4,7 @@ import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { EventLoopMonitor, HEALTHZ_RESPONSIVENESS_BUDGET_MS } from "../src/domain/event-loop-monitor.js";
 import { RouteTimingRecorder } from "../src/domain/route-timing-recorder.js";
+import { TerminalServerReachability } from "../src/domain/terminal-server-reachability.js";
 
 function seedRigWithNodes(db: Database.Database, name: string, nodeCount: number): string {
   const rigId = `rig-${name}`;
@@ -18,12 +19,46 @@ function seedRigWithNodes(db: Database.Database, name: string, nodeCount: number
 }
 
 describe("OPR.0.4.3.21 — /healthz enrichment", () => {
+  it("reports missing-pane background work as unknown without changing daemon health", async () => {
+    const db = createFullTestDb();
+    const backgroundWork = [{ nodeId: "n1", rigId: "rig1", sessionName: "worker@rig", state: "unknown", reason: "pane_pid_gone", observedAt: "2026-11-19T00:00:00.000Z", processes: [{ pid: 42, startedAt: "2026-11-18T00:00:00Z", command: "/usr/bin/node --token=private-token" }] }];
+    const { app } = createTestApp(db, { appDeps: { seatIdentityReconciler: { backgroundWorkUnknown: () => backgroundWork } as never } });
+    const body = await (await app.request("/healthz")).json() as Record<string, unknown>;
+    expect(body.status).toBe("ok");
+    expect(body.backgroundWork).toEqual([{ ...backgroundWork[0], processes: [{ pid: 42, startedAt: "2026-11-18T00:00:00Z", command: "node" }] }]);
+    db.close();
+  });
+
+  it("keeps health readable when background-work diagnostics fail", async () => {
+    const db = createFullTestDb();
+    const { app } = createTestApp(db, { appDeps: { seatIdentityReconciler: {
+      backgroundWorkUnknown: () => { throw new Error("database unavailable"); },
+    } as never } });
+    const body = await (await app.request("/healthz")).json() as Record<string, unknown>;
+    expect(body).toMatchObject({ status: "ok", backgroundWorkUnavailable: true });
+    expect(body).not.toHaveProperty("backgroundWork");
+    db.close();
+  });
+
   it("reports process identity without requiring the event-loop monitor", async () => {
     const db = createFullTestDb();
     const { app } = createTestApp(db);
     const res = await app.request("/healthz");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok", pid: process.pid, euid: process.geteuid?.() });
+    db.close();
+  });
+
+  it("#3315 keeps status ok and adds the terminals it reaches, apart from the daemon being up", async () => {
+    const db = createFullTestDb();
+    const terminalReachability = new TerminalServerReachability();
+    terminalReachability.observe("/tmp/openrig-3315.sock", { reachable: false, cause: "no server running on /tmp/openrig-3315.sock" });
+    const { app } = createTestApp(db, { terminalReachability });
+    const body = await (await app.request("/healthz")).json() as Record<string, unknown>;
+    expect(body.status).toBe("ok");
+    expect(body.terminals).toMatchObject({ state: "degraded",
+      servers: [{ socket: "/tmp/openrig-3315.sock", state: "unreachable", cause: "no server running on /tmp/openrig-3315.sock" }] });
+    terminalReachability.stop();
     db.close();
   });
 

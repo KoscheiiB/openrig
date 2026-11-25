@@ -175,6 +175,7 @@ packagesRoutes.post("/plan", async (c) => {
     conflicts: refined.conflicts.length,
     noOps: refined.noOps.length,
     rejected: policyResult.rejected.length,
+    ...(refined.warnings?.length ? { warnings: refined.warnings } : {}),
   });
 });
 
@@ -273,7 +274,7 @@ packagesRoutes.post("/install", async (c) => {
   }
 
   // Verify
-  const verification = installVerifier.verify(result.installId);
+  const verification = installVerifier.verify(result.installId, { skipped: result.notes?.length ?? 0 });
   if (!verification.passed) {
     eventBus.emit({ type: "package.install_failed", packageName: resolved.manifest.name, code: "verification_failed", message: "Post-apply verification failed" });
     return c.json({
@@ -281,6 +282,7 @@ packagesRoutes.post("/install", async (c) => {
       code: "verification_failed",
       installId: result.installId,
       verification,
+      ...(result.notes?.length ? { notes: result.notes } : {}),
     }, 500);
   }
 
@@ -302,6 +304,8 @@ packagesRoutes.post("/install", async (c) => {
     conflicts: result.conflicts,
     verification,
     ...(policyResult.rejected.length > 0 ? { policyRejected: policyResult.rejected } : {}),
+    ...(result.notes?.length ? { notes: result.notes } : {}),
+    ...(refined.warnings?.length ? { warnings: refined.warnings } : {}),
   }, 201);
 });
 

@@ -11,9 +11,13 @@ import { RigRepository } from "../src/domain/rig-repository.js";
 import { planRuntimeSwitchMaterials, type SwitchRuntime } from "../src/domain/runtime-switch-materials.js";
 import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
 import { seatSkillsPointerStartupFile } from "../src/domain/rigspec-instantiator.js";
+import { runningBuiltinAssetsRoot } from "../src/domain/builtin-startup-files.js";
 import type { ParsedStartupContext } from "../src/domain/seat-lifecycle-service.js";
 import type { Node } from "../src/domain/types.js";
 import type { NodeBinding } from "../src/domain/runtime-adapter.js";
+import { PiRuntimeAdapter } from "../src/adapters/pi-runtime-adapter.js";
+import { piSeatPaths } from "../src/adapters/pi-runner-protocol.js";
+import { piAccountSwitchStateRoot } from "../src/domain/pi-account-state.js";
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
 import { managedBlockText } from "../src/domain/managed-blocks.js";
 import { managedBlockRecords } from "../src/domain/managed-block-records.js";
@@ -111,6 +115,39 @@ describe("a runtime switch plans the successor from the seat's own agent spec", 
     expect(materials.dropped).toContainEqual({ setting: "model (agent spec, profile default, declared for claude-code)", value: "claude-opus-5-5" });
   });
 
+  it.each(["codex", "claude-code"] as const)("prepares %s → Pi in isolated successor storage with target settings", async from => {
+    const node = seat(from, { model: "source-model" });
+    const materials = plan(node, from, "pi");
+    expect(materials.settings.model).toEqual({ value: null, source: "native_default" });
+    expect(materials.settings.effort).toEqual({ value: null, source: "native_default" });
+    expect(materials.firstTurn).toContain("- runtime: pi");
+    expect(materials.files.map(file => file.absolutePath)).not.toContain(seatSkillPaths({ rigId, logicalId: "dev.impl", runtime: from }, home).catalogPath);
+    const explicit = plan(node, from, "pi", { model: "provider/pi-model", effort: "medium" });
+    expect(explicit.settings.model).toEqual({ value: "provider/pi-model", source: "explicit" });
+    expect(explicit.settings.effort).toEqual({ value: "medium", source: "explicit" });
+    const base = nodePath.join(home, "state", "pi");
+    const canonical = "dev-impl@seat-rig";
+    const adapter = new PiRuntimeAdapter({ stateRoot: base, runnerEntryPath: "/unused-runner.js", tmux: {},
+      fsOps: { exists: existsSync, readFile: (p: string) => readFileSync(p, "utf8"), writeFile: writeFileSync,
+        mkdirp: (p: string) => mkdirSync(p, { recursive: true }), listFiles: readdirSync } } as never);
+    await materials.prepare({ nodeId: node.id, cwd: node.cwd, tmuxSession: "openrig-switch-staged", launchGeneration: "next",
+      runtimeSwitchFrom: { runtime: from, session: canonical, pane: "%0", generation: "old" }, ...materials.bindingAdditions() } as NodeBinding, adapter);
+    const target = piSeatPaths(piAccountSwitchStateRoot(base, "next"), canonical);
+    expect(readFileSync(nodePath.join(target.agentDir, "skills", "review", "SKILL.md"), "utf8")).toContain("# Review");
+    expect(existsSync(piSeatPaths(base, canonical).agentDir)).toBe(false);
+    expect(existsSync(nodePath.join(node.cwd!, ".claude"))).toBe(false);
+    expect(materials.notRun).toEqual(["/rename impl"]);
+  });
+
+  it.each(["codex", "claude-code"] as const)("Pi → %s resolves that runtime's spec and materials", to => {
+    const materials = plan(seat("pi", { model: "provider/pi-model" }), "pi", to);
+    expect(materials.settings.model).toEqual({ value: to === "codex" ? "gpt-5.5" : "claude-opus-5-5", source: "agent_spec" });
+    expect(materials.settings.effort.value).toBe(to === "codex" ? "high" : null);
+    expect(materials.firstTurn).toContain(`- runtime: ${to}`);
+    expect(materials.bindingAdditions().seatSkillsRoot).toBe(seatSkillPaths({ rigId, logicalId: "dev.impl", runtime: to }, home).skillsRoot);
+    expect(materials.dropped).toContainEqual({ setting: "model", value: "provider/pi-model" });
+  });
+
   it("an explicit option wins over the spec", () => {
     const materials = plan(seat("codex"), "codex", "claude-code", { model: "claude-sonnet-5", effort: "max" });
     expect(materials.settings.model).toEqual({ value: "claude-sonnet-5", source: "explicit" });
@@ -135,6 +172,25 @@ describe("a runtime switch plans the successor from the seat's own agent spec", 
     expect(materials.firstTurn).toMatch(/The implementer's role/);
     // A switch doesn't run startup slash commands; the preview names them.
     expect(materials.notRun).toEqual(["/rename impl"]);
+  });
+
+  // #261 for a switch: OpenRig's own saved files are read from the running install, as launch and restore read them. A
+  // seat saved by another install (an older version, or one under a home that moved) gets this install's files, and its
+  // saved seat-skills pointer isn't delivered beside the current one.
+  it("saved OpenRig files from another install are read from the running install", () => {
+    const node = seat("codex");
+    const old = "/old/lib/node_modules/@openrig/cli/daemon/assets";
+    const saved = savedContext(node, "codex");
+    saved.resolvedStartupFiles = saved.resolvedStartupFiles.map((file) => file.ownerRoot === seatSkillsPointerStartupFile().ownerRoot
+      ? { ...file, absolutePath: nodePath.join(old, "guidance", "openrig-seat-skills.md"), ownerRoot: old } : file);
+    saved.resolvedStartupFiles.push({ path: "CULTURE-default.md", absolutePath: nodePath.join(old, "guidance", "CULTURE-default.md"), ownerRoot: old,
+      deliveryHint: "send_text", required: true, appliesOn: ["fresh_start", "restore"] });
+    const materials = planRuntimeSwitchMaterials({ db, node, rigName: "seat-rig", canonicalSession: "dev-impl@seat-rig", runtime: "claude-code", explicit: {},
+      saved, openrigHome: home, resolution: { homedir: tmp, skillsRoot: nodePath.join(tmp, "no-catalog") } });
+    const paths = materials.files.map((file) => file.absolutePath);
+    expect(paths.filter((path) => path.startsWith(old))).toEqual([]);
+    expect(paths).toContain(nodePath.join(runningBuiltinAssetsRoot(), "guidance", "CULTURE-default.md"));
+    expect(paths.filter((path) => path === seatSkillsPointerStartupFile().absolutePath)).toHaveLength(1);
   });
 
   it("to Codex, the successor reads the Codex seat's own skill catalog", () => {
@@ -162,6 +218,92 @@ describe("a runtime switch plans the successor from the seat's own agent spec", 
   it("a spec that isn't where the seat's last launch read it is reported before anything stops", () => {
     rmSync(nodePath.join(agentDir, "agent.yaml"));
     expect(() => plan(seat("codex"), "codex", "claude-code")).toThrow(/agent spec \(impl\) wasn't found where its last launch read it/);
+  });
+
+  // A seat's `local:` ref names its spec by the rig root, which isn't recorded. The seat's saved startup context is the
+  // only other witness, and it doesn't carry the owner root of every file — an agent with no startup files leaves none.
+  // These read the `local:` ref itself: absolute remainders directly, relative ones against the rig root a launch found.
+  describe("a `local:` agent_ref whose saved startup context has no owner root", () => {
+    /** The seat's saved context, minus anything that would carry the agent folder from the spec's own files. */
+    const contextless = (node: Node, from: SwitchRuntime): ParsedStartupContext => {
+      const saved = savedContext(node, from);
+      saved.resolvedStartupFiles = [];
+      saved.plan.entries = [];
+      return saved;
+    };
+    const planFrom = (node: Node, from: SwitchRuntime) =>
+      planRuntimeSwitchMaterials({ db, node, rigName: "seat-rig", canonicalSession: "dev-impl@seat-rig", runtime: "claude-code", explicit: {},
+        saved: contextless(node, from), openrigHome: home, resolution: { homedir: tmp, skillsRoot: nodePath.join(tmp, "no-catalog") } });
+
+    it("resolves an absolute remainder without a recorded rig root", () => {
+      const node = seat("codex");
+      node.agentRef = `local:${agentDir}`;
+      expect(planFrom(node, "codex").resolvedSpec?.name).toBe("impl");
+    });
+
+    it("resolves a relative remainder against the rig.yaml a launch read it from", () => {
+      // The rig root is the nearest ancestor carrying a rig.yaml; the seat's cwd sits below it.
+      writeFileSync(nodePath.join(tmp, "rig", "rig.yaml"), "version: \"0.2\"\nname: seat-rig\npods: []\n");
+      const node = seat("codex");
+      node.cwd = nodePath.join(tmp, "rig", "project");
+      mkdirSync(node.cwd, { recursive: true });
+      expect(planFrom(node, "codex").resolvedSpec?.name).toBe("impl");
+    });
+
+    it("refuses a relative remainder that names no spec under the anchor, rather than searching elsewhere", () => {
+      writeFileSync(nodePath.join(tmp, "rig", "rig.yaml"), "version: \"0.2\"\nname: seat-rig\npods: []\n");
+      const node = seat("codex");
+      node.cwd = nodePath.join(tmp, "rig", "project");
+      mkdirSync(node.cwd, { recursive: true });
+      node.agentRef = "local:agents/missing";
+      expect(() => planFrom(node, "codex"))
+        .toThrow(/agent spec \(impl\) wasn't found where its last launch read it/);
+    });
+
+    it("resolves against the root the rig recorded, not a project's own rig.yaml", () => {
+      // The project carries its own rig.yaml with a same-named agents/impl: only the recorded root may decide.
+      const project = nodePath.join(tmp, "project");
+      mkdirSync(nodePath.join(project, "agents", "impl"), { recursive: true });
+      writeFileSync(nodePath.join(project, "rig.yaml"), "version: \"0.2\"\nname: nested\npods: []\n");
+      writeFileSync(nodePath.join(project, "agents", "impl", "agent.yaml"), "name: impl\nversion: \"1.0.0\"\nstartup:\n  files: []\n  actions: []\n");
+      const node = seat("codex");
+      node.cwd = project;
+      const materials = planRuntimeSwitchMaterials({ db, node, rigName: "seat-rig", canonicalSession: "dev-impl@seat-rig",
+        runtime: "claude-code", explicit: {}, saved: contextless(node, "codex"), rigRoot: nodePath.join(tmp, "rig"),
+        openrigHome: home, resolution: { homedir: tmp, skillsRoot: nodePath.join(tmp, "no-catalog") } });
+      // The recorded root's spec wins; the project copy never stands in.
+      expect(materials.resolvedSpec?.name).toBe("impl");
+      expect(nodePath.isAbsolute(nodePath.join(tmp, "rig", "agents", "impl"))).toBe(true);
+    });
+  });
+
+  // A community harness takes no startup files, so `send_text` material must not be queued into its handover. The
+  // identity line still travels (it is what the seat needs); a seat's own role file does not.
+  it("queues no send_text startup material for a community harness target", () => {
+    const node = seat("codex");
+    const saved = savedContext(node, "codex");
+    const materials = planRuntimeSwitchMaterials({ db, node, rigName: "seat-rig", canonicalSession: "dev-impl@seat-rig",
+      runtime: "cursor", explicit: {}, saved, openrigHome: home,
+      resolution: { homedir: tmp, skillsRoot: nodePath.join(tmp, "no-catalog") } });
+    expect(materials.firstTurn).toContain("Identity:");
+    expect(materials.firstTurn).not.toContain("The implementer's role");
+    expect(materials.firstTurn).not.toContain("Read your queue first.");
+  });
+
+  // The saved startup context is what a launch actually read the spec from, so a `local:` ref must not add a second
+  // candidate beside it: two roots that pass the same name check read as ambiguous and refuse a switch that used to work.
+  it("a nested rig.yaml does not add a second candidate to a source the saved context already names", () => {
+    // The seat's cwd carries its own rig.yaml, so the ref would resolve to a copy under project/agents/impl whose spec
+    // name matches. The saved context names the real source; the copy must not be read as a second answer.
+    const project = nodePath.join(tmp, "rig", "project");
+    mkdirSync(project, { recursive: true });
+    writeFileSync(nodePath.join(project, "rig.yaml"), "version: \"0.2\"\nname: nested\npods: []\n");
+    const nested = nodePath.join(project, "agents", "impl");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(nodePath.join(nested, "agent.yaml"), "name: impl\nversion: \"1.0.0\"\nstartup:\n  files: []\n  actions: []\n");
+    const node = seat("codex");
+    node.cwd = project;
+    expect(plan(node, "codex", "claude-code").resolvedSpec?.name).toBe("impl");
   });
 
   // #2456: the switch's preparation writes the successor's guidance through the target adapter, as a start does. A block

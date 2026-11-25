@@ -3,6 +3,7 @@ import path from "node:path";
 import { InstallPlanner } from "../src/domain/install-planner.js";
 import { PackageResolver, type FsOps } from "../src/domain/package-resolver.js";
 import { parseManifest, normalizeManifest } from "../src/domain/package-manifest.js";
+import { isPathInsideRoot } from "../src/domain/cwd-resolution.js";
 
 const BASIC_MANIFEST = `
 schema_version: 1
@@ -742,6 +743,35 @@ describe("InstallPlanner export-name containment", () => {
     }
   });
 
+  it("says when an accepted name lands outside its kind's usual folder, and plans it as before", () => {
+    const flagged: Array<["skill" | "agent", string, "claude-code" | "codex", string, string, string]> = [
+      ["skill", "../../.git/hooks", "claude-code", ".git/hooks/SKILL.md", ".claude/skills", "Skill '../../.git/hooks' installs to .git/hooks/, outside the usual .claude/skills/ folder"],
+      ["skill", "../extra", "codex", ".agents/extra/SKILL.md", ".agents/skills", "Skill '../extra' installs to .agents/extra/, outside the usual .agents/skills/ folder"],
+      ["agent", "../x", "claude-code", ".claude/x.yaml", ".claude/agents", "Agent '../x' installs to .claude/x.yaml, outside the usual .claude/agents/ folder"],
+      ["agent", "../x", "codex", "x.yaml", ".agents", "Agent '../x' installs to x.yaml, outside the usual .agents/ folder"],
+    ];
+    for (const [kind, name, runtime, destination, kindFolder, warning] of flagged) {
+      const { threw, escaped, plan } = planTarget(kind, name, runtime);
+      expect(threw, `${kind} '${name}' (${runtime}) should not be refused`).toBe(false);
+      expect(escaped).toBe(false);
+      expect(plan!.warnings).toEqual([warning]);
+      const entry = plan!.entries.find((e) => e.targetPath.length > 0)!;
+      expect(entry).toMatchObject({ deferred: false, classification: "safe_projection", outsideKindFolder: { destination, kindFolder } });
+      expect(plan!.actionable).toContain(entry);
+    }
+    // Names inside the kind's folder, nested or not, say nothing.
+    const quiet: Array<["skill" | "agent", string, "claude-code" | "codex"]> = [
+      ["skill", "helper", "claude-code"], ["skill", "nested/helper", "claude-code"], ["skill", "nested/helper", "codex"],
+      ["skill", "_helper", "claude-code"], ["skill", ".helper", "codex"], ["agent", "a", "claude-code"], ["agent", "", "codex"],
+    ];
+    for (const [kind, name, runtime] of quiet) {
+      const { threw, plan } = planTarget(kind, name, runtime);
+      expect(threw).toBe(false);
+      expect(plan!.warnings ?? [], `${kind} '${name}' (${runtime})`).toEqual([]);
+      expect(plan!.entries.some((e) => e.outsideKindFolder)).toBe(false);
+    }
+  });
+
   it("accepts names that stay inside the target", () => {
     const cases: Array<["skill" | "agent", string, "claude-code" | "codex"]> = [
       ["skill", "nested/helper", "claude-code"],
@@ -760,3 +790,53 @@ describe("InstallPlanner export-name containment", () => {
   });
 });
 
+
+/** Plans a manifest whose single skill export uses the given source verbatim, and reports the
+ *  path the planner names when the file is missing, so a test can assert where it resolved. */
+function planWithSkillSource(source: string) {
+  const { fsOps, pkgRoot } = realFs();
+  const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "planner-source-"));
+  try {
+    const yaml = `schema_version: 1\nname: p\nversion: 1.0.0\nsummary: s\ncompatibility: { runtimes: [claude-code, codex] }\nexports:\n  skills:\n    - source: ${JSON.stringify(source)}\n      name: x\n`;
+    const resolved = {
+      sourceKind: "local_path" as const,
+      sourceRef: pkgRoot,
+      manifest: normalizeManifest(parseManifest(yaml)),
+      manifestHash: "x",
+      rawManifestYaml: "",
+    };
+    new InstallPlanner(fsOps).plan(resolved, targetRoot, "claude-code");
+    return { threw: false, error: "", pkgRoot };
+  } catch (err) {
+    return { threw: true, error: (err as Error).message, pkgRoot };
+  } finally {
+    fs.rmSync(pkgRoot, { recursive: true, force: true });
+    fs.rmSync(targetRoot, { recursive: true, force: true });
+  }
+}
+
+describe("InstallPlanner export-source resolution", () => {
+  // The planner reads an export from join(packageRoot, source), and join keeps the base: on
+  // macOS, Linux and WSL2 an absolute, drive-prefixed or UNC-shaped source is a plain segment
+  // under the package, so the plan is not refused and the missing-file check names that inside
+  // path. (On a native-Windows host a drive-shaped segment resolves as drive-absolute; that
+  // platform is not supported, so only the joined name is pinned everywhere.)
+  it("keeps an absolute, drive or UNC source under the package and fails as missing there", () => {
+    const shapes = ["/etc", "C:\\Users\\victim\\secrets", "\\\\server\\share\\x"];
+    for (const source of shapes) {
+      const { threw, error, pkgRoot } = planWithSkillSource(source);
+      expect(threw, `${source} should reach the missing-file check`).toBe(true);
+      const expected = path.join(pkgRoot, source, "SKILL.md");
+      expect(error, `${source} names the joined path`).toContain(expected);
+      if (path.sep === "/") {
+        expect(isPathInsideRoot(path.resolve(expected), path.resolve(pkgRoot)), `${source} stays inside the package`).toBe(true);
+      }
+    }
+  });
+
+  it("plans a relative source inside the package directory", () => {
+    const { threw, error } = planWithSkillSource("skills/x");
+    expect(threw, "skills/x should plan").toBe(false);
+    expect(error).toBe("");
+  });
+});

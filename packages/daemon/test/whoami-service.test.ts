@@ -17,7 +17,8 @@ import { externalCliAttachmentSchema } from "../src/db/migrations/019_external_c
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { TranscriptStore } from "../src/domain/transcript-store.js";
-import { WhoamiService } from "../src/domain/whoami-service.js";
+import { WhoamiService, ROSTER_BUILDING_NOTE } from "../src/domain/whoami-service.js";
+import { markRigBuilding, unmarkRigBuilding } from "../src/domain/rigs-being-built.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 
 function setupDb(): Database.Database {
@@ -141,6 +142,25 @@ describe("WhoamiService", () => {
 
     expect(result["roster"]).toBeUndefined();
     expect(result["podRoster"]).toBeUndefined();
+  });
+
+  // #2871: the building state belongs to the rig being built, by id, never to another rig with the same name.
+  it("only the rig being built says so; a running rig with the same name answers as before", () => {
+    const { nodeA } = seedRig();
+    const newRig = rigRepo.createRig("my-rig");
+    const newNode = rigRepo.addNode(newRig.id, "dev.impl", { role: "worker", runtime: "claude-code" });
+    markRigBuilding(db, newRig.id);
+
+    const running = svc.resolve({ nodeId: nodeA.id })!;
+    expect(running).not.toHaveProperty("rosterState");
+    expect(running.peersNote).toBe("peers = this rig's roster excluding self (no edge filter); edges = directional relationships; use `rig ps --nodes` for node inventory including self + live state");
+
+    const building = svc.resolve({ nodeId: newNode.id })!;
+    expect(building.rosterState).toBe("building");
+    expect(building.peersNote.startsWith(ROSTER_BUILDING_NOTE)).toBe(true);
+
+    unmarkRigBuilding(db, newRig.id);
+    expect(svc.resolve({ nodeId: newNode.id })).not.toHaveProperty("rosterState");
   });
 
   it("unknown nodeId returns null", () => {
@@ -301,5 +321,39 @@ describe("WhoamiService", () => {
     // nodeA is claude-code -> runtimeContext is built (not skipped).
     expect(result!.runtimeContext).not.toBeNull();
     expect(result!.runtimeContext?.runtime).toBe("claude-code");
+  });
+
+  // A connected seat is told so: the binding id, its address on the hub and the hub, query hidden; not the peer list.
+  function bind(nodeId: string, id: string, state: "active" | "revoked" | "disconnected", hubUrl = "https://hub.example/mcp?key=secret") {
+    db.prepare(`INSERT INTO network_bindings (id, node_id, local_session, hub_url, hub_seat, state, created_at, updated_at)
+      VALUES (?, ?, 'dev-impl@my-rig', ?, 'alex@team', ?, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`).run(id, nodeId, hubUrl, state);
+  }
+
+  it("names the seat's active network binding in its identity, with the hub's query hidden", () => {
+    const { nodeA, nodeB } = seedRig();
+    bind(nodeA.id, "netb-00000000000000000001", "disconnected");
+    bind(nodeA.id, "netb-00000000000000000002", "active");
+    expect(svc.resolve({ nodeId: nodeA.id })!.identity.networkBinding).toEqual({
+      id: "netb-00000000000000000002", hubSeat: "alex@team", hubUrl: "https://hub.example/mcp (query hidden)" });
+    // A seat with no binding, or only an ended one, has no networkBinding key at all.
+    expect(svc.resolve({ nodeId: nodeB.id })!.identity).not.toHaveProperty("networkBinding");
+    db.prepare("UPDATE network_bindings SET state = 'revoked' WHERE id = 'netb-00000000000000000002'").run();
+    expect(svc.resolve({ nodeId: nodeA.id })!.identity).not.toHaveProperty("networkBinding");
+  });
+
+  it("hides a hub URL's fragment as well as its query, since whoami lands in transcripts", () => {
+    const { nodeA, nodeB } = seedRig();
+    bind(nodeA.id, "netb-00000000000000000003", "active", "https://hub.example/mcp#key=secret");
+    bind(nodeB.id, "netb-00000000000000000004", "active", "https://hub.example/mcp?key=secret#also=secret");
+    expect(svc.resolve({ nodeId: nodeA.id })!.identity.networkBinding!.hubUrl).toBe("https://hub.example/mcp (fragment hidden)");
+    expect(svc.resolve({ nodeId: nodeB.id })!.identity.networkBinding!.hubUrl).toBe("https://hub.example/mcp (query and fragment hidden)");
+    expect(JSON.stringify([svc.resolve({ nodeId: nodeA.id }), svc.resolve({ nodeId: nodeB.id })])).not.toContain("secret");
+  });
+
+  it("reads no binding from a database that predates the network connector", () => {
+    const { nodeA } = seedRig();
+    db.pragma("foreign_keys = OFF");
+    db.exec("DROP TABLE network_bindings");
+    expect(svc.resolve({ nodeId: nodeA.id })!.identity).not.toHaveProperty("networkBinding");
   });
 });

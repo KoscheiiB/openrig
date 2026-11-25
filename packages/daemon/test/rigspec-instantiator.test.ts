@@ -484,6 +484,7 @@ describe("RigInstantiator", () => {
     if (!result.ok) {
       expect(result.code).toBe("instantiate_error");
       expect(result.message).toContain("all node launches failed");
+      for (const id of ["orchestrator", "worker-a", "worker-b"]) expect(result.message).toContain(`${id}: all fail`);
     }
 
     // Rig should be deleted
@@ -606,7 +607,7 @@ describe("RigInstantiator", () => {
     if (!result.ok) {
       expect(result.code).toBe("validation_failed");
       if (result.code === "validation_failed") {
-        expect(result.errors).toContain('nodes.bad-terminal.launch_wrapper: only valid when runtime is "pi", "codex" or "claude-code"');
+        expect(result.errors).toContain('nodes.bad-terminal.launch_wrapper: only valid when runtime is "pi", "codex", "claude-code" or a supported community harness');
       }
     }
     expect(rigRepo.listRigs()).toHaveLength(0);

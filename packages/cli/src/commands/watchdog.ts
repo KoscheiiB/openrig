@@ -85,7 +85,7 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
       "Context transcripts measured 113K–153K tokens/MB. The margin is the protection " +
       "because prompt-bound consumers act only at turn boundaries",
     )
-    .option("--spec <path>", "Path to YAML spec file (optional for context-usage-threshold)")
+    .option("--spec <path>", "YAML spec file (required except for context-usage-threshold)")
     .requiredOption("--policy <policy>", "Policy name (one of: periodic-reminder, artifact-pool-ready, edge-artifact-required, workflow-keepalive, idle-gate-qitem, context-usage-threshold)")
     .requiredOption("--target-session <session>", "Canonical <member>@<rig> target")
     .requiredOption("--interval-seconds <n>", "Evaluation interval (positive integer)")
@@ -93,14 +93,34 @@ export function watchdogCommand(depsOverride?: WatchdogDeps): Command {
     .option("--threshold-bytes <n>", "(context-usage-threshold) transcript byte threshold")
     .option("--threshold-mb <n>", "(context-usage-threshold) transcript threshold in decimal MB")
     .option("--threshold-tokens <n>", "(context-usage-threshold) sampled-context token threshold; triggers from the seat's own usage sample")
-    .option("--threshold-percent <n>", "(context-usage-threshold) percent of the seat's context window; triggers from the seat's own usage sample")
+    .option("--threshold-percent <n>", "(context-usage-threshold) percent of the seat's context window; triggers from the seat's own usage sample; samples without a percentage, including current Pi samples, cannot trigger it (use --threshold-tokens)")
     .option("--watched-file <path>", "(context-usage-threshold) explicit transcript file; recorded context path is the fallback")
     .option("--requires-job <jobId>", "(context-usage-threshold) require this earlier job's receipt for the same occupant")
     .option("--message <text>", "(context-usage-threshold) message delivered when the threshold fires")
     .option("--active-wake-interval-seconds <n>", "(pool-ready-specific) wake-up cadence when actionable artifacts exist")
     .option("--scan-interval-seconds <n>", "(pool-ready-specific) artifact pool scan cadence")
     .option("--json", "JSON output for agents")
-    .addHelpText("after", "\nTranscript density varies by session shape; do not tune a context threshold near the context wall.\n\nThe returned job id can be attached to a deliberate park with: rig queue block <qitemId> --on <blocker> --continuation <what-resumes> --wake-watchdog <jobId>")
+    .addHelpText("after", `
+Recurring reminder for an agent (not a person's one-shot queue watch):
+  Save periodic-reminder.yaml:
+    policy: periodic-reminder
+    target:
+      session: worker@my-team
+    message: "Finish the current action, then check the pending work."
+
+  rig watchdog register --spec periodic-reminder.yaml --policy periodic-reminder \\
+    --target-session worker@my-team --interval-seconds 600 \\
+    --registered-by coordinator@my-team
+
+All five flags above are required for periodic-reminder. At registration,
+--policy selects the policy; a YAML policy field is not the selector.
+YAML target.session takes precedence over --target-session; keep them aligned.
+Put the reminder message in YAML. --message is only a context-usage-threshold shortcut.
+For a person's one-shot watch, use rig queue block --wake-after instead.
+
+Transcript density varies by session shape; do not tune a context threshold near the context wall.
+
+The returned job id can be attached to a deliberate park with: rig queue block <qitemId> --on <blocker> --continuation <what-resumes> --wake-watchdog <jobId>`)
     .action(async (opts: {
       spec?: string;
       policy: string;
@@ -297,7 +317,7 @@ The pre-0.5.8 complete array remains available with: rig watchdog list --all --f
 
   cmd
     .command("status <jobId>")
-    .description("Show one watchdog job + recent evaluation history")
+    .description("Show one watchdog job + recent evaluation history + its quiet count since the daemon started")
     .option("--json", "JSON output for agents")
     .action(async (jobId: string, opts: { json?: boolean }) => {
       const deps = getDeps();

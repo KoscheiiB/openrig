@@ -60,6 +60,24 @@ describe("delivery pause and durable custody", () => {
     await expect(guard.input("a", async () => { writes.push("bad"); })).rejects.toMatchObject({ code: "typing_guard_enabled" });
     db.close();
   });
+  it("one sorted pass leases writing seats and only records custody seats: a paused custody seat isn't refused", async () => {
+    const { db, guard } = fixture();
+    await guard.set("b", true, "actor", "person typing");
+    // Leasing the paused seat for writing is still refused, as before.
+    await expect(guard.lifecycle(["a", "b"], async () => {})).rejects.toMatchObject({ code: "typing_guard_enabled" });
+    let ran = false;
+    await guard.lifecycle(["a"], async () => {
+      expect(guard.ownsLifecycle("a")).toBe(true);
+      expect(guard.ownsCustody("b")).toBe(true);
+      expect(guard.ownsLifecycle("b")).toBe(false);
+      ran = true;
+    }, ["b"]);
+    expect(ran).toBe(true);
+    expect(guard.preference("b")).toMatchObject({ desired: true, effective: true });
+    // A paused writing seat still refuses, whatever is recorded beside it.
+    await expect(guard.lifecycle(["b"], async () => {}, ["a"])).rejects.toMatchObject({ code: "typing_guard_enabled" });
+    db.close();
+  });
   it("service-level strict pause permits only explicit human input and sibling", async () => {
     const { db, guard } = fixture(); await guard.set("a", true, "actor", "draft"); const writes: string[] = [];
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -153,7 +171,7 @@ describe("real adapter/transport guard boundaries with no external effects", () 
     expect(f.commands).toEqual([]);expect(f.files).toEqual([]);expect(f.tmux.listPanes).not.toHaveBeenCalled();
     expect(f.outbox.heldForNode("a").total).toBe(4);f.db.close();
   });
-  it("an explicit override under hold reads the composer and stops on unreadable input without typing or retaining", async () => {
+  it("an explicit override under hold reads the composer and delivers on unreadable input, saying it couldn't read it", async () => {
     // This send reaches session metadata; use the existing migrated fixture, not the hold-only schema.
     const f = queueFixture(); await f.guard.set("a", true, "person", "draft");
     f.db.prepare("UPDATE nodes SET runtime = 'terminal' WHERE id = 'a'").run();
@@ -162,11 +180,13 @@ describe("real adapter/transport guard boundaries with no external effects", () 
       sleep: async () => {}, captureObserver: observer });
     const capture = vi.spyOn(f.tmux, "captureComposerSnapshot").mockResolvedValue(null);
     const result = await transport.send("worker@test", "message", { dangerouslyInteract: true, reason: "explicit" });
-    expect(result).toMatchObject({ ok: false, reason: "override_input_unknown", sent: false,
-      existingInput: { classification: "unreadable", reason: expect.any(String) } });
+    // Unknown is reported as unknown, never as empty, and it doesn't stop the explicit override.
+    expect(result).toMatchObject({ ok: true,
+      existingInput: { classification: "unreadable", fullContentsVisible: false, reason: expect.any(String) } });
+    expect(result.warning).toContain("Input could not be read and was not cleared; this send may join or submit existing text.");
     expect(capture).toHaveBeenCalledTimes(1);
-    // Preparing the inert buffer precedes inspection; no pane input occurs.
-    expect(f.writes.some(command => /paste-buffer|send-keys/.test(command))).toBe(false);
+    expect(f.writes.some(command => /paste-buffer/.test(command))).toBe(true);
+    // The override is not retained behind the hold, and the capture observer stays off for overrides.
     expect(f.outbox.heldForNode("a").total).toBe(0);
     expect(f.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 0 });
     expect(observer.record).not.toHaveBeenCalled(); f.db.close();
@@ -470,27 +490,27 @@ it("automatic reminder records retained custody and no delivered fire or input",
  });
  it("guarded session termination binds the immutable session ID, never recycled name",async()=>{
   const {db,guard}=fixture();const commands:string[]=[];
-  const tmux=new TmuxAdapter(async command=>{commands.push(command);return command.includes("display-message")?"$123\n":"";});tmux.deliveryGuard=guard;
+  const tmux=new TmuxAdapter(async command=>{commands.push(command);return command.startsWith("tmux show-environment")?"OPENRIG_NODE_ID=a\n":command.startsWith("tmux display-message")?"$123|4242|1700000000\n":"";});tmux.deliveryGuard=guard;
   vi.spyOn(tmux,"listPanes").mockResolvedValue([{id:"%1"} as never]);
   expect(await guard.lifecycle(["a"],()=>tmux.killSession("a"))).toEqual({ok:true});
-  expect(commands.at(-1)).toBe("tmux kill-session -t '$123'");db.close();
+  expect(commands.at(-1)).toMatch(/^tmux if-shell -F -t '\$123' '#\{&&:#\{==:#\{session_id\},\$123\},#\{&&:#\{==:#\{pid\},4242\},#\{==:#\{start_time\},1700000000\}\}\}' 'kill-session -t .*\$123.*' 'display-message -p openrig-stop-target-changed'$/);db.close();
  });
 
  it("failed first binding compensates only its proven fresh session under the same lifecycle lease",async()=>{
   const f=queueFixture();f.db.exec("INSERT INTO nodes(id,rig_id,logical_id) VALUES ('c','rig','fresh');");
-  const commands:string[]=[];const tmux=new TmuxAdapter(async command=>{commands.push(command);return command.includes("display-message")?"$44\n":"";});tmux.deliveryGuard=f.guard;
+  const commands:string[]=[];const tmux=new TmuxAdapter(async command=>{commands.push(command);return command.startsWith("tmux show-environment")?"OPENRIG_NODE_ID=c\n":command.startsWith("tmux display-message")?"$44|4242|1700000000\n":"";});tmux.deliveryGuard=f.guard;
   vi.spyOn(tmux,"listPanes").mockResolvedValue([{id:"%3"} as never]);
   vi.spyOn(f.bus,"persistWithinTransaction").mockImplementation(()=>{throw Error("injected DB failure");});
   const launcher=new NodeLauncher({db:f.db,rigRepo:f.rigRepo,sessionRegistry:f.sessionRegistry,eventBus:f.bus,tmuxAdapter:tmux});
   expect(await launcher.launchNode("rig","fresh")).toMatchObject({ok:false,code:"db_error"});
-  expect(commands.at(-1)).toBe("tmux kill-session -t '$44'");expect(f.guard.target("c").pane).toBeNull();f.db.close();
+  expect(commands.at(-1)).toMatch(/^tmux if-shell -F -t '\$44' .*#\{==:#\{pid\},4242\}.*kill-session -t .*\$44/);expect(f.guard.target("c").pane).toBeNull();f.db.close();
  });
  it("private probe termination uses only its positively allocated session identity",async()=>{
   const {db,guard}=fixture();const commands:string[]=[];
-  const tmux=new TmuxAdapter(async command=>{commands.push(command);return command.includes("display-message")?"$55\n":"";});tmux.deliveryGuard=guard;
+  const tmux=new TmuxAdapter(async command=>{commands.push(command);return command.startsWith("tmux show-environment")?"OPENRIG_NODE_ID=none\n":command.startsWith("tmux display-message")?"$55|4242|1700000000\n":"";});tmux.deliveryGuard=guard;
   vi.spyOn(tmux,"listPanes").mockResolvedValue([{id:"%55"} as never]);
   expect(await tmux.createProbeSession("probe")).toEqual({ok:true});expect(await tmux.killSession("probe")).toEqual({ok:true});
-  expect(commands.at(-1)).toBe("tmux kill-session -t '$55'");const count=commands.length;
+  expect(commands.at(-1)).toMatch(/^tmux if-shell -F -t '\$55' .*#\{==:#\{pid\},4242\}.*kill-session -t .*\$55/);const count=commands.length;
   expect(await tmux.sendKeys("probe",["Enter"])).toMatchObject({ok:false});expect(commands).toHaveLength(count);db.close();
  });
 

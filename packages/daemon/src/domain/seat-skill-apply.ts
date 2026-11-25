@@ -79,12 +79,16 @@ export function bootstrapLineChoice(settings: Pick<SettingsStore, "resolveOne">)
 }
 
 /** The seat a session name names (its latest session), or why not. */
-export function resolveSeat(db: Db, sessionName: string): { ok: true; seat: SeatRef } | { ok: false; error: string } {
+/** A known seat on a runtime without seat skills carries `unsupportedRuntime`: a read reports it, a write refuses it. */
+export function resolveSeat(db: Db, sessionName: string): { ok: true; seat: SeatRef } | { ok: false; error: string; unsupportedRuntime?: string } {
   const row = db.prepare(`SELECT n.id AS nodeId, n.rig_id AS rigId, n.logical_id AS logicalId, n.runtime AS runtime, n.cwd AS cwd
     FROM sessions s JOIN nodes n ON n.id = s.node_id WHERE s.session_name = ? ORDER BY s.id DESC LIMIT 1`).get(sessionName) as
     { nodeId: string; rigId: string; logicalId: string; runtime: string | null; cwd: string | null } | undefined;
   if (!row) return { ok: false, error: `no OpenRig seat has the session ${sessionName}` };
-  if (row.runtime !== "claude-code" && row.runtime !== "codex") return { ok: false, error: `${sessionName} is a ${row.runtime ?? "unknown"} seat; seat skills are kept for Claude Code and Codex seats` };
+  if (row.runtime !== "claude-code" && row.runtime !== "codex") {
+    const runtime = row.runtime ?? "unknown";
+    return { ok: false, error: `${sessionName} is a ${runtime} seat; seat skills are kept for Claude Code and Codex seats`, unsupportedRuntime: runtime };
+  }
   return { ok: true, seat: { nodeId: row.nodeId, rigId: row.rigId, logicalId: row.logicalId, runtime: row.runtime, sessionName, cwd: row.cwd ?? "." } };
 }
 
@@ -170,7 +174,7 @@ export interface SeatSkillApplyResult {
 }
 
 export interface SeatSkillSender {
-  send(sessionName: string, text: string, opts: { deliveryId: string; verify: boolean; waitForIdleMs?: number }): Promise<{ ok: boolean; outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained" | "unknown"; error?: string; reason?: string }>;
+  send(sessionName: string, text: string, opts: { deliveryId: string; verify: boolean; waitForIdleMs?: number }): Promise<{ ok: boolean; outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained" | "bridged" | "unknown"; error?: string; reason?: string }>;
 }
 
 /**
@@ -244,8 +248,9 @@ export async function applySeatSkills(input: {
   }
   const transportOutcome = sent.outcome ?? (sent.ok ? "unknown" : "failed");
   // Only a confirmed delivery or a definite failure is final as such; rendering without confirmation, or not knowing,
-  // is indeterminate. A guard's retention has already moved the row to retained, which this leaves as it is.
-  const finalized = outbox.finalizeDelivery(deliveryId, transportOutcome === "delivered" ? "delivered"
+  // is indeterminate. A guard's retention has already moved the row to retained, which this leaves as it is. A send
+  // queued for the seat's hook bridge is the bridge's row to settle (#3270), so it's read, not finalized.
+  const finalized = transportOutcome === "bridged" ? outbox.getById(deliveryId)! : outbox.finalizeDelivery(deliveryId, transportOutcome === "delivered" ? "delivered"
     : transportOutcome === "failed" ? "failed" : transportOutcome === "retained" ? "retained" : "indeterminate");
   return result({ state: "sent", record: recordOf(finalized, occupant), transportOutcome, ...(sent.error || sent.reason ? { detail: sent.error ?? sent.reason } : {}) });
 }

@@ -101,7 +101,7 @@ A seat stays `Stable` even if multiple candidate-occupants were produced and dis
 
 ## Failure modes (5)
 
-1. **Candidate creation failed** — `rebuild` couldn't synthesize from artifacts; `fork` couldn't resolve `session_source`; `fresh` couldn't launch. **Action**: bind operation does not begin; seat unchanged; provenance records the failed candidate-creation step.
+1. **Candidate creation failed** — `rebuild` couldn't synthesize from artifacts; `fork` couldn't resolve `session_source`; `fresh` couldn't launch. **Action**: bind operation does not begin; seat unchanged; provenance records the failed candidate-creation step. **If the failure came after the in-place respawn, with the successor launched** (its readiness closed, its context packet didn't land, or finalization refused), the previous occupant is already ended and the successor may be running in the pane, not adopted: another handover ends it. When the failure recorded the attempt, its guidance names `rig seat handover <seat> --recover --reason <why>`, which proves the pane's one Claude is that launch and adopts it, keeping its conversation and typing nothing into it (`successor_identity_unproven` changes nothing; `handover_attempt_superseded` means another launch or handover took the seat since; Claude Code only).
 2. **Old occupant cannot be detached cleanly** — runtime hung, tmux locked, etc. **Action**: bind halts mid-flight; seat enters `Binding` state with explicit "halted" sub-status; operator alerted. **Do NOT auto-rollback by reattaching old-occupant if detach didn't complete cleanly.**
 3. **Bind succeeded but the lineage record didn't write** — disk/db error; the receipt says `provenanceRecordWritten: false`. **Action**: the binding is committed and the successor is the occupant; only its lineage record is missing. Report it as bound with the record missing, check the daemon log (it names the first such failure since the daemon started), and don't run the handover again.
 4. **Old occupant disposition unfulfillable** — operator requested `advise` (keep alive as advisor) but runtime can't keep old alive. **Action**: degrade to `retire` with explicit notification, OR fail if operator passed strict-disposition flag.
@@ -139,22 +139,26 @@ A `rebuild` primes the successor from the seat's durable artifacts, highest trus
 first:
 1. the authored `RECAP.md`;
 2. `LEARNED.md`;
-3. the latest restore packet, when one is marked;
-4. the superseded recaps.
+3. the latest restore packet, when one is marked.
+
+The superseded recaps follow, newest first, as optional history: the successor reads
+them only when it needs the seat's history.
 
 A missing `RECAP.md` is recorded as a gap. The successor is directed to the remaining
 available artifacts in that order. So before a handover, a compaction or a long pause,
 the sitting occupant writes its recap alongside `LEARNED.md`:
 
 ```sh
-rig context recap-write --rig <rig> --seat <seat> --file <draft.md>
+rig context recap-write --file <draft.md>
 ```
 
-- `<seat>` is the seat's folder under `rigs/<rig>/seats/`, the part of its session
-  name before `@`.
+- Without `--rig` and `--seat` it writes the calling seat's recap (from `OPENRIG_SESSION_NAME`).
+  For another seat, `--seat` is its folder under `rigs/<rig>/seats/`, the part of its session
+  name before `@`. A seat's recorded logical id or member id maps to its folder when the daemon
+  can check it against the rig's seats.
 - The command reads `topology.root` and doesn't need the daemon.
 - Each write moves the previous recap into the seat's `recap-superseded/` chain,
-  which later rebuilds also read. Write through this command, not a file tool, so
+  which later rebuilds list as history. Write through this command, not a file tool, so
   the chain is kept.
 
 **The store refuses the write, and writes nothing,** when a section can't be

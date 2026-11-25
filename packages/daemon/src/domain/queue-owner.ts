@@ -20,13 +20,22 @@ export function resolveOperatorSeat(): string | null {
  *  approvals use. Null when unset, unreadable, or not an agent's canonical session (a person's address or
  *  human seat ref never counts). */
 export function resolveRecoveryAgentSeat(): string | null {
+  return readReceivingAgentSetting().session;
+}
+
+/** `agents.operator_session` as the receiving agent reads it: the agent's session, or null with why when it can't be used
+ *  (`problem`: unreadable, or not an agent's canonical session). Unset is null with no problem. */
+export function readReceivingAgentSetting(): { session: string | null; problem?: string } {
+  let session: string;
   try {
     const v = new SettingsStore().resolveOne("agents.operator_session" as never).value;
-    const session = typeof v === "string" ? v.trim() : "";
-    return session && parseSessionName(session).kind === "canonical" && !isHumanSeatSessionRef(session) ? session : null;
-  } catch {
-    return null;
+    session = typeof v === "string" ? v.trim() : "";
+  } catch (error) {
+    return { session: null, problem: `agents.operator_session couldn't be read (${(error as Error).message})` };
   }
+  if (!session) return { session: null };
+  return parseSessionName(session).kind === "canonical" && !isHumanSeatSessionRef(session) ? { session }
+    : { session: null, problem: `agents.operator_session is "${session}", which isn't an agent's session, so it's ignored` };
 }
 
 /** The durable session→node binding (the session-registry precedent: latest sessions row
@@ -46,7 +55,12 @@ export function resolveSessionNodeId(db: Database.Database, session: string): st
  *  (there is no orchestrator session to wake — never synthesize one). */
 export function defaultResolveOrchestrator(db: Database.Database, session: string): string | null {
   const nodeId = resolveSessionNodeId(db, session);
-  if (!nodeId) return null;
+  return nodeId ? orchestratorOfNode(db, nodeId) : null;
+}
+
+/** defaultResolveOrchestrator for a known node: the source of its delegates_to edge, at that parent's CURRENT canonical
+ *  session binding, or null. */
+export function orchestratorOfNode(db: Database.Database, nodeId: string): string | null {
   const row = db
     .prepare(
       `SELECT s.session_name AS parentSession FROM edges e
@@ -73,6 +87,16 @@ export function resolveRigRepresentative(db: Database.Database, rigName: string)
 
 /** The same delegation-root rule for a rig already known by id, so another rig with the same name doesn't matter. */
 export function resolveRigRepresentativeById(db: Database.Database, rigId: string): string | null {
+  const nodeId = resolveRigRepresentativeNodeId(db, rigId);
+  if (!nodeId) return null;
+  const row = db
+    .prepare("SELECT session_name FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
+    .get(nodeId) as { session_name: string } | undefined;
+  return row?.session_name ?? null;
+}
+
+/** The declared representative's stable node identity, independent of its session spelling. */
+export function resolveRigRepresentativeNodeId(db: Database.Database, rigId: string): string | null {
   const roots = db
     .prepare(
       `SELECT n.id AS nodeId FROM nodes n
@@ -81,9 +105,5 @@ export function resolveRigRepresentativeById(db: Database.Database, rigId: strin
           AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = n.id AND e.kind = 'delegates_to')`,
     )
     .all(rigId) as Array<{ nodeId: string }>;
-  if (roots.length !== 1) return null;
-  const row = db
-    .prepare("SELECT session_name FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1")
-    .get(roots[0]!.nodeId) as { session_name: string } | undefined;
-  return row?.session_name ?? null;
+  return roots.length === 1 ? roots[0]!.nodeId : null;
 }

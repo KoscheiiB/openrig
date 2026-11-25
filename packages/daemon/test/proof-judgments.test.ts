@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import YAML from "yaml";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { createHash } from "node:crypto";
 import { evidenceAt } from "../src/domain/proof/judgments.js";
 import { watchProofSources } from "../src/domain/proof/source-watch.js";
 import type { EventBus } from "../src/domain/event-bus.js";
@@ -80,6 +81,18 @@ describe("attributed proof judgments and derived readiness", () => {
     expect(readSliceReadiness(f.beta).revision).toBe(b.readiness.revision);
     expect(files.map(p => fs.readFileSync(p, "utf8"))).toEqual(before);
     expect(fs.readFileSync(join(f.alpha, "proof/judgments/00000001.md"), "utf8")).toContain(a.judgment.id);
+  });
+  it("retains judgment identity and correction history after CRLF conversion", () => {
+    const f = fixture(), accepted = f.judge();
+    const receipt = join(f.alpha, "proof/judgments/00000001.md");
+    f.write(receipt, fs.readFileSync(receipt, "utf8").replace(/\n/g, "\r\n"));
+    const current = readSliceReadiness(f.alpha);
+    expect(current).toEqual(accepted.readiness);
+    const correction = f.judge(f.input(undefined, "reject"));
+    expect(correction.judgment.previous).toBe(accepted.judgment.id);
+    expect(correction.readiness.items[0]!.state).toBe("rejected");
+    f.write(receipt, fs.readFileSync(receipt, "utf8").replace("verdict: accept", "verdict: reject"));
+    expect(readSliceReadiness(f.alpha).issues.join()).toContain("changed judgment");
   });
   it("rejects unauthorized actors, wrong revisions and missing evidence without a receipt", () => {
     const f = fixture();
@@ -253,7 +266,7 @@ describe("retained authority negative controls", () => {
     const sliceRevision = readSliceReadiness(f.alpha).revision;
     const events: Array<{ type: string; revision: string }> = [];
     let invalidated = 0;
-    const watch = watchProofSources(f.missions, () => { invalidated++; }, {
+    const watch = await watchProofSources(f.missions, () => { invalidated++; }, {
       emit: (event: { type: string; revision: string }) => events.push(event),
     } as unknown as EventBus);
     try {
@@ -284,8 +297,11 @@ describe("retained authority negative controls", () => {
   it("pushes changed source truth, keeps sibling basis, and ignores unchanged source bytes", async () => {
     const f = fixture(); f.judge(); const sibling = readSliceReadiness(f.beta).revision;
     const events: Array<{ type: string; revision: string }> = []; let invalidated = 0;
-    const watch = watchProofSources(f.missions, () => { invalidated++; }, { emit: (e: { type: string; revision: string }) => events.push(e) } as unknown as EventBus);
+    const watch = await watchProofSources(f.missions, () => { invalidated++; }, { emit: (e: { type: string; revision: string }) => events.push(e) } as unknown as EventBus);
     try {
+      // Creation events may interrupt asynchronous setup; count changes only after the initial basis settles.
+      await expect.poll(() => watch.observation().state, { timeout: 5000 }).toBe("watching");
+      events.length = 0; invalidated = 0;
       const file = join(f.alpha, "proof/evidence.md"); fs.writeFileSync(file, fs.readFileSync(file));
       await new Promise(r => setTimeout(r, 100)); expect(events).toEqual([]);
       fs.writeFileSync(file, "Measured outcome changed.\n");
@@ -438,7 +454,7 @@ it("notifies scope followers on a node-header change even when proof readiness i
   const f = fixture(), file = join(f.alpha, "SPEC.md");
   const original = fs.readFileSync(file, "utf8"), before = readMissionReadiness(f.mission).revision;
   let scopeChanges = 0;
-  const watch = watchProofSources(f.missions, () => {}, { emit: () => {} } as unknown as EventBus, () => { scopeChanges++; });
+  const watch = await watchProofSources(f.missions, () => {}, { emit: () => {} } as unknown as EventBus, () => { scopeChanges++; });
   try {
     const updated = original.replace("id: 01-alpha", "id: renamed-alias");
     fs.writeFileSync(file, updated);
@@ -450,4 +466,45 @@ it("notifies scope followers on a node-header change even when proof readiness i
     expect(scopeChanges).toBeGreaterThan(0);
     expect(readMissionReadiness(f.mission).revision).toBe(before);
   } finally { watch.close(); }
+});
+
+describe("an empty active set reads apart from active work that isn't ready (#3614)", () => {
+  const revisionOf = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const editMission = (f: ReturnType<typeof fixture>, change: (doc: any) => void) => {
+    const file = join(f.mission, "mission.yaml"), doc = YAML.parse(fs.readFileSync(file, "utf8"));
+    change(doc); f.write(file, doc);
+  };
+
+  it("counts a mission's active slices, and a composition with none reads not-ready with 0", () => {
+    const f = fixture();
+    expect(readMissionReadiness(f.mission)).toMatchObject({ state: "not-ready", activeSlices: 2, issues: [] });
+    editMission(f, doc => { for (const member of doc.composition.slices) member.active = false; });
+    const none = readMissionReadiness(f.mission);
+    expect(none).toMatchObject({ state: "not-ready", activeSlices: 0, slices: [], issues: [], historicalStatus: "active" });
+    expect(none.revision).toBe(revisionOf([none.slices, none.issues, none.historicalStatus]));
+  });
+
+  it("keeps a legacy mission and an unreadable composition apart from no active work", () => {
+    const f = fixture();
+    fs.rmSync(join(f.mission, "mission.yaml"));
+    expect(readMissionReadiness(f.mission)).toMatchObject({ state: "legacy", activeSlices: 0 });
+    f.write(join(f.mission, "mission.yaml"), { kind: "mission", metadata: { status: "active" }, composition: { slices: "not a list" } });
+    const unreadable = readMissionReadiness(f.mission);
+    expect(unreadable.state).toBe("unknown");
+    expect(unreadable.issues.join(" ")).toContain("composition.slices must be a list");
+  });
+
+  it("counts a project's active missions, and a project with none reads not-ready with 0, its revision hashed as before", () => {
+    const f = fixture();
+    const live = readProjectReadiness(f.missions);
+    expect(live).toMatchObject({ state: "not-ready", activeMissions: 1 });
+    const { activeSlices, ...hashedAsBefore } = live.missions[0]!;
+    expect(activeSlices).toBe(2);
+    expect(live.revision).toBe(revisionOf([hashedAsBefore]));
+    editMission(f, doc => { doc.metadata.status = "complete"; });
+    const finished = readProjectReadiness(f.missions);
+    expect(finished).toMatchObject({ state: "not-ready", activeMissions: 0 });
+    expect(finished.missions[0]).toMatchObject({ name: "trial", historicalStatus: "complete", activeSlices: 2 });
+    expect(finished.revision).toBe(revisionOf([]));
+  });
 });

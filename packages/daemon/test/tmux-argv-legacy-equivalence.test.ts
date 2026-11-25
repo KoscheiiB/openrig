@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { TmuxAdapter, type TmuxFileOps } from "../src/adapters/tmux.js";
 import type { SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
+import { TMUX_SERVER_SESSION_BUS } from "../src/tmux-server-start.js";
 
 // The daemon runs every `run(argv, legacy)` call as argv on POSIX. A legacy string that a shell would split
 // differently from its argv means the shell path and the argv path hand tmux different arguments. A real
@@ -47,16 +48,20 @@ function respond(cmd: string, failing: string[], composer = false): string {
     case "list-sessions": return `${SESSION}\nalpha\n`;
     case "list-panes": return "%1|0|/w|80|24|1\n";
     case "display-message":
-      return cmd.includes("session_id") ? "$7\n" : cmd.includes("pane_pid") ? "4242\n" : "1\n";
-    case "show-environment": return "OPENRIG_NODE_ID=n1\nCLAUDECODE=1\nHERDR_PANE_ID=p1\n";
+      return cmd.includes("#{pid}") ? "$7|4242|1700000000\n" : cmd.includes("session_id") ? "$7\n" : cmd.includes("pane_pid") ? "4242\n" : "1\n";
+    // tmux prints just the variable asked for, or every one when none is named.
+    case "show-environment": return cmd.endsWith(" OPENRIG_NODE_ID") ? "OPENRIG_NODE_ID=n1\n" : "OPENRIG_NODE_ID=n1\nCLAUDECODE=1\nHERDR_PANE_ID=p1\n";
     case "new-session": case "source-file": case "start-server": return "%1\n";
     default: return "";
   }
 }
 
 /** A shell-path adapter whose every run() call records its caller line, its argv and the string exec received. */
-function recordingAdapter(calls: RunCall[], opts: { failing?: string[]; guard?: boolean; composer?: boolean } = {}): TmuxAdapter {
+function recordingAdapter(calls: RunCall[], opts: { failing?: string[]; guard?: boolean; composer?: boolean; nodeId?: string;
+  freshServer?: boolean } = {}): TmuxAdapter {
   const execs: string[] = [];
+  // #3253: no server until `tmux -D` starts one, whose global environment holds the unusable bus address it was given.
+  let serverUp = !opts.freshServer;
   const fileOps: TmuxFileOps = {
     writeFile: async () => {},
     unlink: async () => {},
@@ -65,12 +70,17 @@ function recordingAdapter(calls: RunCall[], opts: { failing?: string[]; guard?: 
   };
   const adapter = new TmuxAdapter(async (cmd) => {
     execs.push(cmd);
+    if (!serverUp) {
+      if (/ -D /.test(cmd)) { serverUp = true; return ""; }
+      throw new Error(`Command failed: ${cmd}\nno server running on /tmp/tmux-1000/default`);
+    }
+    if (opts.freshServer && cmd === "tmux show-environment -g") return `DBUS_SESSION_BUS_ADDRESS=${TMUX_SERVER_SESSION_BUS}\nHOME=/h\n`;
     return respond(cmd, opts.failing ?? [], opts.composer);
   }, fileOps);
   if (opts.guard) {
     adapter.deliveryGuard = {
-      maybeTarget: () => TARGET,
-      target: () => TARGET,
+      maybeTarget: () => ({ ...TARGET, nodeId: opts.nodeId ?? TARGET.nodeId }),
+      target: () => ({ ...TARGET, nodeId: opts.nodeId ?? TARGET.nodeId }),
       ownsLifecycle: () => false,
       checkInput: () => {},
       input: (_name: string, fn: () => Promise<unknown>) => fn(),
@@ -101,10 +111,22 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   const calls: RunCall[] = [];
   const a = recordingAdapter(calls);
   await a.startServer();
+  // #3253: a start that made the server gives its panes the daemon's session bus back (Linux only).
+  const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  const saved = { bus: process.env.DBUS_SESSION_BUS_ADDRESS, manager: process.env.MANAGERPID };
+  Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+  process.env.DBUS_SESSION_BUS_ADDRESS = "unix:path=/run/user/1 0/it's bus";
+  delete process.env.MANAGERPID;  // the start in the daemon's cgroup, whatever host runs the test
+  try { await recordingAdapter(calls, { freshServer: true }).startServer(); } finally {
+    Object.defineProperty(process, "platform", platform);
+    if (saved.bus === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS; else process.env.DBUS_SESSION_BUS_ADDRESS = saved.bus;
+    if (saved.manager === undefined) delete process.env.MANAGERPID; else process.env.MANAGERPID = saved.manager;
+  }
   await a.listSessions();
   await a.listWindows(SESSION);
   await a.listPanes(SESSION);
   await a.listPanes("=seat:1");
+  await a.serverStartTime(SESSION);
   await a.probeSession(SESSION);
   await a.hasSession(SESSION);
   await a.createSession(SESSION, "/w x", { PATH: "/a b:$HOME", Q: "it's" });
@@ -156,13 +178,16 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.readAllPaneProcesses();
   await a.readPaneLastActivity(SESSION);
   await a.listClients();
+  await a.listSessionClientTerminals(SESSION);
+  await a.lastClientActivity(SESSION);  // #3076: the client activity read right before an automatic paste
   await a.switchClient("/dev/ttys001", SESSION);
   // A runtime switch's exchange: two session-id reads, then the guarded if-shell swap (nested quoting); and its env writes.
   await a.swapRuntimeSwitchPanes({ nodeId: "n1", stagingSession: "staging'q a", canonicalSession: SESSION, canonicalPane: "%1", stagedPane: "%1" });
   await a.setRuntimeSwitchEnvironment(SESSION, "claude-code", "gen 'q 1");
-  // A failed paste deletes the loaded buffer; the guarded kill reads the session id first.
+  // A failed paste deletes the loaded buffer. The guarded kill reads the session id and server, then the seat's marker
+  // (the session's OPENRIG_NODE_ID, n1 here), and runs each effect held to that id and server.
   await recordingAdapter(calls, { failing: ["paste-buffer"] }).sendText(SESSION, "hello");
-  await recordingAdapter(calls, { guard: true }).killSession(SESSION);
+  await recordingAdapter(calls, { guard: true, nodeId: "n1" }).killSession(SESSION);
   await recordingAdapter(calls, { composer: true }).captureComposerSnapshot("%1");
   const scoped = recordingAdapter(calls);
   scoped.launchEnvironment = () => ({ inheritTmuxEnvironment: false, env: { PATH: "/a b:$HOME", PRIVATE_SYNTHETIC: "it's a\nvalue" } });

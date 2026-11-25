@@ -7,6 +7,7 @@ import { createApp } from "../src/server.js";
 import { createRestoreCheckService } from "../src/routes/restore-check.js";
 import * as eligibility from "../src/domain/rehydrate-eligibility.js";
 import * as preconditions from "../src/domain/restore-preconditions.js";
+import { chooseRestoreSnapshot } from "../src/domain/existing-rig-restore.js";
 
 describe("restore-check current-state eligibility correction", () => {
   let setup: ReturnType<typeof createTestApp>;
@@ -163,5 +164,178 @@ describe("restore-check current-state eligibility correction", () => {
     expect((await (await app.request(`/api/rigs/${bad.id}/status`)).json()).status).toBe("blocked");
     expect((await (await app.request(`/api/rigs/${unknown.id}/status`)).json()).status).toBe("unknown");
     expect(changes()).toEqual(before);
+  });
+
+  // A seat that only ever resumed or was attached has no saved startup context. With a resume token, restore resumes it
+  // with an empty plan; eligibility and restore-check follow the same rule.
+  function seedMoved(name: string, token: boolean, pod = true) {
+    const { rigRepo, sessionRegistry, db } = setup;
+    const rig = rigRepo.createRig(name);
+    if (pod) db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run(`pod-${name}`, rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, pod ? "dev.moved" : "moved", { runtime: "codex", cwd: home, ...(pod ? { podId: `pod-${name}` } : {}) });
+    const session = sessionRegistry.registerSession(node.id, pod ? `dev-moved@${name}` : `moved@${name}`);
+    sessionRegistry.updateStatus(session.id, "stopped");
+    if (token) db.prepare("UPDATE sessions SET resume_type='codex_id',resume_token='fixture-codex-token' WHERE id=?").run(session.id);
+    return rig;
+  }
+  const startupContextCheck = (result: { checks: Array<{ check: string }> }) =>
+    result.checks.find((c) => c.check.endsWith(".startup-context")) as { status: string; evidence: string; remediation: string };
+
+  it("a pod-aware seat with a resume token and no saved startup context is eligible, and restore-check says it resumes", async () => {
+    const rig = seedMoved("moved", true);
+    expect(eligibility.assessCurrentStateRehydrateEligibility(setup.db, setup.rigRepo.getRig(rig.id)!)).toEqual({ ok: true, blockers: [] });
+    const ctx = startupContextCheck(await check(rig.name));
+    expect(ctx).toMatchObject({ status: "yellow", evidence: expect.stringContaining("Restore tries dev-moved@moved's saved conversation without replaying a saved startup plan, and names this gap.") });
+    // A fresh seat launch refuses without a saved startup context, so none is offered.
+    expect(ctx.remediation).toBe("No startup-context repair is needed to restore it.");
+  });
+
+  it("a legacy seat with a resume token and no saved startup context reads yellow without promising a named gap", async () => {
+    const rig = seedMoved("legacy-moved", true, false);
+    const ctx = startupContextCheck(await check(rig.name));
+    expect(ctx).toMatchObject({ status: "yellow", evidence: expect.stringContaining("without replaying a saved startup plan.") });
+    expect(ctx.evidence).not.toContain("names this gap");
+    expect(ctx.remediation).toContain("No startup-context repair is needed to restore it.");
+  });
+
+  // A member outside the restore roster (joined later with `rig attach --self`, say) is left as it is, so its saved
+  // conversation isn't tried: from the selected snapshot's roster, or, on a current-state rehydrate, from the rig's
+  // recorded roster. With no recorded roster everyone is restored, as the eligible case above shows.
+  function seedOutside(name: string) {
+    const rig = seedMoved(name, true);
+    const lead = setup.rigRepo.addNode(rig.id, "dev.lead", { runtime: "codex", cwd: home, podId: `pod-${name}` });
+    return { rig, lead };
+  }
+  async function expectLeftAttached(rigName: string) {
+    const ctx = (await check(rigName)).checks.find((c: { check: string }) => c.check === `seat.dev-moved@${rigName}.startup-context`) as
+      { status: string; evidence: string; remediation: string };
+    expect(ctx).toMatchObject({ status: "yellow",
+      evidence: expect.stringContaining(`Restore leaves dev-moved@${rigName} attached and doesn't restore it: it isn't in this rig's restore roster.`) });
+    expect(ctx.evidence).not.toContain("Restore tries");
+    expect(ctx.remediation).toBe("No startup-context repair is needed: restore doesn't touch this member.");
+  }
+
+  it("a member outside the selected snapshot's roster reads as left attached and not restored, not as a resume", async () => {
+    const { rig, lead } = seedOutside("outside");
+    const live = setup.rigRepo.getRig(rig.id)!;
+    const sessions = setup.sessionRegistry.getSessionsForRig(rig.id);
+    // The snapshot holds both members and their current occupants, so restore uses it; its roster names only the lead.
+    setup.snapshotRepo.createSnapshot(rig.id, "auto-pre-down", {
+      rig: live.rig, nodes: live.nodes, edges: live.edges, sessions, checkpoints: {},
+      activeSessionIdByNode: Object.fromEntries(sessions.map((s) => [s.nodeId, s.id])),
+      topologyRoster: { version: 1, source: "materialized_topology", intendedNodeIds: [lead.id] },
+    });
+    await expectLeftAttached(rig.name);
+  });
+
+  it("a member the selected snapshot doesn't hold at all (it joined later and its session exited) reads as left attached", async () => {
+    const { rig, lead } = seedOutside("joined-after");
+    // With no fresh-launch record, the occupant match skips an exited session, so restore uses a snapshot that holds
+    // only the lead. Restore acts on that snapshot's roster and leaves the later member as it is.
+    setup.sessionRegistry.updateStatus(setup.sessionRegistry.getSessionsForRig(rig.id)[0]!.id, "exited");
+    const live = setup.rigRepo.getRig(rig.id)!;
+    setup.snapshotRepo.createSnapshot(rig.id, "auto-pre-down", {
+      rig: live.rig, nodes: live.nodes.filter((node) => node.id === lead.id), edges: [], sessions: [], checkpoints: {},
+      activeSessionIdByNode: {},
+      topologyRoster: { version: 1, source: "materialized_topology", intendedNodeIds: [lead.id] },
+    });
+    await expectLeftAttached(rig.name);
+  });
+
+  it("on a current-state rehydrate, a member outside the rig's recorded roster reads as left attached too", async () => {
+    const { rig, lead } = seedOutside("outside-rehydrate");
+    // No usable snapshot, so restore would rehydrate from current state, which takes the rig's recorded roster.
+    setup.db.prepare("INSERT INTO events (rig_id, type, payload) VALUES (?, ?, ?)")
+      .run(rig.id, "topology.roster_recorded", JSON.stringify({ intendedNodeIds: [lead.id], source: "materialized_topology" }));
+    await expectLeftAttached(rig.name);
+  });
+
+  it("without a resume token the seat stays blocked, and restore-check names a supported command instead of 'recreate'", async () => {
+    const rig = seedMoved("unmoved", false);
+    expect(eligibility.assessCurrentStateRehydrateEligibility(setup.db, setup.rigRepo.getRig(rig.id)!).blockers)
+      .toContain("node dev.moved is pod-aware but has no persisted startup context or resume token");
+    const ctx = startupContextCheck(await check(rig.name));
+    expect(ctx).toMatchObject({ status: "red", remediation: "No command records startup context for this seat yet. To see what restore would do for it, preview with: rig up unmoved --existing --plan (read-only; it records nothing)." });
+    expect(ctx.remediation).not.toContain("--fresh");
+  });
+
+  // After a reboot that follows a restore, one seat's current row can carry no token while its siblings' rows do. That
+  // seat's current occupant is still known, so current state stands in: restore keeps its row and null token and stops
+  // it for a decision, and the siblings resume from their own rows. Both selection paths and restore-check decide
+  // through the one eligibility rule.
+  const WAITING = "node dev.moved has no persisted startup context or resume token: restore keeps its current session and leaves it unstarted, waiting for a decision; without startup context it can't be started fresh";
+  const BLOCKED = "node dev.moved is pod-aware but has no persisted startup context or resume token";
+  function seedPartial(name: string, shape: "known" | "ambiguous" | "relaunch-fresh" | "no-eligible-seat" | "lead-context-no-token" = "known") {
+    const rig = seedMoved(name, false);
+    const moved = setup.rigRepo.getRig(rig.id)!.nodes.find((node) => node.logicalId === "dev.moved")!;
+    const lead = setup.rigRepo.addNode(rig.id, "dev.lead", { runtime: "codex", cwd: home, podId: `pod-${name}` });
+    const leadRow = setup.sessionRegistry.registerSession(lead.id, `dev-lead@${name}`);
+    setup.sessionRegistry.updateStatus(leadRow.id, "stopped");
+    if (shape === "lead-context-no-token") {
+      setup.db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, '[]', '[]', '[]', 'codex')").run(lead.id);
+    } else if (shape !== "no-eligible-seat") {
+      setup.db.prepare("UPDATE sessions SET resume_type='codex_id',resume_token='fixture-lead-token' WHERE id=?").run(leadRow.id);
+    }
+    if (shape === "ambiguous") {
+      // A second current row that never recorded a token: which one is the seat's occupant can't be told.
+      setup.sessionRegistry.updateStatus(setup.sessionRegistry.registerSession(moved.id, `dev-moved@${name}`).id, "stopped");
+    }
+    if (shape === "relaunch-fresh") setup.db.prepare("UPDATE sessions SET restore_policy='relaunch_fresh' WHERE node_id=?").run(moved.id);
+    return { rig, moved };
+  }
+  const plans = async (rigId: string, rigName: string) => Promise.all([
+    app.request(`/api/rigs/${rigId}/up`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ plan: true }) }),
+    app.request("/api/up", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceRef: rigName, plan: true }) }),
+  ]);
+
+  it("a seat with no startup context or token whose current occupant is known waits for a decision instead of blocking its rig", async () => {
+    const { rig, moved } = seedPartial("partial");
+    const live = setup.rigRepo.getRig(rig.id)!;
+    const before = changes();
+    expect(eligibility.assessCurrentStateRehydrateEligibility(setup.db, live)).toEqual({ ok: true, blockers: [], awaitingDecision: [WAITING] });
+    // `rig up --existing` and daemon start choose here; the choice is current state (no snapshot to restore from).
+    expect(chooseRestoreSnapshot(setup, rig.id)).toMatchObject({ ok: true, snapshot: null });
+    // `rig start`'s id-based route and the name-based route forecast the same: the lead resumes, dev.moved waits.
+    for (const response of await plans(rig.id, rig.name)) {
+      expect(response.status).toBe(200);
+      const forecast = await response.json() as { wouldCaptureCurrentState: boolean; nodes: Array<{ logicalId: string; intendedAction: string; occupantSessionId: string | null }> };
+      expect(forecast.wouldCaptureCurrentState).toBe(true);
+      expect(Object.fromEntries(forecast.nodes.map((node) => [node.logicalId, node.intendedAction]))).toEqual({ "dev.lead": "resume-original", "dev.moved": "awaiting-decision" });
+      expect(forecast.nodes.find((node) => node.logicalId === "dev.moved")!.occupantSessionId)
+        .toBe(setup.sessionRegistry.getSessionsForRig(rig.id).find((session) => session.nodeId === moved.id)!.id);
+    }
+    // restore-check says a restore can be attempted, and names the seat it would leave waiting.
+    const input = (await check(rig.name)).checks.find((c: { check: string }) => c.check.endsWith(".restore-preconditions"));
+    expect(input).toMatchObject({ status: "yellow", evidence: expect.stringContaining(`It would not start every seat: ${WAITING}.`) });
+    expect(changes()).toEqual(before);
+  });
+
+  it("a sibling with saved startup context but no resume token waits too, and is named; when no seat would start, the report says so", async () => {
+    const { rig } = seedPartial("partial-lead-waits", "lead-context-no-token");
+    const LEAD_WAITING = "node dev.lead has saved startup context but no resume token: restore leaves it unstarted, waiting for a decision";
+    // No new gate: the rig stays eligible, as a rig whose seats all wait already restores that way.
+    expect(eligibility.assessCurrentStateRehydrateEligibility(setup.db, setup.rigRepo.getRig(rig.id)!))
+      .toEqual({ ok: true, blockers: [], awaitingDecision: [WAITING, LEAD_WAITING], noSeatStarts: true });
+    for (const response of await plans(rig.id, rig.name)) {
+      expect(response.status).toBe(200);
+      const forecast = await response.json() as { nodes: Array<{ logicalId: string; intendedAction: string }> };
+      expect(Object.fromEntries(forecast.nodes.map((node) => [node.logicalId, node.intendedAction]))).toEqual({ "dev.lead": "awaiting-decision", "dev.moved": "awaiting-decision" });
+    }
+    const input = (await check(rig.name)).checks.find((c: { check: string }) => c.check.endsWith(".restore-preconditions"));
+    expect(input).toMatchObject({ status: "yellow", evidence: expect.stringContaining(`It would start no seat; every seat would wait for a decision: ${WAITING}; ${LEAD_WAITING}.`) });
+  });
+
+  it.each([
+    ["its current occupant is ambiguous", "ambiguous"],
+    ["its restore policy starts it fresh", "relaunch-fresh"],
+    ["no other seat is eligible", "no-eligible-seat"],
+  ] as const)("a seat with no startup context or token still blocks its rig when %s", async (_label, shape) => {
+    const { rig } = seedPartial(`blocked-${shape}`, shape);
+    const result = eligibility.assessCurrentStateRehydrateEligibility(setup.db, setup.rigRepo.getRig(rig.id)!);
+    expect(result.ok).toBe(false);
+    expect(result.blockers).toContain(BLOCKED);
+    expect(result.awaitingDecision).toBeUndefined();
+    expect(chooseRestoreSnapshot(setup, rig.id)).toMatchObject({ ok: false, status: 404, body: { code: "no_snapshot", blockers: expect.arrayContaining([BLOCKED]) } });
+    for (const response of await plans(rig.id, rig.name)) expect(response.status).toBe(404);
   });
 });

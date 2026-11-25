@@ -46,6 +46,16 @@ describe("Git context selections preserve author work", () => {
     expect(result.consumption).toContain("UNVERIFIED");
   });
 
+  it("inspects and updates the tracked branch when a tag has the same name", () => {
+    const f = fixture();
+    git(f.checkout, "tag", "main");
+    writeFileSync(join(f.upstream, f.pack, "upstream.md"), "Revision B\n"); commit(f.upstream, "B");
+    expect(inspectGitContext(f.target).checkout).toMatchObject({ branch: "main", remote: "origin" });
+    const result = updateGitContext(f.target);
+    expect(result.served.revision).toBe(git(f.upstream, "rev-parse", "HEAD"));
+    expect(git(f.checkout, "rev-parse", "refs/tags/main")).toBe(f.a);
+  });
+
   it("stops on a real merge conflict while keeping the old served bytes and both Git parents", () => {
     const f = fixture();
     writeFileSync(join(f.checkout, f.pack, "upstream.md"), "Local choice\n"); commit(f.checkout, "local");
@@ -90,6 +100,16 @@ describe("Git context selections preserve author work", () => {
     expect(existsSync(join(result.installedAt, "private-unrelated.txt"))).toBe(false);
   });
 
+  it.skipIf(process.platform === "win32")("can select and inspect a pack whose name begins with a colon", () => {
+    const f = fixture();
+    const pack = ":guide";
+    renameSync(join(f.checkout, f.pack), join(f.checkout, pack));
+    commit(f.checkout, "move pack");
+    const selection = addGitContext(f.checkout, { checkout: true, pack }, join(f.home, "second"));
+    writeFileSync(join(f.checkout, pack, "local.md"), "changed\n");
+    expect(inspectGitContext(selection.installedAt).checkout.selectedPackDiff).toContain("local.md");
+  });
+
   it("rejects escaped pack paths, symlinks and unsafe destination refs", () => {
     const f = fixture();
     expect(() => addGitContext(f.checkout, { checkout: true, pack: "../outside", name: "escape" }, f.root)).toThrow(/relative/);
@@ -102,7 +122,7 @@ describe("Git context selections preserve author work", () => {
   it("refuses a detached checkout for update and preserves an explicit selection", () => {
     const f = fixture(); git(f.checkout, "checkout", "--detach", "HEAD");
     expect(inspectGitContext(f.target).checkout).toMatchObject({ branch: null, upstream: null });
-    expect(() => updateGitContext(f.target)).toThrow(/symbolic-ref failed/);
+    expect(() => updateGitContext(f.target)).toThrow(/Select a branch/);
     expect(readFileSync(join(f.target, "upstream.md"), "utf8")).toBe("Revision A\n");
   });
 });

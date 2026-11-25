@@ -56,6 +56,13 @@ harness grammar. Nonlocal host pins can validate as registered names but
 This is a workflow-step restriction, not a claim that all queue traffic is
 local-only.
 
+A step can carry an optional `label`, a short name a person sees in place of its
+`id`. It must be a non-empty string. It's display only: `id` stays the step's
+identity (and its display without a label), and `objective` stays its
+instruction; nothing routes or validates on it. A daemon from before this key
+refuses a labelled spec with `spec_unknown_key`, so author labelled specs only
+for versions that support them.
+
 A step whose `allowed_exits` can neither finish it nor route it on is refused as
 `step_cannot_finish` (`workflow-validator.ts:223-236`): its exits leave out `done`, none is
 mapped in `next_hop.on`, and it allows no `handoff` that routes on. In a dependency graph,
@@ -84,6 +91,15 @@ Diagnostic-only rows, moved sources, and versions retained for unfinished
 work have separate paths in `readThrough`, `writeDiagnostic`, and
 `isPinnedByUnfinishedWork`.
 
+Only instantiate (and `rig workflow run`, which posts to the same route) and
+the workflows-folder scan register specs through `readThrough`.
+`WorkflowRuntime.validate` (`rig workflow validate`, `POST /validate`) reads
+the file with `WorkflowSpecCache.readFromDisk`: the same file and parse
+checks, in memory, with no `workflow_specs` write. A spec that was only
+validated from outside the workflows folder is not listed by
+`rig workflow specs` and is not found by its bare name; its path still
+instantiates (#2726).
+
 ## Durable state
 
 The migration files record the storage evolution; they are not a count of
@@ -95,6 +111,7 @@ all database migrations:
 | [`040`](../../../packages/daemon/src/db/migrations/040_workflow_specs_diagnostic.ts), [`050`](../../../packages/daemon/src/db/migrations/050_workflow_spec_json.ts) | Cache diagnostics and complete parsed spec JSON. |
 | [`049`](../../../packages/daemon/src/db/migrations/049_workflow_instance_version.ts), [`051`](../../../packages/daemon/src/db/migrations/051_workflow_resume.ts), [`052`](../../../packages/daemon/src/db/migrations/052_workflow_instance_bound_rig.ts) | Optimistic version guard, resume/hop baseline, and bound rig. |
 | [`079`](../../../packages/daemon/src/db/migrations/079_workflow_lifecycle_parallel.ts) | Lifecycle operation key/digest/binding, packet-to-step frontier bindings, and failure occurrences. |
+| [`177`](../../../packages/daemon/src/db/migrations/177_workflow_bound_pod.ts) | Optional workflow pod binding. |
 
 Current instance states include `active`, `waiting`, `completed`, `failed`,
 and `aborted`. A multi-packet frontier needs packet-to-step bindings; a
@@ -128,6 +145,50 @@ parked `blocked_on` that human seat in the same transaction (summary and
 `evidence_ref` required), and the instance waits until the park is resolved;
 for a declared role, an ordinary packet goes to that handler role's seat
 (`workflow-projector.ts:1659`–`1778`).
+
+On the serial path, a `handoff` into a step of the same `actor_role` that
+resolves through `preferred_targets`, while the closing session was the
+destination of the packet it closed, returns an advisory naming
+`--next-owner`. `next_owner: same_as_previous`, on a step or at the spec's top
+level (the step's value wins), keeps such a handoff with that closing
+session instead. It applies only to the `handoff` exit (another exit that
+`next_hop.on` routes into the step, such as `failed`, doesn't count) into a
+step of the same `actor_role` that has no gate, with no explicit next owner,
+when the closing session was the closed packet's
+destination; the closure evidence then records
+`owner_resolution.mode: "continuation"`. Without it, resolution is unchanged.
+Dependency-graph successors (`depends_on`) don't read it.
+
+`rig workflow instantiate` and `rig workflow run` accept `--pod <namespace>`
+when the instance is bound to a registered rig. The pod must exist on that rig.
+The instance stores the selection, and role-only resolution considers seats in
+that pod on later projections and resumes. A preferred target can use the
+quoted YAML form `"{pod}-builder@{rig}"`; the instance expands it from its
+stored bindings. Literal preferred targets and explicit owner overrides retain
+their existing precedence and may name other seats.
+
+For an ordinary start, `rig workflow instantiate ... --operation-key <key>`
+records a creation receipt atomically with the instance and entry packet.
+Retain the key: `rig workflow operation <key>` reads that receipt, and retrying
+the same keyed request returns the recorded instance instead of starting another.
+The request's spec selector, objective, creator, owner, rig, pod and scope bind
+the key; a different request is refused. Recovery does not require the source
+file to remain available. A receipt establishes creation, not delivery or
+pickup; inspect the entry packet for those outcomes. Unkeyed starts remain
+independent. The CLI uses `/api/workflow/instantiate-keyed` for this feature;
+older daemons return an unsupported response rather than receiving an unkeyed
+fallback. API clients must use that endpoint when requesting keyed behavior.
+For a local file, pass a path such as `./workflow.yaml` rather than an ambiguous
+bare filename; a registered workflow name remains valid.
+
+Both commands also accept an optional `--title <text>`. Empty titles are
+untitled; control characters become spaces and titles longer than 120
+characters are shortened. The response reports normalization and the stored
+title. The instance retains it across restarts; ordinary
+entry and handoff packets receive a summary combining the title and step label
+(or step ID). Gate summaries keep their own behavior. A packet's summary can
+still be corrected with `rig queue update`; without a title the existing
+summary behavior is unchanged. The root objective remains the full instruction.
 
 A `preferred_targets` entry may end in `@{rig}`, for example `watcher@{rig}`.
 When the instance is bound to a rig (`--rig`, or the spec's `target.rig`

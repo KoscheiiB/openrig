@@ -35,12 +35,69 @@ function run(runtime: string, event: string, overrides: NodeJS.ProcessEnv = {}, 
 }
 const context = (r: ReturnType<typeof run>) => { expect(r.status, r.stderr || String(r.error)).toBe(0); return JSON.parse(r.stdout).hookSpecificOutput.additionalContext as string; };
 const calls = () => existsSync(env.CALLS!) ? readFileSync(env.CALLS!, "utf8").trim().split("\n") : [];
+const refocusStatePath = () => join(env.OPENRIG_HOME!, "refocus", `${env.OPENRIG_SESSION_NAME}__test-occupant.json`);
+
+it.each([6_000, 12_000, 28_000])("Codex refocus output budgets %i standing-content bytes and records any omitted tail", (bytes) => {
+  const content = join(root, "standing.md");
+  writeFileSync(content, `STANDING START\n${"🙂".repeat(bytes / 4)}\nSTANDING END`);
+  run("codex", "PostCompact");
+  const text = context(run("codex", "UserPromptSubmit", { OPENRIG_REFOCUS_CONTENT_FILE: content }));
+  const manifest = JSON.parse(readFileSync(resolve(hook, "../../codex.json"), "utf8"));
+  const handler = manifest.hooks.UserPromptSubmit.flatMap((group: any) => group.hooks)
+    .find((entry: any) => entry.command.includes("refocus.cjs"));
+  expect(Buffer.byteLength(text)).toBeLessThanOrEqual(2_500 * 4);
+  expect(handler.additionalContextLimit).toBeUndefined();
+  const state = JSON.parse(readFileSync(refocusStatePath(), "utf8"));
+  expect(state.firedAt).toEqual(expect.any(String));
+  expect(state.contextOutput.outputBytes).toBe(Buffer.byteLength(text));
+  if (bytes === 6_000) {
+    expect(text).toContain("STANDING END");
+    expect(state.contextOutput).toMatchObject({ status: "full", omittedBytes: 0 });
+  } else {
+    expect(text).toContain("REFOCUS SHORTENED");
+    expect(text).not.toContain("STANDING END");
+    expect(text).not.toContain("\uFFFD");
+    expect(state.contextOutput.status).toBe("shortened");
+    const full = readFileSync(state.contextOutput.fullPath, "utf8");
+    expect(full).toContain("STANDING END");
+    expect(state.contextOutput.originalBytes).toBe(Buffer.byteLength(full));
+    expect(state.contextOutput.omittedBytes).toBe(Buffer.byteLength(full) - state.contextOutput.prefixBytes);
+    expect(text.startsWith(Buffer.from(full).subarray(0, state.contextOutput.prefixBytes).toString("utf8"))).toBe(true);
+    writeFileSync(content, `NEXT STANDING CONTENT\n${"x".repeat(25_000)}`);
+    context(run("codex", "UserPromptSubmit", { OPENRIG_REFOCUS_CONTENT_FILE: content, OPENRIG_REFOCUS_NOW: "1" }));
+    const next = JSON.parse(readFileSync(refocusStatePath(), "utf8"));
+    expect(next.contextOutput.fullPath).not.toBe(state.contextOutput.fullPath);
+    expect(readFileSync(state.contextOutput.fullPath, "utf8")).toBe(full);
+  }
+  expect(run("codex", "UserPromptSubmit").stdout).toBe("");
+});
+
+it("Codex refocus output still fires and records shortening when the full-text file cannot be saved", () => {
+  const content = join(root, "standing.md");
+  writeFileSync(content, "x".repeat(25_000));
+  run("codex", "PostCompact");
+  const stateFile = refocusStatePath();
+  const preload = join(root, "fail-context-save.cjs");
+  writeFileSync(preload, `const fs = require("node:fs"), write = fs.writeFileSync;
+fs.writeFileSync = (file, ...args) => {
+  if (String(file).endsWith(".context.txt")) throw new Error("fixture context save refused");
+  return write(file, ...args);
+};`);
+  const text = context(run("codex", "UserPromptSubmit", { OPENRIG_REFOCUS_CONTENT_FILE: content }, preload));
+  expect(text).toContain("REFOCUS SHORTENED");
+  expect(text).toContain("Full text could not be saved");
+  const state = JSON.parse(readFileSync(stateFile, "utf8"));
+  expect(state.firedAt).toEqual(expect.any(String));
+  expect(state.contextOutput).toMatchObject({ status: "shortened", fullPath: null });
+  expect(state.contextOutput.omittedBytes).toBeGreaterThan(0);
+});
 it.each(["claude", "codex"])("%s carries only A's role after PostCompact and reuses the work response", (runtime) => {
   expect(run(runtime, "PostCompact").stdout).toBe("");
   const text = context(run(runtime, "UserPromptSubmit"));
   expect(text).toContain("Your seat's role file:"); expect(text).toContain("/seat/a/role.md");
   expect(text).toContain("Re-read it if your role is unclear"); expect(text).not.toContain("/seat/b");
-  expect(calls().filter(x => x === "queue whoami --json")).toHaveLength(1);
+  // One lookup serves role and work; with the packet off it also asks for held and pending work.
+  expect(calls().filter(x => x === "queue whoami --json --held-work")).toHaveLength(1);
   expect(run(runtime, "UserPromptSubmit").stdout).toBe("");
 });
 it.each(["claude", "codex"])("%s obtains role once with explicit work override even when Python fails", (runtime) => {
@@ -51,7 +108,7 @@ it.each(["claude", "codex"])("%s obtains role once with explicit work override e
 it("keeps role independent of configured content, including context refs", () => {
   const text = context(run("codex", "UserPromptSubmit", { OPENRIG_REFOCUS_NOW: "1", OPENRIG_REFOCUS_CONTENT_REF: "custom/ref" }));
   expect(text).toContain("CUSTOM REF CONTENT"); expect(text).toContain("/seat/a/role.md");
-  expect(calls()).toEqual(["queue whoami --json", "context get custom/ref"]);
+  expect(calls()).toEqual(["queue whoami --json --held-work", "context get custom/ref"]);
 });
 it.each([{ ROLE_STATUS: "1" }, { ANSWER: "broken" }, { ANSWER: "{}" }])("reports failed/unavailable role lookup honestly %j", (overrides) => {
   const text = context(run("codex", "UserPromptSubmit", { ...overrides, OPENRIG_REFOCUS_NOW: "1", OPENRIG_REFOCUS_WORK_NODE: "/explicit" }));

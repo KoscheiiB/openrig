@@ -7,11 +7,16 @@ import { resolveRegisteredHumanAddress } from "../human-registry.js";
 import { callWebApi, type FetchImpl, type WebApiResult } from "./slack-api.js";
 import { budgetLeft, HISTORY, REPLIES, MethodBackoff, newRecoveryBudget } from "./recovery-budget.js";
 import { parsePostedStamp } from "./thread-seat-map.js";
-import { TYPED_REPLY_HINT, CHANNEL_REPLY_HINT, HUMAN_REQUIRED_REPLY_HINT, QUESTION_BLOCK_PREFIX, escapeSlackText, redactSecrets } from "./message.js";
+import { TYPED_REPLY_HINT, CHANNEL_REPLY_HINT, HUMAN_REQUIRED_REPLY_HINT, QUESTION_BLOCK_PREFIX, SLACK_SECTION_CAP, recommendationLabel, escapeSlackText, redactSecrets } from "./message.js";
+import { chosenAnswers, type HumanAnswers, type HumanQuestion } from "../../human-questions.js";
 
 const UPDATE = "chat.update";
 const EDITED = "slack-ask-settled";
 const RATE_LIMIT = "slack-ask-edit-rate-limit";
+/** The posted message itself is gone or can never be edited by us: recorded, so a restart doesn't ask Slack again. */
+const UNAVAILABLE = "slack-ask-settle-unavailable";
+// cant_update_message means our token didn't author the message, which a token change can repair, so it isn't here.
+const goneErrors = new Set(["message_not_found", "thread_not_found", "original message unavailable"]);
 const STATUS_BLOCK = "or-settled";
 const permanentErrors = new Set(["missing_scope", "not_in_channel", "channel_not_found", "is_archived",
   "cant_update_message", "invalid_blocks", "message_not_found", "thread_not_found", "original message unavailable"]);
@@ -30,7 +35,7 @@ function handledMessage(message: { text: string; blocks: Block[] }, status: stri
     if (block.type === "actions" && block.block_id?.startsWith(QUESTION_BLOCK_PREFIX)) {
       // The labels remain history after their controls disappear, as in the resolved-notice render.
       const buttons = block.elements as unknown as Array<{ text?: { text?: string }; style?: string }>;
-      return [{ type: "section", text: { type: "mrkdwn", text: buttons.map((b) => `• ${b.text?.text ?? ""}${b.style === "primary" ? " (recommended)" : ""}`).join("\n") } }];
+      return [{ type: "section", text: { type: "plain_text", text: buttons.map((b) => `• ${recommendationLabel(b.text?.text ?? "", b.style === "primary")}`).join("\n") } }];
     }
     const hint = block.type === "context" && block.elements?.length === 1 ? block.elements[0]?.text : undefined;
     if (!hint || !hints.has(hint)) return [block];
@@ -39,15 +44,51 @@ function handledMessage(message: { text: string; blocks: Block[] }, status: stri
     if (at >= 0) text = text.slice(0, at) + text.slice(at + hint.length + 1);
     return [];
   });
+  // plain_text, as the settled labels below are: a chosen label's `*`, `_` or `~` shows as written, not as styling.
   return { text: status + "\n" + text,
-    blocks: [{ type: "context", block_id: STATUS_BLOCK, elements: [{ type: "mrkdwn", text: status }] }, ...blocks] };
+    blocks: [{ type: "context", block_id: STATUS_BLOCK, elements: [{ type: "plain_text", text: status }] }, ...blocks] };
 }
 
-function statusLine(t: QueueTransition, label?: string): string {
-  const what = label ?? (t.ownerNotificationKind === "human-decision-resolved" ? "Answered" : t.state === "done" ? "Done"
+/** What an episode's card may name (C8). The answers are the item's, and a re-park's click writes over an earlier park's,
+ *  so only the latest episode names anything. After an earlier episode, an answer counts only when this one recorded it:
+ *  a click by its human-answer-recorded note, as recordHumanAnswer reads "this park". Typed words carry no note, and
+ *  they're stored only under a question with no answer yet, so they count only while no earlier episode was answered. */
+function episodeChoices(questions: readonly HumanQuestion[], answers: HumanAnswers, episode: QueueTransition,
+  transitions: QueueTransition[]): Array<string | null> {
+  const episodes = transitions.filter((t) => t.ownerNotificationKind === "human-required");
+  if (episodes.at(-1)?.transitionId !== episode.transitionId) return [];
+  if (episodes.length === 1) return chosenAnswers(questions, answers);
+  const answeredBefore = transitions.some((t) => t.transitionId < episode.transitionId && t.ownerNotificationKind === "human-decision-resolved");
+  const recorded = new Set(transitions.filter((t) => t.transitionId > episode.transitionId).map((t) => t.transitionNote));
+  return chosenAnswers(questions, Object.fromEntries(Object.entries(answers).filter(([questionId, answer]) => typeof answer === "string"
+    ? recorded.has(`human-answer-recorded: ${JSON.stringify({ questionId, optionId: answer })}`) : !answeredBefore)));
+}
+
+/** An answered card names what was chosen (C8); a typed reply's words stay in the thread, so the card says only that.
+ *  Each label is redacted as the question card's inert() redacts it; statusLine escapes the whole line. */
+function answeredLine(chosen: ReadonlyArray<string | null>): string {
+  if (!chosen.length) return "Answered";
+  return chosen.every((c) => c === null) ? "Answered with a typed reply"
+    : `Answered: ${chosen.map((c) => c === null ? "a typed reply" : redactSecrets(c)).join("; ")}`;
+}
+
+function statusLine(t: QueueTransition, label?: string, chosen: ReadonlyArray<string | null> = []): string {
+  const what = label ?? (t.closureReason === "denied" ? "Denied"
+    : t.ownerNotificationKind === "human-decision-resolved" ? answeredLine(chosen) : t.state === "done" ? "Done"
     : t.state === "canceled" ? "Canceled" : terminal.has(t.state) ? t.state : "Handled");
   const note = redactSecrets((t.transitionNote ?? "").replace(/\s+/g, " ")).slice(0, 1000);
-  return escapeSlackText([`${what}${t.closureReason ? ` · ${t.closureReason}` : ""}`, t.ts, `by ${t.actorSession}`, note].filter(Boolean).join(" · "));
+  const text = [what, t.ts, `by ${t.actorSession}`, note].filter(Boolean).join(" · ");
+  const escaped = escapeSlackText(text);
+  if (escaped.length <= SLACK_SECTION_CAP) return escaped;
+  // The context text object has the same limit. Keep escaped entities and
+  // Unicode code points intact when budgeting the final wire string.
+  let prefix = "";
+  for (const character of text) {
+    const piece = escapeSlackText(character);
+    if (prefix.length + piece.length >= SLACK_SECTION_CAP) break;
+    prefix += piece;
+  }
+  return prefix + "…";
 }
 
 export class SlackAskSettlement {
@@ -133,7 +174,19 @@ export class SlackAskSettlement {
   private failed(id: string, key: string, method: string, result: WebApiResult): number {
     this.lastFailure = `${id}: ${method} not done (${result.error ?? result.status})`;
     this.opts.log(`slack ask settlement retained: ${this.lastFailure}`);
-    if (permanentErrors.has(result.error ?? "")) { this.unavailable.add(key); return 0; }
+    if (permanentErrors.has(result.error ?? "")) {
+      this.unavailable.add(key);
+      // Scope, membership, the token or a rendering fault can be fixed, so those are asked again after a restart; a gone message can't.
+      if (goneErrors.has(result.error ?? "")) {
+        try {
+          this.opts.queue.update({ qitemId: id, actorSession: "daemon@kernel",
+            transitionNote: `${UNAVAILABLE}${key.slice(EDITED.length)} error=${(result.error ?? "").replace(/\s+/g, "_")}` });
+        } catch (error) {
+          this.opts.log(`slack ask settlement: couldn't record ${id} as unavailable (${(error as Error).message}); skipped until restart`);
+        }
+      }
+      return 0;
+    }
     const count = (this.failures.get(key) ?? 0) + 1;
     this.failures.set(key, count);
     const wait = Math.max(Math.min(30_000 * 2 ** Math.min(count - 1, 7), 3_600_000), (result.retryAfterSeconds ?? 0) * 1000);
@@ -150,10 +203,11 @@ export class SlackAskSettlement {
     const item = this.opts.queue.getById(id);
     if (!item) return undefined;
     const after = transitions.filter((t) => t.transitionId > episode.transitionId && ![
-      "slack-posted ", "slack-owner-notification-posted ", EDITED + " ", RATE_LIMIT + " ",
+      "slack-posted ", "slack-owner-notification-posted ", EDITED + " ", RATE_LIMIT + " ", UNAVAILABLE + " ",
     ].some((prefix) => (t.transitionNote ?? "").startsWith(prefix)));
+    const chosen = episodeChoices(item.humanQuestions ?? [], item.humanAnswers ?? {}, episode, transitions);
     const make = (t: QueueTransition, label?: string) => {
-      const status = statusLine(t, label);
+      const status = statusLine(t, label, chosen);
       return { status, revision: createHash("sha256").update(status).digest("hex").slice(0, 24) };
     };
     const exit = after.find((t) => terminal.has(t.state) || t.ownerNotificationKind === "human-decision-resolved"
@@ -204,6 +258,9 @@ export class SlackAskSettlement {
       if (!stamp) continue; // No authoritative channel/timestamp: never guess a replacement post.
       const edited = `${EDITED} notification_key=${key} channel=${stamp.channel} message_ts=${messageTs}`;
       if (this.unavailable.has(edited)) continue;
+      // Recorded as gone for this exact message; a new post of the episode has its own message_ts and is tried.
+      const gone = `${UNAVAILABLE} notification_key=${key} channel=${stamp.channel} message_ts=${messageTs} `;
+      if (transitions.some((t) => t.transitionNote?.startsWith(gone))) continue;
       const desired = this.desired(id, episode, stamp.human, transitions);
       if (!desired) continue;
       const lastAck = transitions.filter((t) => t.transitionNote === edited || t.transitionNote?.startsWith(edited + " ")).at(-1);

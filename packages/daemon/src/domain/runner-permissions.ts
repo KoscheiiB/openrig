@@ -6,6 +6,7 @@
 // seat's opt-in (`--deny`) refuses every request. Each default permit leaves one pull-only record on the stream.
 
 import type Database from "better-sqlite3";
+import { ActivityGrantStore } from "./activity-grants.js";
 import { createHash } from "node:crypto";
 import { isHumanSeatSessionRef } from "./session-name.js";
 import { resolveRegisteredHumanAddress, type LoadResult } from "./gateway/human-registry.js";
@@ -22,6 +23,8 @@ const QUESTION_ID = "permission";
 const NODE_TAG = "permission-node:";
 const GENERATION_TAG = "permission-generation:";
 const TURN_TAG = "permission-turn:";
+const RUN_TAG = "permission-run:";
+const NATIVE_TURN_TAG = "permission-native-turn:";
 const WITHDRAWN_NOTE = "runner-permission-withdrawn";
 const STALE_NOTE = "runner-permission-stale";
 /** The agent's own allow and reject options, kept on the ask so a person's yes or no in words maps to them. */
@@ -101,13 +104,15 @@ export type RunnerPermissionSeat = { nodeId: string; sessionName: string; genera
 export type RunnerPermissionOption = { optionId: string; name: string; kind: string };
 export type RunnerPermissionRequest = {
   nativeRef: string;
+  runId?: string;
+  nativeTurnId?: string;
   turnId: string;
   requestId: string;
   toolCall: { title?: string; kind?: string };
   options: RunnerPermissionOption[];
 };
 
-export type SubmitRefusalCode = "denied_by_seat" | "duplicate_request" | "invalid_permission_request" | "options_unsupported";
+export type SubmitRefusalCode = "denied_by_seat" | "duplicate_request" | "invalid_permission_request" | "options_unsupported" | "turn_withdrawn";
 export type SubmitResult =
   | { ok: true; askId: string; created: boolean }
   | { ok: true; state: "permitted"; optionId: string; reason: string }
@@ -140,6 +145,9 @@ export function runnerPermissionOrigin(item: Pick<QueueItem, "tags">): { nodeId:
 export function parseRunnerPermissionRequest(body: Record<string, unknown>): { ok: true; request: RunnerPermissionRequest } | { ok: false; message: string } {
   const nativeRef = text(body.nativeRef), turnId = idText(body.turnId), requestId = idText(body.requestId);
   if (!nativeRef || !turnId || !requestId) return { ok: false, message: "A permission request needs nativeRef, turnId and requestId." };
+  if ((body.runId !== undefined || body.nativeTurnId !== undefined)
+    && (!text(body.runId) || !text(body.nativeTurnId) || String(body.runId).length > 1024 || String(body.nativeTurnId).length > 1024))
+    return { ok: false, message: "Native permission correlation requires both runId and nativeTurnId." };
   if (!Array.isArray(body.options)) return { ok: false, message: "A permission request needs options[]." };
   const options: RunnerPermissionOption[] = [];
   for (const raw of body.options as unknown[]) {
@@ -150,10 +158,21 @@ export function parseRunnerPermissionRequest(body: Record<string, unknown>): { o
   }
   const toolCall = (body.toolCall ?? {}) as Record<string, unknown>;
   return { ok: true, request: { nativeRef, turnId, requestId, options,
+    ...(body.runId ? { runId: text(body.runId)!, nativeTurnId: text(body.nativeTurnId)! } : {}),
     toolCall: { title: text(toolCall.title) ?? undefined, kind: text(toolCall.kind) ?? undefined } } };
 }
 
 export class RunnerPermissions {
+  // Routes construct short-lived services; counts must span those instances while a queue create awaits.
+  private static readonly submissions = new WeakMap<Database.Database, Map<string, number>>();
+  private submissionKey(nodeId: string, target: { runId?: string; nativeTurnId?: string }): string {
+    return JSON.stringify([nodeId, target.runId, target.nativeTurnId]);
+  }
+  private submissions(): Map<string, number> {
+    let counts = RunnerPermissions.submissions.get(this.deps.db);
+    if (!counts) { counts = new Map(); RunnerPermissions.submissions.set(this.deps.db, counts); }
+    return counts;
+  }
   constructor(private readonly deps: {
     db: Database.Database;
     queueRepo: QueueRepository;
@@ -172,6 +191,7 @@ export class RunnerPermissions {
   }
 
   async submit(seat: RunnerPermissionSeat, request: RunnerPermissionRequest): Promise<SubmitResult> {
+    if (this.turnFenced(seat.nodeId, request)) return { ok: false, code: "turn_withdrawn", message: "Native turn permissions are withdrawn." };
     const selected = this.deps.ownerOf(seat.nodeId);
     if (selected === PERMISSIONS_DENY) {
       return { ok: false, code: "denied_by_seat",
@@ -181,6 +201,7 @@ export class RunnerPermissions {
     const reject = request.options.find((option) => option.kind === "reject_once") ?? request.options.find((option) => option.kind === "reject_always");
     // OpenRig's default is permit: when no one can be asked, the agent gets its own allow option at once.
     const permit = (why: string): SubmitResult => {
+      if (this.turnFenced(seat.nodeId, request)) return { ok: false, code: "turn_withdrawn", message: "Native turn permissions are withdrawn." };
       if (!allow) return { ok: false, code: "options_unsupported", message: `No one can be asked (${why}), and the agent offered no allow option to permit.` };
       // One record per request and turn: a resubmitted request finds its record already there.
       const key = JSON.stringify([seat.nodeId, seat.generation, request.nativeRef, request.requestId, request.turnId]);
@@ -214,70 +235,118 @@ export class RunnerPermissions {
     const kind = clip(request.toolCall.kind ?? "other", MAX_AGENT_TEXT);
     const selection = this.latestSelection(seat.nodeId);
     const offered = request.options.map((option) => `- ${clip(option.name, MAX_AGENT_TEXT)} (${option.kind}, ${option.optionId}): ${NATIVE_MEANING[option.kind]}.`);
-    await this.deps.queueRepo.create({
-      qitemId: askId,
-      sourceSession: seat.sessionName,
-      destinationSession: owner.address,
-      humanIntent: "decision",
-      humanAlert: true,
-      summary: clip(`Permission: ${seat.sessionName} asks to ${title} (${kind})`, 200),
-      humanQuestions: [{ id: QUESTION_ID, question: clip(`Allow ${seat.sessionName} to ${title} (${kind})?`, MAX_QUESTION_TEXT),
-        options: request.options.map((option) => ({ id: option.optionId,
-          label: clip(option.kind.endsWith("_always") ? `${option.name} (remembered by the agent)` : option.name, MAX_OPTION_LABEL) })) }],
-      tags: [RUNNER_PERMISSION_TAG, `${NODE_TAG}${seat.nodeId}`, `${GENERATION_TAG}${seat.generation}`, `${TURN_TAG}${request.turnId}`,
-        ...(allow ? [`${ALLOW_TAG}${allow.optionId}`, `${ALLOW_KIND_TAG}${allow.kind}`] : []), ...(reject ? [`${REJECT_TAG}${reject.optionId}`] : [])],
-      nudge: false,
-      body: [
-        `${seat.sessionName}'s agent asks permission for one tool call, and is waiting on it.`,
-        "",
-        `- **Tool call:** ${title} (${kind}), as the agent described it.`,
-        `- **Conversation:** ${request.nativeRef}, turn ${request.turnId}, request ${request.requestId}.`,
-        `- **Why you:** ${selected ? selection ?? "you are the seat's chosen permission answer owner" : "you are the default person, and no one else is chosen for this seat"}.`,
-        "",
-        "**The options the agent offered:**",
-        ...offered,
-        "",
-        "Your choice goes to this one request, once. A reply of just yes or no counts as the agent's allow or reject. Any other words choose nothing: OpenRig's default permits the request when the agent offered an allow option, and a runner that forwards your words passes them to the agent only after its turn. Closing this without choosing counts as no answer, and then OpenRig's default applies: the request is permitted. If the agent's turn ends first, your answer isn't sent.",
-      ].join("\n"),
-    });
-    return { ok: true, askId, created: true };
+    const counts = this.submissions(), key = this.submissionKey(seat.nodeId, request);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    try {
+      await this.deps.queueRepo.create({
+        qitemId: askId,
+        sourceSession: seat.sessionName,
+        destinationSession: owner.address,
+        humanIntent: "decision",
+        humanAlert: true,
+        summary: clip(`Permission: ${seat.sessionName} asks to ${title} (${kind})`, 200),
+        humanQuestions: [{ id: QUESTION_ID, question: clip(`Allow ${seat.sessionName} to ${title} (${kind})?`, MAX_QUESTION_TEXT),
+          options: request.options.map((option) => ({ id: option.optionId,
+            label: clip(option.kind.endsWith("_always") ? `${option.name} (remembered by the agent)` : option.name, MAX_OPTION_LABEL) })) }],
+        tags: [RUNNER_PERMISSION_TAG, `${NODE_TAG}${seat.nodeId}`, `${GENERATION_TAG}${seat.generation}`, `${TURN_TAG}${request.turnId}`,
+          ...(request.runId && request.nativeTurnId ? [`${RUN_TAG}${request.runId}`, `${NATIVE_TURN_TAG}${request.nativeTurnId}`] : []),
+          ...(allow ? [`${ALLOW_TAG}${allow.optionId}`, `${ALLOW_KIND_TAG}${allow.kind}`] : []), ...(reject ? [`${REJECT_TAG}${reject.optionId}`] : [])],
+        nudge: false,
+        body: [
+          `${seat.sessionName}'s agent asks permission for one tool call, and is waiting on it.`,
+          "",
+          `- **Tool call:** ${title} (${kind}), as the agent described it.`,
+          `- **Conversation:** ${request.nativeRef}, turn ${request.turnId}, request ${request.requestId}.`,
+          `- **Why you:** ${selected ? selection ?? "you are the seat's chosen permission answer owner" : "you are the default person, and no one else is chosen for this seat"}.`,
+          "",
+          "**The options the agent offered:**",
+          ...offered,
+          "",
+          "Your answer, a choice or your own words, goes to this host's receiving agent, which decides this one request while the agent waits: it acts on a clear answer at once, and asks you back when your words aren't clear. Where no agent can decide here, your answer is kept and the request waits, and nothing runs: decide directly with rig seat decide-permission, or set up a receiving agent. Closing this without answering counts as no answer, and then OpenRig's default applies: the request is permitted. If the agent's turn ends first, your answer isn't sent.",
+        ].join("\n"),
+      });
+      if (this.turnFenced(seat.nodeId, request)) {
+        this.withdrawOne(seat, askId, "turn_cancelled");
+        return { ok: false, code: "turn_withdrawn", message: "Native turn ended while the ask was being submitted." };
+      }
+      return { ok: true, askId, created: true };
+    } finally {
+      const remaining = counts.get(key)! - 1;
+      if (remaining) counts.set(key, remaining); else counts.delete(key);
+    }
   }
 
   /** A grant's seat carries its launch generation: it reads only its own launch's requests. Only the current
-   *  occupant's request can read pending or answered; an earlier occupant's reads stale, whatever answer it holds. */
-  read(seat: { nodeId: string; generation?: string } | null, askId: string): ReadResult {
+   *  occupant's request can read pending or answered; an earlier occupant's reads stale, whatever answer it holds.
+   *  `authority` is a caller's own check of the ask's seat, used in place of a second one. */
+  read(seat: { nodeId: string; generation?: string } | null, askId: string, authority?: { current: boolean; unknown: boolean }): ReadResult {
     const asked = this.deps.queueRepo.getById(askId);
     const origin = asked ? runnerPermissionOrigin(asked) : null;
     if (!asked || !origin || (seat && origin.nodeId !== seat.nodeId)) return { ok: false, code: "not_found", message: `No permission request ${askId} for this seat.` };
+    if (this.turnFenced(origin.nodeId, { runId: tagValue(asked, RUN_TAG) ?? undefined, nativeTurnId: tagValue(asked, NATIVE_TURN_TAG) ?? undefined }))
+      return { ok: true, state: "withdrawn" };
     const item = this.liveEnd(asked);
-    const askIsCurrent = this.deps.currentGeneration(origin.nodeId) === origin.generation;
+    const { current: askIsCurrent, unknown } = authority ?? this.seatAuthority(origin);
     const callerMatches = !seat?.generation || seat.generation === origin.generation;
+    // Unknown authority proves neither that this ask is current nor that a successor replaced it: it waits, unclosed and
+    // ungranted, until the seat's generation is proven (current: as usual; replaced or gone: stale). A caller of another
+    // generation never gets this wait.
+    const unproven = unknown && callerMatches;
     // Handed to someone this host can't follow (another host, or no row that carries the ask): still no answer, and the
     // handoff itself never permits.
-    if (!item) return askIsCurrent && callerMatches ? { ok: true, state: "pending" } : { ok: true, state: "stale" };
+    if (!item) return (askIsCurrent && callerMatches) || unproven ? { ok: true, state: "pending" } : { ok: true, state: "stale" };
     // Still open (pending, or claimed or parked by the person): no answer yet.
     if (item.state === "pending" || item.state === "in-progress" || item.state === "blocked") {
-      if (askIsCurrent && callerMatches) return { ok: true, state: "pending" };
-      if (!askIsCurrent) this.close(item, STALE_NOTE, "relaunched: a later occupant holds this seat");
+      if ((askIsCurrent && callerMatches) || unproven) return { ok: true, state: "pending" };
+      if (!askIsCurrent && !unknown) this.close(item, STALE_NOTE, "relaunched: a later occupant holds this seat");
       return { ok: true, state: "stale" };
     }
     if (item.state === "canceled") {
       const withdrawn = this.deps.queueRepo.listTransitions(item.qitemId).some((transition) => transition.transitionNote?.startsWith(WITHDRAWN_NOTE));
       return { ok: true, state: withdrawn ? "withdrawn" : "stale" };
     }
-    if (!askIsCurrent || !callerMatches) return { ok: true, state: "stale" };
-    const answer = item.humanAnswers?.[QUESTION_ID];
-    const offered = item.humanQuestions?.find((question) => question.id === QUESTION_ID)?.options.map((option) => option.id) ?? [];
-    if (typeof answer === "string" && offered.includes(answer)) return { ok: true, state: "answered", optionId: answer };
-    // A plain no in words, or a deny from the Feed, is the agent's reject, and never a grant; a plain yes is its allow.
+    if (!callerMatches || (!askIsCurrent && !unknown)) return { ok: true, state: "stale" };
+    // A request withdrawn after its row closed without a decision: it ended, so nothing decides it now. That holds whether or
+    // not the seat can be read; only then does unknown authority leave the rest waiting.
+    if (this.withdrawnAfterClose(item)) return { ok: true, state: "withdrawn" };
+    if (unproven) return { ok: true, state: "pending" };
+    // The person's answer, from the live row or back along the rows the request was handed through.
+    const answer = this.personAnswer(item);
+    // The options travel with the ask: a row handed to an agent to decide carries none of its own.
+    const offered = this.deps.queueRepo.permissionQuestionsFor(item)?.find((question) => question.id === QUESTION_ID)?.options.map((option) => option.id) ?? [];
     const allowId = tagValue(item, ALLOW_TAG), rejectId = tagValue(item, REJECT_TAG);
-    const said = item.closureReason === "denied" || item.state === "denied" ? "no" : typedYesOrNo(answer);
-    if (said === "no") return rejectId ? { ok: true, state: "answered", optionId: rejectId } : { ok: true, state: "refused", reason: "said_no" };
-    if (said === "yes" && allowId) return { ok: true, state: "answered", optionId: allowId };
-    // Closed without an option is no answer, so OpenRig's default applies: permit.
+    // A refusing close (denied) is the agent's reject, and never a grant.
+    if (item.closureReason === "denied" || item.state === "denied") {
+      return rejectId ? { ok: true, state: "answered", optionId: rejectId } : { ok: true, state: "refused", reason: "said_no" };
+    }
+    if (answer != null) {
+      // An answer counts only through an explicit decision (`rig seat decide-permission`, or a person's own direct reply
+      // where no agent is wired to decide). An ordinary close without one leaves it waiting: never a direct action from
+      // a kept click or plain yes or no, and never the default permit over the person's answer.
+      if (!this.explicitlyDecided(item)) return { ok: true, state: "pending" };
+      if (typeof answer === "string" && offered.includes(answer)) return { ok: true, state: "answered", optionId: answer };
+      // A plain no in words is the agent's reject, and never a grant; a plain yes is its allow.
+      const said = typedYesOrNo(answer);
+      if (said === "no") return rejectId ? { ok: true, state: "answered", optionId: rejectId } : { ok: true, state: "refused", reason: "said_no" };
+      if (said === "yes" && allowId) return { ok: true, state: "answered", optionId: allowId };
+      // Other words nobody decided on are kept: the request waits for an explicit decision, or the turn's end.
+      return { ok: true, state: "pending" };
+    }
+    // Closed with no answer at all is no answer, so OpenRig's default applies: permit.
     if (!allowId) return { ok: true, state: "refused", reason: "no_allow_offered" };
     this.recordClosedAsk(asked, item, origin.nodeId, allowId);
     return { ok: true, state: "permitted", optionId: allowId };
+  }
+
+  /** Whether the ask's seat still holds its generation. The `currentGeneration` callback is asked once, and a throw or null
+   *  from it is no answer: the one authority helper decides whether that is positive replacement or absence (not current,
+   *  not unknown) or unknown (the callback alone never makes the ask current, even if the helper then reads it as current). */
+  private seatAuthority(origin: { nodeId: string; generation: string }): { current: boolean; unknown: boolean } {
+    let generation: string | null;
+    try { generation = this.deps.currentGeneration(origin.nodeId); } catch { generation = null; }
+    if (generation !== null) return { current: generation === origin.generation, unknown: false };
+    const authority = this.deps.queueRepo.runnerPermissionAuthority(origin);
+    return { current: false, unknown: authority !== "replaced" && authority !== "absent" };
   }
 
   /** The record of a permit after an ask closed without a choice: one per ask, however often the runner reads it. */
@@ -315,8 +384,15 @@ export class RunnerPermissions {
     const changed = new Promise<void>((resolve) => { release = resolve; });
     let liveId = askId; // after a route or handoff, the colleague's row is where the answer lands
     const unsubscribe = this.deps.eventBus.subscribe((event) => {
-      const changedId = (event as { type?: string; qitemId?: string }).type === "queue.updated" ? (event as { qitemId?: string }).qitemId : undefined;
-      if (changedId === askId || changedId === liveId) release();
+      const { type, qitemId } = event as { type?: string; qitemId?: string };
+      // A handoff while this read waits (the person's answer going to the receiving agent) moves the request to a new
+      // row: follow it, so the decision recorded there wakes this read rather than its next one.
+      if (type === "queue.handed_off" && (qitemId === askId || qitemId === liveId)) {
+        const asked = this.deps.queueRepo.getById(askId);
+        liveId = (asked ? this.liveEnd(asked)?.qitemId : undefined) ?? liveId;
+        return;
+      }
+      if (type === "queue.updated" && (qitemId === askId || qitemId === liveId)) release();
     });
     try {
       const now = this.withWords(askId, this.read(seat, askId));
@@ -332,17 +408,94 @@ export class RunnerPermissions {
     }
   }
 
-  withdraw(seat: { nodeId: string; generation?: string } | null, askId: string, reason: string): WithdrawResult {
-    if (!WITHDRAW_REASONS.has(reason)) {
-      return { ok: false, code: "invalid_permission_request", message: "reason must be turn_cancelled, turn_ended or exited." };
-    }
-    const now = this.read(seat, askId);
+  /** An agent's decision on a request its person answered (`rig seat decide-permission`): one of the options the agent
+   *  offered, recorded on the row that holds the request now, with who decided and why. A request that's no longer
+   *  pending (decided, withdrawn or stale) returns as it is and nothing is written, so deciding twice changes nothing. */
+  decide(askId: string, optionId: string, decider: string, reason: string): ReadResult | { ok: false; code: "invalid_option" | "not_recorded"; message: string } {
+    // One authority check for the whole decision, shared with its read. A second check could prove the seat current after
+    // the read waited on unknown authority, and record a decision on a row already closed as denied or with no answer.
+    const requested = this.deps.queueRepo.getById(askId);
+    const origin = requested ? runnerPermissionOrigin(requested) : null;
+    const authority = origin ? this.seatAuthority(origin) : null;
+    const now = this.read(null, askId, authority ?? undefined);
     if (!now.ok || now.state !== "pending") return now;
     const asked = this.deps.queueRepo.getById(askId)!;
     const live = this.liveEnd(asked);
-    // A handoff this host can't follow leaves its rows as they are; the runner just stops waiting.
-    if (live) this.close(live, WITHDRAWN_NOTE, reason);
-    return { ok: true, state: "withdrawn" };
+    if (!live) return now; // handed somewhere this host can't follow: nothing here to decide on
+    // An explicit decision on a closed row is final: a read that waited on unproven authority must not let a later,
+    // luckier authority check overwrite it.
+    if ((live.state === "done" || live.state === "failed") && this.explicitlyDecided(live)) return now;
+    // A decision isn't recorded on authority that can't be proven: it would wait as an unread decision. Decide again once the seat reads.
+    if (authority?.unknown) {
+      return { ok: false, code: "not_recorded", message: `${askId}'s seat can't be read right now, so its request can't be confirmed current. Nothing was decided. Decide again shortly.` };
+    }
+    // The same check proved a successor holds the seat: the ask is stale, and nothing is written.
+    if (authority && !authority.current) return { ok: true, state: "stale" };
+    const question = this.deps.queueRepo.permissionQuestionsFor(live)?.find((q) => q.id === QUESTION_ID);
+    if (!question?.options.some((option) => option.id === optionId)) {
+      return { ok: false, code: "invalid_option", message: `${optionId} isn't one of the options the agent offered: ${(question?.options ?? []).map((o) => o.id).join(", ") || "none recorded"}. Nothing was decided.` };
+    }
+    // The person's words as they wrote them, a plain yes or no included (the record says what they said).
+    const typed = this.personAnswer(live) as { kind?: unknown; text?: unknown } | string | undefined;
+    const words = typed && typeof typed === "object" && typed.kind === "typed-reply" ? String(typed.text ?? "").trim() || null : null;
+    const recorded = this.deps.queueRepo.recordPermissionDecision({ qitemId: live.qitemId, actorSession: decider, questionId: QUESTION_ID, optionId,
+      transitionNote: `runner-permission-decided by ${decider}, an agent, not the person: ${optionId}${reason ? `, because ${clip(reason, MAX_AGENT_TEXT)}` : ""}${words ? `; the person wrote "${words}"` : typeof typed === "string" ? `; the person chose ${typed}` : ""}` });
+    if (!recorded) return { ok: false, code: "not_recorded", message: `The decision couldn't be recorded on ${live.qitemId} (its row is ${live.state}). Nothing was decided. Read the request again.` };
+    return this.read(null, askId);
+  }
+
+  withdrawTurn(seat: RunnerPermissionSeat, target: { runId: string; nativeTurnId: string }): { confirmed: boolean; withdrawn: number; pendingSubmissions: number } {
+    if (!target.runId || !target.nativeTurnId) return { confirmed: false, withdrawn: 0, pendingSubmissions: 0 };
+    if (this.deps.currentGeneration(seat.nodeId) !== seat.generation) {
+      const grants = new ActivityGrantStore(this.deps.db), active = grants.activeForNode(seat.nodeId);
+      if (!active || active.runId !== target.runId || active.generation !== seat.generation || grants.standing(active.grantId) !== "current")
+        return { confirmed: false, withdrawn: 0, pendingSubmissions: 0 };
+    }
+    if (!this.turnFenced(seat.nodeId, target)) this.deps.eventBus.emit({ type: "agent.runner_turn_fenced", nodeId: seat.nodeId,
+      generation: seat.generation, ...target });
+    const rows = this.deps.db.prepare(`SELECT qitem_id FROM queue_items
+      WHERE EXISTS (SELECT 1 FROM json_each(queue_items.tags) WHERE value=?)
+      AND EXISTS (SELECT 1 FROM json_each(queue_items.tags) WHERE value=?)
+      AND EXISTS (SELECT 1 FROM json_each(queue_items.tags) WHERE value=?)`).all(
+        `${NODE_TAG}${seat.nodeId}`, `${RUN_TAG}${target.runId}`, `${NATIVE_TURN_TAG}${target.nativeTurnId}`) as { qitem_id: string }[];
+    let withdrawn = 0, confirmed = true;
+    for (const row of rows) {
+      const result = this.withdrawOne(seat, row.qitem_id, "turn_cancelled", true);
+      if (result.ok && result.state === "withdrawn") withdrawn++;
+      else if (!result.ok || result.state === "pending") confirmed = false;
+    }
+    const pendingSubmissions = this.submissions().get(this.submissionKey(seat.nodeId, target)) ?? 0;
+    return { confirmed: confirmed && pendingSubmissions === 0, withdrawn, pendingSubmissions };
+  }
+
+  private turnFenced(nodeId: string, target: { runId?: string; nativeTurnId?: string }): boolean {
+    return !!(target.runId && target.nativeTurnId && this.deps.db.prepare(`SELECT 1 FROM events WHERE node_id=?
+      AND type='agent.runner_turn_fenced' AND json_extract(payload,'$.runId')=? AND json_extract(payload,'$.nativeTurnId')=? LIMIT 1`)
+      .get(nodeId, target.runId, target.nativeTurnId));
+  }
+
+  withdraw(seat: { nodeId: string; generation?: string } | null, askId: string, reason: string): WithdrawResult {
+    return this.withdrawOne(seat, askId, reason);
+  }
+
+  private withdrawOne(seat: { nodeId: string; generation?: string } | null, askId: string, reason: string, requireLocal = false): WithdrawResult {
+    if (!WITHDRAW_REASONS.has(reason)) {
+      return { ok: false, code: "invalid_permission_request", message: "reason must be turn_cancelled, turn_ended or exited." };
+    }
+    const asked = this.deps.queueRepo.getById(askId);
+    const origin = asked ? runnerPermissionOrigin(asked) : null;
+    if (!asked || !origin || seat && (seat.nodeId !== origin.nodeId || seat.generation && seat.generation !== origin.generation))
+      return { ok: false, code: "not_found", message: "Permission request does not belong to this seat." };
+    const now = this.read(seat, askId);
+    if (!now.ok || !["pending", "withdrawn"].includes(now.state)) return now;
+    const live = this.liveEnd(asked);
+    if (live && this.withdrawnAfterClose(live)) return { ok: true, state: "withdrawn" };
+    // A handoff this host can't follow leaves its rows as they are; the runner just stops waiting. A row closed without a
+    // decision (its answer kept, so the request read pending) can't be canceled: the withdrawal is recorded on it instead.
+    if (live && (live.state === "pending" || live.state === "in-progress" || live.state === "blocked")) this.close(live, WITHDRAWN_NOTE, reason);
+    else if (live) this.deps.queueRepo.update({ qitemId: live.qitemId, actorSession: live.sourceSession, state: live.state,
+      transitionNote: `${WITHDRAWN_NOTE} reason=${reason}: the runner's request ended, so any answer or decision here is not sent.` });
+    return !requireLocal || live ? { ok: true, state: "withdrawn" } : { ok: true, state: "pending" };
   }
 
   /** A person who closed the ask with their own words, not a choice or a plain yes or no: the read passes them back as
@@ -350,8 +503,42 @@ export class RunnerPermissions {
   private withWords(askId: string, result: ReadResult): ReadResult {
     if (!result.ok || !(result.state === "permitted" || (result.state === "refused" && result.reason === "no_allow_offered"))) return result;
     const asked = this.deps.queueRepo.getById(askId);
-    const said = typedWords((asked ? this.liveEnd(asked) : null)?.humanAnswers?.[QUESTION_ID]);
+    const live = asked ? this.liveEnd(asked) : null;
+    const said = typedWords(live ? this.personAnswer(live) : undefined);
     return said ? { ...result, said } : result;
+  }
+
+  /** Whether the runner's request was withdrawn after this row closed (recorded on the row, since it can't be canceled). */
+  private withdrawnAfterClose(item: QueueItem): boolean {
+    const transitions = this.deps.queueRepo.listTransitions(item.qitemId);
+    for (let i = transitions.length - 1; i >= 0 && transitions[i]!.state === item.state; i--) {
+      if (transitions[i]!.transitionNote?.startsWith(WITHDRAWN_NOTE)) return true;
+    }
+    return false;
+  }
+
+  /** Whether the row's close is an explicit decision: `rig seat decide-permission`'s, recorded on the row (also after an
+   *  agent's ordinary close), or a person's own direct reply where no agent is wired to decide. */
+  private explicitlyDecided(item: QueueItem): boolean {
+    const transitions = this.deps.queueRepo.listTransitions(item.qitemId);
+    for (let i = transitions.length - 1; i >= 0 && transitions[i]!.state === item.state; i--) {
+      const t = transitions[i]!;
+      if (t.transitionNote?.startsWith("runner-permission-decided") || t.ownerNotificationKind === "human-decision-resolved") return true;
+    }
+    return false;
+  }
+
+  /** The answer the request holds: the live row's own, else the nearest one back along the rows it was handed through
+   *  (a person answered there, and the row was handed on to decide), so a person's no is never lost to a later close. */
+  private personAnswer(item: QueueItem): unknown {
+    let current: QueueItem | null = item;
+    for (let hops = 0; current && hops <= MAX_HANDOFF_HOPS; hops++) {
+      const answer = current.humanAnswers?.[QUESTION_ID];
+      if (answer != null) return answer;
+      current = current.handedOffFrom ? this.deps.queueRepo.getById(current.handedOffFrom) : null;
+      if (current && !runnerPermissionOrigin(current)) return undefined;
+    }
+    return undefined;
   }
 
   /** A person who routes or hands the ask to a colleague means the colleague decides: follow each handoff (a handed-off

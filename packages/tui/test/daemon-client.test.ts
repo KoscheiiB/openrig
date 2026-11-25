@@ -37,6 +37,7 @@ const SPEC_4A_ROUTES = [
   "/api/provider/status",
   "/api/provider/usage/hosts",
   "/api/telemetry/usage/cost",
+  "/api/queue/hosted-members",
 ];
 
 describe("daemon client = the §4.A table, one module, nothing else (FR-8/FR-9)", () => {
@@ -75,6 +76,7 @@ describe("daemon client = the §4.A table, one module, nothing else (FR-8/FR-9)"
     await c.providerStatus();
     await c.usageAcrossHosts();
     await c.usageCost();
+    await c.hostedMembers();
 
     expect(seen.sort()).toEqual([...SPEC_4A_ROUTES].sort());
   });
@@ -144,9 +146,9 @@ describe("daemon client = the §4.A table, one module, nothing else (FR-8/FR-9)"
       .toContain("Startup prompt still staged; press Enter in that pane.");
   });
 
-  it("reports an already-running launch response honestly", () => {
+  it("reports a launch over a live session as not relaunched, with its agent unproven", () => {
     expect(launchNodeNotice("dev.qa", { ok: true, code: "already_running", alreadyRunning: [{ logicalId: "dev.qa" }] }))
-      .toBe("agent already running: dev.qa");
+      .toBe("not relaunched, live session (its agent isn't proven running): dev.qa");
     expect(launchNodeNotice("dev.qa", { ok: true, launched: [{ logicalId: "dev.qa" }] }))
       .toBe("agent run requested: dev.qa");
   });
@@ -260,7 +262,7 @@ describe("terminal preview width", () => {
     }
   });
 
-  it("previews the kernel view for cmux without the wide TUI's width, as the cmux open sends none", async () => {
+  it("previews the kernel view for cmux and herdr-app without the wide TUI's width, as their opens send none", async () => {
     const descriptor = Object.getOwnPropertyDescriptor(process.stdout, "columns");
     const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
     const requests: string[] = [];
@@ -273,8 +275,9 @@ describe("terminal preview width", () => {
       }) as typeof fetch });
       await client.previewTerminal("saved:kernel", "cmux");
       await client.previewTerminal("saved:kernel", "herdr");
+      await client.previewTerminal("saved:kernel", { provider: "herdr-app", appHome: "/srv/app" });
       expect(requests.map(url => [new URL(url).searchParams.get("provider"), new URL(url).searchParams.get("viewportColumns")]))
-        .toEqual([["cmux", null], ["herdr", "160"]]);
+        .toEqual([["cmux", null], ["herdr", "160"], ["herdr-app", null]]);
     } finally {
       if (descriptor) Object.defineProperty(process.stdout, "columns", descriptor);
       else delete (process.stdout as unknown as Record<string, unknown>)["columns"];

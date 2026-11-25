@@ -118,6 +118,43 @@ describe("SSE events route", () => {
     expect(events[0]!.id).toBe(String(e2.seq));
   });
 
+  it("a reconnect cursor from a newer database falls back to bounded replay and then receives live events", async () => {
+    const rig = rigRepo.createRig("r01");
+    const first = eventBus.emit({ type: "rig.created", rigId: rig.id });
+    const second = eventBus.emit({ type: "node.added", rigId: rig.id, nodeId: "n1", logicalId: "worker" });
+    // A browser that saw seq 100 before a database restore reconnects to this older event log.
+    const res = await app.request(`/api/events?rigId=${rig.id}&replay=1`, { headers: { "Last-Event-ID": "100" } });
+    let liveSeq = 0;
+    setTimeout(() => { liveSeq = eventBus.emit({ type: "rig.created", rigId: rig.id }).seq; }, 10);
+    const events = await readSSEEvents(res, 2);
+    expect(events.map((event) => Number(event.id))).toEqual([second.seq, liveSeq]);
+    expect(first.seq).toBeLessThan(second.seq);
+  });
+
+  it("a future reconnect cursor with replay=0 receives new events even when the restored log is empty", async () => {
+    const res = await app.request("/api/events?replay=0", { headers: { "Last-Event-ID": "100" } });
+    let liveSeq = 0;
+    setTimeout(() => { liveSeq = eventBus.emit({ type: "rig.created", rigId: "r1" }).seq; }, 10);
+    const events = await readSSEEvents(res, 1);
+    expect(events.map((event) => Number(event.id))).toEqual([liveSeq]);
+    expect(liveSeq).toBeGreaterThan(0);
+  });
+
+  it("delivers an event arriving during stale-cursor replay once after the restored history", async () => {
+    const rig = rigRepo.createRig("r01");
+    const original = eventBus.emit({ type: "rig.created", rigId: rig.id });
+    const replayPage = eventBus.replayPage.bind(eventBus);
+    let liveSeq = 0;
+    vi.spyOn(eventBus, "replayPage").mockImplementation((...args) => {
+      if (!liveSeq) liveSeq = eventBus.emit({ type: "rig.created", rigId: rig.id }).seq;
+      return replayPage(...args);
+    });
+    const res = await app.request(`/api/events?rigId=${rig.id}&replay=10`, { headers: { "Last-Event-ID": "100" } });
+    const events = await readSSEEvents(res, 2);
+    expect(events.map((event) => Number(event.id))).toEqual([original.seq, liveSeq]);
+    expect(liveSeq).toBeGreaterThan(original.seq);
+  });
+
   it("no gap: event emitted during replay window delivered exactly once", async () => {
     const rig = rigRepo.createRig("r01");
 
@@ -260,6 +297,35 @@ describe("SSE events route", () => {
       const seqs = emitMany(rig.id, 3);
       const res = await app.request(`/api/events?rigId=${rig.id}&replay=0`, { headers: { "Last-Event-ID": String(seqs[0]) } });
       expect(ids(await readSSEEvents(res, 3))).toEqual(seqs.slice(1));
+    });
+
+    const evidence = (i: number) => eventBus.emit({ type: "transport.delivery_evidence", sessionName: "dev-impl@my-rig", seatKind: "tmux", pane: null,
+      occupantGeneration: null, messageId: `m${i}`, attemptId: `a${i}`, admitted: "none", written: "submitted",
+      terminalObserved: { outcome: null, verified: null }, inputBoundary: "unknown", source: "send_result", wireSha256: null, wireBytes: null, writtenAt: null }).seq;
+
+    it("a fresh replay=<n> skips per-send delivery evidence, so sends after the newest real events never empty a new feed", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 2);
+      const stored = Array.from({ length: 5 }, (_, i) => evidence(i));
+      // The log keeps them for their own readers.
+      expect(db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'transport.delivery_evidence'").get()).toEqual({ n: stored.length });
+      expect(ids(await readSSEEvents(await app.request("/api/events?replay=2"), 3))).toEqual(seqs);
+    });
+
+    it("live delivery evidence and prompt observations aren't written to the stream, so a viewer's cache never holds them, and a reconnect's replay skips them", async () => {
+      const rig = rigRepo.createRig("r01");
+      const [first] = emitMany(rig.id, 1);
+      const live = await app.request("/api/events?replay=0");
+      setTimeout(() => {
+        evidence(0);
+        eventBus.emit({ type: "transport.prompt_observation", sessionName: "dev-impl@my-rig", occupantGeneration: "g", runtime: "claude-code",
+          source: "UserPromptSubmit", nativeSessionId: null, nativePromptId: null, nativeTurnId: null, promptSha256: "a".repeat(64), promptBytes: 1,
+          observedAt: new Date().toISOString() });
+        eventBus.emit({ type: "rig.created", rigId: rig.id });
+      }, 10);
+      expect((await readSSEEvents(live, 2)).map((e) => JSON.parse(e.data).type)).toEqual(["rig.created"]);
+      const again = await app.request("/api/events?replay=0", { headers: { "Last-Event-ID": String(first) } });
+      expect((await readSSEEvents(again, 3)).map((e) => JSON.parse(e.data).type)).toEqual(["rig.created"]);
     });
 
     it("the UI's first connection, replay=100 over 1,000 stored events, gets the newest 100 in order, then live", async () => {

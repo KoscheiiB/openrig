@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { defaultResolveOrchestrator, resolveSessionNodeId } from "./queue-owner.js";
+import { orchestratorOfNode, resolveSessionNodeId } from "./queue-owner.js";
 
 export const ESCALATION_HOP_TAG = "escalation-route:one-hop";
 /** A consumed hop belongs to this recovery's handoff ancestry, never its recipient's other work. */
@@ -25,14 +25,26 @@ interface Arc { source_id: string; target_id: string | null; target_ref: string 
  * runtime status is consulted only after proving the selected target isn't in a cycle. */
 export function resolveEscalationOwner(db: Database.Database, session: string, acceptsDestination?: (destination: string) => boolean): EscalationOwner {
   const source = resolveSessionNodeId(db, session);
-  const parent = defaultResolveOrchestrator(db, session);
-  if (!source) return { owner: parent, outcome: "none", reason: "no recorded source topology" };
-  // A declared parent without a session still wins over a newly declared fallback.
-  if (db.prepare("SELECT 1 FROM edges WHERE target_id=? AND kind='delegates_to'").get(source)) {
+  if (!source) return { owner: null, outcome: "none", reason: "no recorded source topology" };
+  return resolveEscalationOwnerOfNode(db, source, session, acceptsDestination);
+}
+
+/** resolveEscalationOwner from a known node rather than a session name: for a seat with no recorded session left, such as
+ *  one whose rolled-back resume removed the only session it had. `label` names the seat in the reasons. */
+export function resolveEscalationOwnerOfNode(db: Database.Database, source: string, label: string, acceptsDestination?: (destination: string) => boolean): EscalationOwner {
+  const session = label;
+  const parent = orchestratorOfNode(db, source);
+  // One declared parent, even without a session, still wins over a newly declared fallback. Several parents name no
+  // single owner (#2840): a declared escalates_to decides, and without one the caller keeps its own fallback.
+  const parents = (db.prepare("SELECT COUNT(DISTINCT source_id) AS n FROM edges WHERE target_id=? AND kind='delegates_to'")
+    .get(source) as { n: number }).n;
+  if (parents === 1) {
     return { owner: parent, outcome: "parent", reason: "declared delegation parent retained" };
   }
   if (!db.prepare("SELECT 1 FROM edges WHERE source_id=? AND kind='escalates_to'").get(source)) {
-    return { owner: null, outcome: "none", reason: "no escalation destination declared" };
+    return parents > 1
+      ? { owner: null, outcome: "ambiguous", reason: `delegates_to ambiguous: ${parents} declared parents and no escalates_to; existing fallback retained` }
+      : { owner: null, outcome: "none", reason: "no escalation destination declared" };
   }
   // Curated/older test stores without the new column have no deferred targets.
   const hasRefs = (db.prepare("PRAGMA table_info(edges)").all() as Array<{ name: string }>).some(c => c.name === "target_ref");

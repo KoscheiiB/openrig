@@ -7,10 +7,12 @@ import {
   getDaemonUrl,
   type LifecycleDeps,
   statusGuardMessage,
+  terminalsDegradedLine,
 } from "../daemon-lifecycle.js";
 import { readLifecycleDescription } from "../daemon-lifecycle-status.js";
 import { realDeps } from "./daemon.js";
 import { ConfigStore } from "../config-store.js";
+import { attentionLines, checkKernelAttention } from "../seat-attention.js";
 
 export interface StatusDeps {
   lifecycleDeps: LifecycleDeps;
@@ -42,7 +44,9 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
     // JSON mode: one object, same keys on every path; sections the command did not
     // (or could not) read are null rather than absent.
     const emit = (daemon: Record<string, unknown>, rest: Record<string, unknown> = {}): void => {
-      console.log(JSON.stringify({ daemon: { ...daemon, ...(status.databaseWarnings ? { databaseWarnings: status.databaseWarnings } : {}) }, kernel: null, workspaceRoot: null, rigs: null, cmux: null, ...rest }, null, 2));
+      // #3315: `terminals` (whether the daemon reaches its tmux server) is read from healthz, apart from `healthy`.
+      console.log(JSON.stringify({ daemon: { ...daemon, ...(status.databaseWarnings ? { databaseWarnings: status.databaseWarnings } : {}) }, kernel: null, workspaceRoot: null, rigs: null, cmux: null,
+        terminals: status.terminals ?? null, ...rest }, null, 2));
     };
 
     const deps = depsOverride ?? {
@@ -136,8 +140,12 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
       } catch {
         // config resolution unavailable - null rather than a guess.
       }
+      // A kernel short of ready: its seats that need attention, and any it couldn't check (never read as none).
+      const attention = kernelRes?.status === 200 && kernelRes.data?.kernel_state && kernelRes.data.kernel_state !== "ready"
+        ? await checkKernelAttention(client) : null;
       const kernel = kernelRes && kernelRes.status === 200 && kernelRes.data?.kernel_state
-        ? { state: kernelRes.data.kernel_state, lastBootFailure: kernelRes.data.last_boot_failure ?? null }
+        ? { state: kernelRes.data.kernel_state, lastBootFailure: kernelRes.data.last_boot_failure ?? null,
+          ...(attention && (attention.attention.length || attention.unknown.length) ? { attention } : {}) }
         : { state: kernelRes && kernelRes.status === 503 ? "not_tracked" : "unknown", lastBootFailure: null };
       const daemon = { state: "running", reachable: true, pid: status.pid, port: status.port, healthy: true };
       if (summaryRes.status !== 200) {
@@ -150,6 +158,9 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
     }
 
     console.log(`Daemon running on port ${status.port}`);
+    // #3315: the daemon is up; whether its terminals answer is a separate line, shown when one does not.
+    const terminalsLine = terminalsDegradedLine(status.terminals);
+    if (terminalsLine) console.log(terminalsLine);
 
     // OPR.0.3.3.04.2 (AC-2): kernel readiness is a DISTINCT signal from daemon
     // health - the kernel rig auto-boots on daemon-start, and a daemon can be up
@@ -162,6 +173,10 @@ export function statusCommand(depsOverride?: StatusDeps): Command {
       const failure = kernelRes.data.last_boot_failure;
       if (failure) {
         console.log(`  Recovered from an earlier boot failure (${failure.state}${failure.at ? ` at ${failure.at}` : ""}): ${failure.detail ?? "no detail recorded"}`);
+      }
+      // A kernel seat held at a startup prompt or sign-in keeps the kernel short of ready: name it and why.
+      if (kernelRes.data.kernel_state !== "ready") {
+        for (const line of attentionLines(await checkKernelAttention(client), "pane")) console.log(`  ${line}`);
       }
     } else if (kernelRes && kernelRes.status === 503) {
       console.log("Kernel: not tracked (no kernel-boot tracker wired)");

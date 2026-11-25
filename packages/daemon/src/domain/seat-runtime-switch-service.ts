@@ -1,3 +1,4 @@
+import { ActivityGrantStore } from "./activity-grants.js";
 import { getOpenRigHome } from "../openrig-compat.js";
 import { piAccountStateRoot, piAccountSwitchStateRoot } from "./pi-account-state.js";
 import { piSeatPaths } from "../adapters/pi-runner-protocol.js";
@@ -11,6 +12,11 @@ import { ulid } from "ulid";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
+import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { communityHarnessOf, isCommunityHarnessRuntime } from "./built-in-runtimes.js";
+import { loadCommunityHarnessPreset } from "./community-harness-presets.js";
+import type { RuntimeHint } from "./discovery-types.js";
+import { communityHarnessAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import type { EventBus } from "./event-bus.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { QueueRepository } from "./queue-repository.js";
@@ -31,6 +37,7 @@ import { clearCodexMemberPermissions } from "./codex-member-permissions.js";
 import { validateNativePermissionSelection, type NativePermissionSelection } from "./native-permission-selection.js";
 import { AppliedLaunchObservationStore } from "./applied-launch-observation-store.js";
 import { validateResumeToken } from "./resume-token-validation.js";
+import { usableCommunityNativeRef } from "./community-harness-launch-result.js";
 import { SnapshotCapture } from "./snapshot-capture.js";
 import { SnapshotRepository } from "./snapshot-repository.js";
 import { CheckpointStore } from "./checkpoint-store.js";
@@ -111,6 +118,8 @@ export interface RuntimeSwitchRefusal {
   committed?: boolean;
   /** The uncommitted successor/pane exchange still needs recovery; do not retry the switch. */
   recoveryPending?: boolean;
+  /** #3253: the staged successor had gone on without the seat's requested process limit before the switch failed. */
+  processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice;
 }
 
 export interface RuntimeSwitchPlan {
@@ -133,18 +142,33 @@ export type SetRuntimeResult =
   /** The seat already runs that runtime and no settings were given: nothing to do. */
   | ({ ok: true; dryRun: boolean; changed: false } & Pick<RuntimeSwitchPlan, "seat" | "from" | "to">)
   | ({ ok: true; dryRun: false; changed: true; switchId: string; generation: string; previousGeneration: string;
-      claimsMoved: number; openRows: number; confirmation: { note: string; at: string }; recoveryPending: boolean } & RuntimeSwitchPlan);
+      claimsMoved: number; openRows: number; confirmation: { note: string; at: string }; recoveryPending: boolean;
+      /** #3253: the switch went ahead without the seat's requested process limit (the request stays stored). */
+      processLimits?: import("../adapters/tmux.js").SeatProcessLimitsNotice } & RuntimeSwitchPlan);
 
 interface SwitchRow {
   id: string; node_id: string; canonical_session: string; staging_session: string;
   predecessor_pane: string; successor_pane: string | null; predecessor_generation: string; successor_generation: string;
   from_runtime: string; to_runtime: string; phase: string; reason: string; requested_by: string | null; plan_json: string;
   confirmation_note: string | null; confirmed_at: string | null; successor_resume_type: string | null; successor_resume_token: string | null;
-  committed_at: string | null; outcome: string | null; attention: string | null; created_at: string;
+  committed_at: string | null; outcome: string | null; attention: string | null; deadline_at: string; created_at: string;
 }
 
 /** What to do about a seat with no pane to switch. */
 const NO_PANE = "it has no bound tmux pane";
+
+/** The community harness a seat was launched for, from its bound session's retained selection. Null when it has none,
+ *  or when the schema predates that column.
+ *
+ *  Ordered by creation, not `updated_at`: a session row has no `updated_at` column (migration 002 creates it with
+ *  `created_at` only), so ordering by it threw and the catch below turned every community seat into "no selection". */
+function seatCommunityHarnessSelect(db: Database.Database, nodeId: string): string | null {
+  try {
+    const row = db.prepare(`SELECT ${sessionCommunityHarnessSelect(db)} AS app FROM sessions s
+      WHERE s.node_id = ? ORDER BY s.created_at DESC, s.id DESC LIMIT 1`).get(nodeId) as { app?: string | null } | undefined;
+    return row?.app ?? null;
+  } catch { return null; }
+}
 const NO_PANE_GUIDANCE = "If the seat is stopped, start it first, then switch it. If it has never started, there's nothing to switch: "
   + "declare the other runtime for this member in its rig spec and bring the team up again from that spec. That makes a new "
   + "generation of the seat, and it doesn't carry this seat's edges, settings or queued work the way a switch does.";
@@ -157,7 +181,7 @@ const COSTS = [
   "A second process runs on the target's account until cutover.",
   "Messages sent to the seat while it switches are held, not typed; rig send says the seat is switching and until when, and they need sending again afterwards.",
   "A failed switch can leave the target runtime's prepared files (its seat storage and projections).",
-  "Codex and Claude Code runtime switches, or Pi account-home changes; single-pane seats only.",
+  "Codex, Claude Code and Pi runtime switches; single-pane seats only.",
 ];
 
 const PI_ACCOUNT_COSTS = [
@@ -194,8 +218,9 @@ export class SeatRuntimeSwitchService {
   /** Validate and plan a successor-first runtime/account move, executing it under the seat's lifecycle guard unless dry-run. */
   async setRuntime(input: SetRuntimeInput): Promise<SetRuntimeResult> {
     const refuse = (code: string, message: string, guidance?: string): RuntimeSwitchRefusal => ({ ok: false, code, message, ...(guidance ? { guidance } : {}) });
-    if (input.runtime !== "codex" && input.runtime !== "claude-code" && input.runtime !== "pi") {
-      return refuse("invalid_runtime_settings", "Choose --runtime codex or --runtime claude-code; Pi supports account-home changes on an existing Pi seat.");
+    // A built-in runtime, or a community harness whose installed preset defines it. Anything else is a typo, not a target.
+    if (input.runtime !== "codex" && input.runtime !== "claude-code" && input.runtime !== "pi" && !isCommunityHarnessRuntime(input.runtime)) {
+      return refuse("invalid_runtime_settings", "Choose --runtime codex, --runtime claude-code, --runtime pi, or the name of an installed community harness (rig community-harness list).");
     }
     const target: SwitchRuntime = input.runtime;
     if (input.clearAccountHome !== undefined && typeof input.clearAccountHome !== "boolean") return refuse("invalid_runtime_settings", "clearAccountHome must be true or false.");
@@ -250,11 +275,21 @@ export class SeatRuntimeSwitchService {
           : open.phase === "abandoned" ? "whose staged successor hasn't been retired" : "in progress"} (${open.from_runtime} → ${open.to_runtime}, switch ${open.id}).`,
         `Inspect it with rig seat status ${seatRef}; finish an interrupted one with rig seat set-runtime ${seatRef} --recover.`), switchId: open.id };
     }
-    if (node.runtime !== "codex" && node.runtime !== "claude-code" && node.runtime !== "pi") {
-      return refuse("runtime_switch_unsupported", `${seatRef} runs ${node.runtime ?? "an unknown runtime"}; only Codex and Claude Code seats can change runtime; Pi supports account-home changes.`);
+    // A seat on a community harness can move too: its adapter is resolved from the preset it was launched for.
+    const sourceRuntime: string = node.runtime ?? "";
+    const sourceIsCommunity = !!sourceRuntime && isCommunityHarnessRuntime(sourceRuntime)
+      && communityHarnessOf(seatCommunityHarnessSelect(db, node.id), sourceRuntime) !== null;
+    if (!sourceIsCommunity && sourceRuntime !== "codex" && sourceRuntime !== "claude-code" && sourceRuntime !== "pi") {
+      return refuse("runtime_switch_unsupported", `${seatRef} runs ${node.runtime ?? "an unknown runtime"}; only Codex, Claude Code, Pi and community-harness seats can change runtime.`);
     }
-    if ((target === "pi" || node.runtime === "pi") && target !== node.runtime) {
-      return refuse("runtime_switch_unsupported", "Pi supports account-home changes on an existing Pi seat; changing to or from Pi is not supported.");
+    if (node.runtime === "pi" && target === "claude-code") {
+      try {
+        if (readSeatLaunchWrapper(db, node.id)?.length) {
+          return refuse("runtime_switch_failed", `${seatRef} has a launch_wrapper configured; switching a wrapped Pi seat to Claude Code is unsupported. Clear the wrapper and re-apply the rig spec first.`);
+        }
+      } catch (error) {
+        return refuse("runtime_switch_failed", (error as Error).message);
+      }
     }
     if (target === "pi" && input.accountHome !== undefined) {
       try {
@@ -265,7 +300,7 @@ export class SeatRuntimeSwitchService {
     }
     const binding = sessionRegistry.getBindingForNode(node.id);
     const sessionName = binding?.tmuxSession ?? null;
-    const base = { seat: { ref: seatRef, nodeId: node.id, rigId: node.rigId, session: sessionName ?? "" }, from: node.runtime, to: target, ...(input.clearAccountHome ? { accountHome: null } : {}) };
+    const base = { seat: { ref: seatRef, nodeId: node.id, rigId: node.rigId, session: sessionName ?? "" }, from: sourceRuntime, to: target, ...(input.clearAccountHome ? { accountHome: null } : {}) };
     if (node.runtime === target && input.accountHome === undefined && !(input.clearAccountHome && node.accountHome)) {
       if (explicit.model || explicit.effort || explicit.codexConfigProfile || explicit.permissionMode) {
         return refuse("runtime_unchanged", `${seatRef} already runs ${target}.`,
@@ -278,7 +313,7 @@ export class SeatRuntimeSwitchService {
       if (problem) return refuse("invalid_runtime_settings", problem);
     }
     // An account change keeps this Pi seat's current model and effort unless explicitly changed.
-    if (target === "pi") {
+    if (target === "pi" && node.runtime === "pi") {
       explicit.model ??= node.model ?? undefined;
       explicit.effort ??= readSeatEffort(db, node.id)?.effective ?? node.effort ?? undefined;
     }
@@ -300,8 +335,14 @@ export class SeatRuntimeSwitchService {
     } catch (error) {
       return refuse("runtime_switch_unsupported", `${seatRef} can't switch runtime: its session couldn't be read (${(error as Error).message}).`);
     }
-    if (!this.deps.runtimeAdapters?.[target]) {
-      return refuse("runtime_target_unavailable", `${target} isn't available on this daemon, so no successor can start here.`);
+    // A built-in target has its adapter in the map. A community target's comes from its installed preset, resolved the same
+    // way a relaunch resolves a seat's own harness, so a staged successor can actually start on it.
+    if (!this.deps.runtimeAdapters?.[target] && !communityHarnessAdapter(this.deps.runtimeAdapters, target)) {
+      // A harness name is the common typo (`--runtime cluade`), and naming the list is what tells them it's a harness.
+      const harness = isCommunityHarnessRuntime(target);
+      return refuse("runtime_target_unavailable", harness
+        ? `no installed community harness is named ${target}, so no successor can start here. List the ones this daemon has with "rig community-harness list".`
+        : `${target} isn't available on this daemon, so no successor can start here.`);
     }
 
     // Settings: the target's explicit permission choice, else member and rig policy. Never the source's selection.
@@ -324,7 +365,7 @@ export class SeatRuntimeSwitchService {
       if (!saved.ok && node.agentRef) return refuse("runtime_target_unavailable", saved.refusal.message);
       materials = planRuntimeSwitchMaterials({ db, node, rigName: status.status.rig_name, canonicalSession: sessionName!, runtime: target,
         explicit, saved: saved.ok ? saved.context : null, claudeManagedBlockFile: rigRepo.getRigClaudeManagedBlockFile(node.rigId) ?? undefined,
-        resolution: this.deps.materialResolution, openrigHome: this.deps.openrigHome });
+        rigRoot: rigRepo.getRigInstallRoot(node.rigId) ?? rigRepo.getRigStartupLayers(node.rigId)?.root, resolution: this.deps.materialResolution, openrigHome: this.deps.openrigHome });
     } catch (error) { return refuse("runtime_target_unavailable", (error as Error).message); }
 
     // An explicit Codex target mode replaces the seat's envelope, which the commit clears; inherit keeps it.
@@ -340,7 +381,7 @@ export class SeatRuntimeSwitchService {
       settings: materials.settings,
       permission: selection ? { mode: selection.mode, source: "explicit" } : { mode: "inherit", source: "member_or_rig_policy" },
       dropped,
-      costs: target === "pi" ? PI_ACCOUNT_COSTS : COSTS,
+      costs: target === "pi" && node.runtime === "pi" ? PI_ACCOUNT_COSTS : COSTS,
       notRun: materials.notRun.map((command) => `startup slash command not run by a switch: ${command}`),
       warnings: materials.warnings,
     };
@@ -374,6 +415,7 @@ export class SeatRuntimeSwitchService {
   }): Promise<SetRuntimeResult> {
     const { db, rigRepo, sessionRegistry, tmuxAdapter: tmux } = this.deps;
     const { node, sessionName, target, materials } = ctx;
+    const changesPiRuntime = target !== node.runtime && (target === "pi" || node.runtime === "pi");
     const failed = (message: string, guidance?: string): RuntimeSwitchRefusal => ({ ok: false, code: "runtime_switch_failed", committed: false, message,
       guidance: guidance ?? `${ctx.seatRef} is unchanged on ${node.runtime}. Correct the cause and try again.` });
     // Refuse unreadable target settings before an active switch can hold sends to the current occupant.
@@ -409,12 +451,16 @@ export class SeatRuntimeSwitchService {
       .run(id, node.id, sessionName, row.staging_session, ctx.predecessorPane, ctx.predecessorGeneration, successorGeneration, node.runtime, target,
         ctx.input.reason, ctx.input.requestedBy ?? null, JSON.stringify(ctx.plan), deadlineAt, stamp(), stamp());
     let successorPane: string | null = null;
+    let activityGrantId: string | undefined;
+    let stagedLimits: import("../adapters/tmux.js").SeatProcessLimitsNotice | undefined;
     const abandon = async (why: string): Promise<RuntimeSwitchRefusal> => {
+      if (activityGrantId) new ActivityGrantStore(db).revoke({ grantId: activityGrantId }, "cutover_abandoned");
       const retired = await this.retireStaging(row.staging_session, node.id, "Uncommitted successor");
       db.prepare(`UPDATE seat_runtime_switches SET phase = 'abandoned', outcome = ?, attention = ?, updated_at = ? WHERE id = ? AND committed_at IS NULL`)
         .run(why, retired.ok ? null : `The staged successor couldn't be retired: ${retired.message}`, stamp(), id);
       tmux.finishLaunchBinding(row.staging_session);
-      return { ...failed(`${why}${retired.ok ? "" : ` The staged successor couldn't be retired (${retired.message}); recover with rig seat set-runtime ${ctx.seatRef} --recover.`}`, retired.ok ? undefined : `Recovery is pending for ${ctx.seatRef}. Run rig seat set-runtime ${ctx.seatRef} --recover.`), switchId: id, ...(!retired.ok ? { recoveryPending: true } : {}) };
+      return { ...failed(`${why}${retired.ok ? "" : ` The staged successor couldn't be retired (${retired.message}); recover with rig seat set-runtime ${ctx.seatRef} --recover.`}`, retired.ok ? undefined : `Recovery is pending for ${ctx.seatRef}. Run rig seat set-runtime ${ctx.seatRef} --recover.`), switchId: id, ...(!retired.ok ? { recoveryPending: true } : {}),
+        ...(stagedLimits ? { processLimits: stagedLimits } : {}) };
     };
 
     // 1. The successor, on the target runtime, beside the predecessor.
@@ -436,11 +482,11 @@ export class SeatRuntimeSwitchService {
         advisor: materials.settings.advisor.value, codexConfigProfile: materials.settings.codexConfigProfile.value,
         claudeMcp,
         ...(launchWrapper?.length ? { launchWrapper } : {}),
-        claudePermissions: override.claudePermissions, kernelAuthority: override.kernelAuthority, teamPermissionDefault: override.teamPermissionDefault,
+        claudePermissions: override.claudePermissions, claudeAutoMode: override.claudeAutoMode, kernelAuthority: override.kernelAuthority, teamPermissionDefault: override.teamPermissionDefault,
         ...(override.codexPermissions ? { codexPermissions: override.codexPermissions } : {}),
         nonInterruptive: rigRepo.getRigNonInterruptive(node.rigId), launchPosture, ...(permissionMode ? { permissionMode } : {}),
-        seatEnv: withPluginDirs({ ...rigRepo.getEffectiveSeatEnv(node.id, ctx.input.accountHome === undefined),
-          ...(ctx.input.accountHome !== undefined ? { [RUNTIME_HOME_VAR[target]]: ctx.input.accountHome } : {}) }, [corePluginDir, target === "claude-code" ? materials.seatSkills.pluginDir : undefined]),
+        seatEnv: withPluginDirs({ ...rigRepo.getEffectiveSeatEnv(node.id, changesPiRuntime || ctx.input.accountHome === undefined),
+          ...(ctx.input.accountHome !== undefined && target in RUNTIME_HOME_VAR ? { [RUNTIME_HOME_VAR[target as keyof typeof RUNTIME_HOME_VAR]]: ctx.input.accountHome } : {}) }, [corePluginDir, target === "claude-code" ? materials.seatSkills.pluginDir : undefined]),
         ...((corePluginDir || codexCorePluginDir) && node.cwd ? { seatProjectDir: node.cwd } : {}) },
       onPaneCreated: (pane) => {
         successorPane = pane;
@@ -451,7 +497,7 @@ export class SeatRuntimeSwitchService {
           const base = nodePath.join(this.deps.openrigHome ?? getOpenRigHome(), "state", "pi");
           const source = piSeatPaths(piAccountStateRoot(db, base, sessionName), sessionName).agentDir;
           const destination = piSeatPaths(piAccountSwitchStateRoot(base, successorGeneration), sessionName).agentDir;
-          if (fs.existsSync(source)) fs.cpSync(source, destination, { recursive: true, verbatimSymlinks: true,
+          if (node.runtime === "pi" && fs.existsSync(source)) fs.cpSync(source, destination, { recursive: true, verbatimSymlinks: true,
             filter: file => file !== nodePath.join(source, "auth.json") && file !== nodePath.join(source, ".openrig-account") });
           // Clearing without a configured home returns to the original seat-local login, if it had one.
           const baseline = piSeatPaths(base, sessionName).agentDir;
@@ -469,14 +515,20 @@ export class SeatRuntimeSwitchService {
           ? retireSeatCoreSkillCopies(materials.seatSkills, corePluginDir, { namesKept: false }) : [];
         return materials.prepare(binding, adapter).then((notes) => [...coreCopyNotes, ...notes]);
       },
-        binding: { ...materials.bindingAdditions(), ...(ctx.input.accountHome !== undefined ? { accountHome: ctx.input.accountHome, accountToken: ctx.input.accountToken ?? null }
+        binding: { ...materials.bindingAdditions(),
+          // Explicit nulls make adapters resolve target defaults without reading a legacy source token.
+          ...(changesPiRuntime ? { accountHome: null, accountToken: null } : {}),
+          ...(ctx.input.accountHome !== undefined ? { accountHome: ctx.input.accountHome, accountToken: ctx.input.accountToken ?? null }
           : ctx.input.clearAccountHome || node.accountHome ? { accountHome: null, ...(node.accountHome ? { accountToken: null } : {}) } : {}), runtimeSwitchFrom: { runtime: node.runtime!, session: sessionName, pane: ctx.predecessorPane, generation: ctx.predecessorGeneration } } },
     });
+    stagedLimits = launch.processLimits;
     if (!launch.ok) {
       const attention = launch.code === "successor_attention_required" ? " It is waiting at a login, trust or approval prompt." : "";
       return abandon(`The ${target} successor didn't start: ${launch.message}.${attention}`);
     }
+    activityGrantId = launch.activityGrantId;
     const warnings = [...ctx.plan.warnings, ...(launch.notes ?? [])];
+    const processLimits = launch.processLimits;
 
     // 2. The handover, as the successor's first turn; the confirmation it asks for is the evidence it can carry on.
     const queue = db.prepare(`SELECT qitem_id, state, priority, source_session FROM queue_items WHERE destination_session = ?
@@ -536,13 +588,15 @@ export class SeatRuntimeSwitchService {
       committed = this.commit({ ...ctx, id, successorGeneration, successorPane: successorPane!, appliedLaunch: launch.appliedLaunch,
         launchResume: launch.resumeToken ? { type: launch.resumeType, token: launch.resumeToken } : null });
     } catch (error) {
+      if (activityGrantId) new ActivityGrantStore(db).revoke({ grantId: activityGrantId }, "cutover_failed");
       const back = await tmux.swapRuntimeSwitchPanes({ nodeId: node.id, stagingSession: row.staging_session, canonicalSession: sessionName,
         canonicalPane: successorPane!, stagedPane: ctx.predecessorPane });
       if (!back.ok) {
         db.prepare("UPDATE seat_runtime_switches SET attention = ?, updated_at = ? WHERE id = ?")
           .run(`The commit failed (${(error as Error).message}) and the panes couldn't be exchanged back: ${back.message}`, stamp(), id);
         return { ...failed(`The commit failed (${(error as Error).message}), and the panes couldn't be put back (${back.message}).`,
-          `The ${node.runtime} occupant still holds ${ctx.seatRef} by record. Recover with rig seat set-runtime ${ctx.seatRef} --recover.`), switchId: id, recoveryPending: true };
+          `The ${node.runtime} occupant still holds ${ctx.seatRef} by record. Recover with rig seat set-runtime ${ctx.seatRef} --recover.`), switchId: id, recoveryPending: true,
+          ...(stagedLimits ? { processLimits: stagedLimits } : {}) };
       }
       return abandon(`The commit failed: ${(error as Error).message}.`);
     }
@@ -558,6 +612,7 @@ export class SeatRuntimeSwitchService {
     if (held) warnings.push(held);
     return { ok: true, dryRun: false, changed: true, ...ctx.plan, switchId: id, generation: successorGeneration, previousGeneration: ctx.predecessorGeneration,
       claimsMoved: committed.claimsMoved, openRows: queue.length, confirmation, recoveryPending: !finished.ok,
+      ...(processLimits ? { processLimits } : {}),
       warnings: finished.ok ? warnings : [...warnings, `The switch committed, but ${finished.message} Finish it with rig seat set-runtime ${ctx.seatRef} --recover.`] };
   }
 
@@ -587,11 +642,11 @@ export class SeatRuntimeSwitchService {
       db.prepare(`UPDATE nodes SET runtime = ?, model = ?, effort = ?, effort_choice = ?, advisor = ?, codex_config_profile = ?,
         ${spec ? "resolved_spec_name = ?, resolved_spec_version = ?, resolved_spec_hash = ?, restore_policy = ?," : ""}
         occupant_lifecycle = 'active', continuity_outcome = 'fresh', handover_result = 'complete', previous_occupant = ?, handover_at = ? WHERE id = ?`)
-        .run(target, materials.settings.model.value, target === "pi" && ctx.input.effort === undefined ? node.effort ?? null : materials.settings.effort.value,
-          target === "pi" && ctx.input.effort === undefined ? readSeatEffort(db, node.id)?.choice ?? null : null, materials.settings.advisor.value, materials.settings.codexConfigProfile.value,
+        .run(target, materials.settings.model.value, target === "pi" && node.runtime === "pi" && ctx.input.effort === undefined ? node.effort ?? null : materials.settings.effort.value,
+          target === "pi" && node.runtime === "pi" && ctx.input.effort === undefined ? readSeatEffort(db, node.id)?.choice ?? null : null, materials.settings.advisor.value, materials.settings.codexConfigProfile.value,
           ...(spec ? [spec.name, spec.version, spec.hash, spec.restorePolicy] : []), ctx.sessionName, at, node.id);
       db.prepare("UPDATE nodes SET account_home = ?, claude_token_ref = CASE WHEN ? THEN ? ELSE claude_token_ref END WHERE id = ?")
-        .run(ctx.input.accountHome ?? null, ctx.input.accountHome !== undefined || node.accountHome ? 1 : 0,
+        .run(ctx.input.accountHome ?? null, ctx.input.accountHome !== undefined || node.accountHome || (target !== node.runtime && (target === "pi" || node.runtime === "pi")) ? 1 : 0,
           ctx.input.accountToken ? JSON.stringify(ctx.input.accountToken) : null, node.id);
       new NativePermissionStore(db).write(node.id, ctx.selection, ctx.input.requestedBy?.trim() || ctx.sessionName, ctx.input.reason);
       // One explicit Codex choice: the switch's mode replaces the seat's envelope here, and the event says so.
@@ -605,11 +660,29 @@ export class SeatRuntimeSwitchService {
       const successor = sessionRegistry.registerClaimedSession(node.id, ctx.sessionName, "handover", ctx.successorGeneration);
       if (sessionRegistry.currentOccupantTenure(node.id)?.generationUuid !== ctx.successorGeneration) throw new Error("the successor's generation couldn't be recorded");
       db.prepare("UPDATE sessions SET origin = 'launched', restore_policy = ? WHERE id = ?").run(ctx.restorePolicy, successor.id);
-      const hooked = db.prepare("SELECT successor_resume_token FROM seat_runtime_switches WHERE id = ?").get(ctx.id) as { successor_resume_token: string | null };
-      const nativeId = hooked.successor_resume_token ?? ctx.launchResume?.token;
+      // A successor on a community harness keeps that fact on its session, as a fresh launch and a restore both record it:
+      // without it a relaunch or restore can't resolve the harness, and switching back is refused.
+      if (isCommunityHarnessRuntime(target)) {
+        const found = loadCommunityHarnessPreset(target);
+        sessionRegistry.recordCommunityHarnessSelection(successor.id, target,
+          found.ok ? (found.preset.protocol === "pi-rpc" ? "pi-rpc" : found.preset.runner) : undefined);
+      }
+      // The successor was launched in the seat's saved folder (stageSuccessor's node.cwd).
+      sessionRegistry.recordLaunchedCwd(successor.id, node.cwd);
+      const hooked = db.prepare("SELECT successor_resume_type, successor_resume_token FROM seat_runtime_switches WHERE id = ?").get(ctx.id) as { successor_resume_type: string | null; successor_resume_token: string | null };
+      // A Pi RPC hook reports the preset's plain runtime and native id, not its launcher-proven session-file pair.
+      // Only a hook already naming this community target can replace that launcher's resume.
+      const hookedToken = isCommunityHarnessRuntime(target) && hooked.successor_resume_type !== `community:${target}`
+        ? null : hooked.successor_resume_token;
+      const nativeId = hookedToken ?? ctx.launchResume?.token;
+      const nativeType = hookedToken ? hooked.successor_resume_type : ctx.launchResume?.type;
       if (nativeId) {
-        const token = validateResumeToken(target, nativeId);
-        if (token.ok) sessionRegistry.updateResumeToken(successor.id, token.resumeType, token.token, hooked.successor_resume_token ? "hook" : "scrape");
+        // A community harness's launcher reports `community:<name>`; that type is the preset's own, not a built-in's, so it is
+        // accepted here when it names this target. The built-in validator still decides every built-in token.
+        const communityToken = isCommunityHarnessRuntime(target) && nativeType === `community:${target}` && usableCommunityNativeRef(nativeId)
+          ? { ok: true as const, resumeType: `community:${target}`, token: nativeId } : null;
+        const token = communityToken ?? (isCommunityHarnessRuntime(target) ? null : validateResumeToken(target, nativeId));
+        if (token?.ok) sessionRegistry.updateResumeToken(successor.id, token.resumeType, token.token, hookedToken ? "hook" : "scrape");
       }
       const observations = new AppliedLaunchObservationStore(db);
       observations.invalidateGeneration(ctx.predecessorGeneration);
@@ -621,7 +694,8 @@ export class SeatRuntimeSwitchService {
         retiringGeneration: ctx.predecessorGeneration });
       db.prepare("UPDATE discovered_sessions SET status = 'vanished', claimed_node_id = NULL WHERE claimed_node_id = ?").run(node.id);
       const discovered = this.deps.discoveryRepo.upsertDiscoveredSession({ tmuxSession: ctx.sessionName, tmuxPane: ctx.successorPane, cwd: node.cwd!,
-        runtimeHint: target, confidence: "high" });
+        // The hint column records the runtime name as text, as a handover records a seat's; a community harness's name goes in as is.
+        runtimeHint: target as RuntimeHint, confidence: "high" });
       this.deps.discoveryRepo.markClaimed(discovered.id, node.id);
       db.prepare(`UPDATE seat_runtime_switches SET phase = 'committed', committed_at = ?, updated_at = ? WHERE id = ? AND phase = 'confirmed'`).run(at, at, ctx.id);
       if ((db.prepare("SELECT committed_at FROM seat_runtime_switches WHERE id = ?").get(ctx.id) as { committed_at: string | null }).committed_at !== at) {
@@ -718,14 +792,23 @@ export class SeatRuntimeSwitchService {
     const row = this.openSwitch(nodeId);
     if (!row) return { ok: true, outcome: "No runtime switch needs recovery.", switchId: null };
     const { db, tmuxAdapter: tmux } = this.deps;
+    if (!row.committed_at) {
+      const grants = new ActivityGrantStore(db);
+      // The durable operation owns this unique reservation. Capture/revoke its exact pending IDs before awaits;
+      // active predecessor authority and other reservations are outside this recovery.
+      const pending = grants.pendingForGeneration(nodeId, row.successor_generation);
+      for (const grant of pending) grants.revoke({ grantId: grant.grantId }, "interrupted_cutover_abandoned");
+    }
     const at = () => this.now().toISOString();
     const stuck = (message: string) => {
       db.prepare("UPDATE seat_runtime_switches SET attention = ?, updated_at = ? WHERE id = ?").run(message, at(), row.id);
       return { ok: false as const, code: "runtime_switch_pending", message, switchId: row.id };
     };
     let canonicalPane: string | null = null;
+    let currentPanes: string[] | null = null;
     try {
       const panes = await tmux.listPanes(row.canonical_session);
+      currentPanes = panes.map((pane) => pane.id);
       canonicalPane = panes.length === 1 ? panes[0]!.id : null;
     } catch { /* absent or unreadable: decided below */ }
     const staging = await tmux.probeSession(row.staging_session).catch(() => ({ state: "unknown" as const }));
@@ -741,19 +824,43 @@ export class SeatRuntimeSwitchService {
     if (!row.committed_at) {
       // Before commit: the predecessor holds the seat.
       const exchanged = canonicalPane !== null && canonicalPane === row.successor_pane && stagingPane === row.predecessor_pane;
+      // Past its deadline with no staging session, the staged successor is gone unless a pane in any of the seat's
+      // windows is it. If every window can't be read, each of the current window's panes still counts.
+      const pastDeadline = staging.state === "absent" && this.now().getTime() >= Date.parse(row.deadline_at);
+      let seatPanes: string[] | null = null;
+      if (pastDeadline) {
+        try { seatPanes = (await tmux.listPanes(row.canonical_session, true)).map((pane) => pane.id); }
+        catch { /* unreadable: no evidence of the successor */ }
+      }
+      const successorPresent = pastDeadline && await this.successorAtSeat(row, seatPanes ?? currentPanes);
+      const successorGone = pastDeadline && !successorPresent;
       if (exchanged) {
         const back = await tmux.swapRuntimeSwitchPanes({ nodeId, stagingSession: row.staging_session, canonicalSession: row.canonical_session,
           canonicalPane: row.successor_pane!, stagedPane: row.predecessor_pane });
         if (!back.ok) return stuck(`The panes couldn't be exchanged back: ${back.message}`);
-      } else if (canonicalPane !== row.predecessor_pane) {
+      } else if (canonicalPane !== row.predecessor_pane && !successorGone) {
+        if (canonicalPane !== null && canonicalPane === row.successor_pane) {
+          return stuck(`The seat's pane (${canonicalPane}) is the staged successor's, but the switch wasn't committed; nothing was touched.`);
+        }
         return stuck(`The seat's pane (${canonicalPane ?? "none"}) is neither the predecessor's nor the successor's; nothing was touched.`);
+      } else if (successorPresent) {
+        // The predecessor's pane is current, but the successor is still in another of the seat's windows: it keeps its hold.
+        return stuck(`The staged successor's pane (${row.successor_pane}) is still in another window of the seat's session; nothing was touched.`);
       }
       const retired = await this.retireStaging(row.staging_session, nodeId, "Uncommitted successor");
       if (!retired.ok) return stuck(`The staged successor couldn't be retired: ${retired.message}`);
       tmux.finishLaunchBinding(row.staging_session);
       // An abandoned switch keeps why it stopped; recovery only settles the successor it couldn't retire then.
+      // An unreadable listing settles too (a hold needs positive evidence), and the outcome doesn't claim who holds the seat.
+      // An empty listing can also come from an unreachable tmux server, so it says only that no pane was found.
+      // Only a pane identified as the predecessor's is named as its occupant.
+      const occupant = exchanged || canonicalPane === row.predecessor_pane ? `the ${row.from_runtime} occupant holds the seat`
+        : seatPanes === null ? "the seat's current occupant is unknown (its panes couldn't be read)"
+        : seatPanes.length === 0 ? "no pane was found at the seat"
+        : seatPanes.length === 1 ? `one pane is at the seat, not identified as the ${row.from_runtime} occupant`
+        : "the seat's current occupant is unknown (it has several panes)";
       const outcome = row.phase === "abandoned" ? `${row.outcome ?? "abandoned before commit"} The staged ${row.to_runtime} successor was retired at recovery.`
-        : `interrupted before commit: the ${row.from_runtime} occupant holds the seat; the staged ${row.to_runtime} successor was retired`;
+        : `interrupted before commit: ${occupant}; the staged ${row.to_runtime} successor ${successorGone ? "was already gone" : "was retired"}`;
       db.prepare("UPDATE seat_runtime_switches SET phase = 'abandoned', outcome = ?, attention = NULL, updated_at = ? WHERE id = ?").run(outcome, at(), row.id);
       return { ok: true, outcome, switchId: row.id };
     }
@@ -764,6 +871,20 @@ export class SeatRuntimeSwitchService {
     const finished = await this.finishCommitted(row);
     if (!finished.ok) return { ok: false, code: "runtime_switch_pending", message: finished.message, switchId: row.id };
     return { ok: true, outcome: `committed: finished; the seat runs ${row.to_runtime}`, switchId: row.id };
+  }
+
+  /** Whether one of the seat's panes may be this switch's successor. tmux pane ids are unique for the life of a server and
+   *  repeat only after it restarts, so a matching id is the successor unless the server started after the switch was
+   *  recorded. A session's own age proves nothing: a surviving pane can be linked or moved into a newer session. When the
+   *  start time can't be read, or a restart falls in the switch's own second, a matching id still counts as the successor.
+   *  No recorded successor pane matches nothing; an unreadable listing is no evidence of the successor either. */
+  private async successorAtSeat(row: SwitchRow, panes: string[] | null): Promise<boolean> {
+    if (!row.successor_pane || !panes?.includes(row.successor_pane)) return false;
+    let started: number | null = null;
+    try { started = await this.deps.tmuxAdapter.serverStartTime(row.canonical_session); }
+    catch { /* unread: the recorded id stands */ }
+    // tmux dates its start to the second; a start in the switch's own second isn't shown to be later.
+    return !(started !== null && started * 1000 >= Math.floor(Date.parse(row.created_at) / 1000) * 1000 + 1000);
   }
 
   /** Daemon start: finish every interrupted switch, including an abandoned one whose successor wasn't retired. Returns

@@ -69,7 +69,10 @@ function fixture(opts: { unconfirmed?: boolean } = {}) {
   const queue = new QueueRepository(db, new EventBus(db), { validateRig: () => true, transport: transport as never });
   queue.attachOutbox(new OutboxHandler(db));
   cleanup.push(async () => { await transport.guardedDelivery!.stop(); db.close(); });
-  const watchdog = makeWatchdogDeliver({ sessionTransport: transport });
+  // Wired as the daemon wires it: a queue-only seat gets OpenRig's reminders as cold rows in its queue (#3076).
+  const watchdog = makeWatchdogDeliver({ sessionTransport: transport,
+    isQueueOnlySeat: name => { const target = resolveGuardTarget(db, name); return !!target && guard.queueOnly(target.nodeId); },
+    createQueueRow: row => queue.create({ ...row, sourceSession: "watchdog@system", nudge: false }).then(({ qitemId, state }) => ({ qitemId, state })) });
   const held = () => new OutboxHandler(db).heldForNode("a", 50).items;
   return { db, guard, transport, queue, typed, held, watchdog, level: (mode: string) => guard.set("a", { mode }, "person@test", "focus") };
 }
@@ -82,11 +85,14 @@ describe("the level table through the real delivery path", () => {
     ["off", { parkWake: "typed", agent: "typed", urgent: "typed" }],
     ["openrig-urgent", { parkWake: "typed", agent: "held", urgent: "typed" }],
     ["urgent-only", { parkWake: "held", agent: "held", urgent: "typed" }],
+    ["queue-only", { parkWake: "queued", agent: "typed", urgent: "typed" }],
     ["hold", { parkWake: "held", agent: "held", urgent: "held" }],
   ] as const)("at %s: a park-timer wake, an agent's message and an urgent one", async (mode, expected) => {
     const f = fixture();
     await f.level(mode);
-    const outcome = (r: { outcome?: string; status?: string }) => (r.outcome === "retained" || r.status === "retained" ? "held" : "typed");
+    // queued: nothing typed or held; the reminder is a cold row in the seat's queue (queue-only, #3076).
+    const outcome = (r: { outcome?: string; status?: string; code?: string }) =>
+      (r.outcome === "retained" || r.status === "retained" ? "held" : r.code === "queued_as_row" ? "queued" : "typed");
     const parkWake = outcome(await f.watchdog({ targetSession: seat, message: "Wake timer fired for parked qitem q-1" }, parkTimer as never));
     const agent = outcome(await f.transport.send(seat, "From: peer@test — please review", { actorSession: "peer@test" }));
     // From another sender: a seat holds one message per sender (#2430), and this table is about each kind of input.
@@ -97,6 +103,13 @@ describe("the level table through the real delivery path", () => {
     if (expected.urgent === "typed") expect(f.typed.at(-1)).toContain("Urgent (marked by lead@test):");
     if (expected.urgent === "held") expect(f.held().find((h) => h.urgency === "urgent")?.body).toContain("Urgent (marked by lead@test):");
     expect(f.held()).toHaveLength(Object.values(expected).filter((v) => v === "held").length);
+    if (expected.parkWake === "queued") {
+      expect(f.typed.join("\n")).not.toContain("Wake timer fired for parked qitem q-1");
+      const rows = f.queue.list({ destinationSession: seat }).filter((r) => r.sourceSession === "watchdog@system");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ state: "pending", tags: expect.arrayContaining(["watchdog", "queue-only"]) });
+      expect(f.queue.getById(rows[0]!.qitemId)!.body).toContain("Wake timer fired for parked qitem q-1");
+    }
   });
 
   it("switching back to always interrupt types new input and never replays what was held", async () => {
@@ -135,6 +148,24 @@ describe("queue wakes: who triggered the wake decides its source", () => {
     await vi.waitFor(() => expect(f.typed.join("\n")).toContain(`Blocker ${blocker.qitemId} resolved; parked qitem ${parked.qitemId} is pending`));
     const peer = await f.queue.create({ sourceSession: "peer@test", destinationSession: seat, body: "Another ask" });
     await vi.waitFor(() => expect(f.queue.getById(peer.qitemId)!.lastNudgeResult).toBe("retained:typing_guard"));
+  });
+
+  it("at queue-only, an urgent row's auto-unpark wake is OpenRig's own and is held with its urgency, never typed (#3076)", async () => {
+    const f = fixture();
+    const blocker = await f.queue.create({ sourceSession: "peer@test", destinationSession: "peer@test", body: "Vendor reply", nudge: false });
+    const parked = await f.queue.create({ sourceSession: "peer@test", destinationSession: seat, body: "Prod fix after the vendor replies", nudge: false, priority: "urgent" });
+    await f.queue.update({ qitemId: parked.qitemId, actorSession: seat, state: "blocked", blockedOn: blocker.qitemId } as never);
+    await f.level("queue-only");
+    await f.queue.update({ qitemId: blocker.qitemId, actorSession: "peer@test", state: "done", closureReason: "no-follow-on" } as never);
+    await vi.waitFor(() => expect(f.held().some((h) => h.body.includes(`parked qitem ${parked.qitemId}`))).toBe(true));
+    expect(f.typed.join("\n")).not.toContain(parked.qitemId);
+    // The urgency stays visible in the held work: marked urgent, with who marked it.
+    const wake = f.held().find((h) => h.body.includes(`parked qitem ${parked.qitemId}`))!;
+    expect(wake.urgency).toBe("urgent");
+    expect(wake.body).toContain("Urgent (marked by OpenRig):");
+    // A deliberate send, urgent or not, still types at queue-only.
+    await f.transport.send(seat, "From: lead@test — the build is red", { actorSession: "lead@test", urgent: { by: "lead@test" } });
+    expect(f.typed.at(-1)).toContain("Urgent (marked by lead@test):");
   });
 
   it("a row OpenRig creates itself (a stuck-sweep finding) wakes as OpenRig's: typed at openrig-urgent, held at sends-only", async () => {
@@ -273,6 +304,10 @@ describe("a level chosen while the seat is busy decides each combined wake's del
     });
 });
 
+/** Whether a sent text lists the row as a woken dependent: its own sentence, or a line of a merged blocker list (#3896). */
+const namesParkedRow = (text: string, id: string): boolean =>
+  text.includes(`parked qitem ${id} is pending`) || text.split("\n").includes(`- ${id}`);
+
 describe("a combined wake's released members are each typed at most once in a drain", () => {
   it("routine, urgent and urgent grouped at off, urgent-only before the lease frees, typed outcomes unconfirmed", async () => {
     const f = fixture({ unconfirmed: true });
@@ -295,8 +330,10 @@ describe("a combined wake's released members are each typed at most once in a dr
     await busy;
     await drain;
     const [routine, ...urgent] = parked;
-    for (const id of urgent) expect(f.typed.filter((t) => t.includes(`parked qitem ${id} is pending`))).toHaveLength(1);
-    expect(f.typed.join("\n")).not.toContain(`parked qitem ${routine} is pending`);
+    // The urgent pair goes as one send naming the blocker once, then each row (#3896).
+    expect(f.typed.filter((t) => t.includes(`2 parked qitems are pending:\n- ${urgent[0]}\n- ${urgent[1]}\n`))).toHaveLength(1);
+    for (const id of urgent) expect(f.typed.filter((t) => namesParkedRow(t, id))).toHaveLength(1);
+    expect(f.typed.join("\n")).not.toContain(routine);
     expect(f.queue.getById(routine!)!.lastNudgeResult).toBe("retained:typing_guard");
   });
 
@@ -329,7 +366,31 @@ describe("a combined wake's released members are each typed at most once in a dr
     await busy;
     await drain;
     expect(relaxed).toBe(true);
-    for (const id of parked) expect(f.typed.filter((t) => t.includes(`parked qitem ${id} is pending`))).toHaveLength(1);
+    for (const id of parked) expect(f.typed.filter((t) => namesParkedRow(t, id))).toHaveLength(1);
+  });
+});
+
+describe("rows parked on one blocker and woken together (#3896)", () => {
+  it("name the blocker once, then each row, in one send; every row keeps its own receipt", async () => {
+    const f = fixture();
+    const blocker = await f.queue.create({ sourceSession: "peer@test", destinationSession: "peer@test", body: "Vendor reply", nudge: false });
+    const parked: string[] = [];
+    for (let i = 0; i < 9; i++) {
+      const row = await f.queue.create({ sourceSession: "peer@test", destinationSession: seat, body: `follow-up ${i}`, nudge: false });
+      await f.queue.update({ qitemId: row.qitemId, actorSession: seat, state: "blocked", blockedOn: blocker.qitemId } as never);
+      parked.push(row.qitemId);
+    }
+    await f.queue.update({ qitemId: blocker.qitemId, actorSession: "peer@test", state: "done", closureReason: "no-follow-on" } as never);
+    await vi.waitFor(() => { for (const id of parked) expect(f.queue.getById(id)!.lastNudgeResult).not.toBeNull(); });
+    expect(f.typed).toHaveLength(1);
+    const text = f.typed[0]!;
+    expect(text.split(`Blocker ${blocker.qitemId} resolved`)).toHaveLength(2);
+    expect(text.split("From: ")).toHaveLength(2);
+    expect(text).toContain(`Blocker ${blocker.qitemId} resolved; 9 parked qitems are pending:\n${parked.map((id) => `- ${id}`).join("\n")}\n`);
+    for (const id of parked) {
+      expect(f.queue.getById(id)!.state).toBe("pending");
+      expect(f.queue.getById(id)!.lastNudgeResult).not.toMatch(/^retained|^failed/);
+    }
   });
 });
 

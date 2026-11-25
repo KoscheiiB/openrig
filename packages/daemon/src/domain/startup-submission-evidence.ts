@@ -12,14 +12,62 @@ const normalize = (text: string): string => text.replace(/\s+/g, "");
 // so a mode-bar line is also known by its leading marker.
 const VIM_MODE_PREFIX = /^-- INSERT --\s*/;
 const MODE_BAR_START = /^(?:⏵⏵|⏸)(?:\s|$)/;
-// The suffix is a circle glyph and an effort level, e.g. `◐ medium` or `● high`; arbitrary text is not one.
-const PASTE_HINT = /^paste again to expand(?:\s{2,}[◐●○◑◒◓] (?:low|medium|high|xhigh|max) · \/effort)?$/;
+// Claude Code 2.1.326's context warning, which a long-lived seat shows at the footer's right (#2429): with auto-compact
+// on, `N% until auto-compact`, `auto-compact is next` or `N% context used`; without it, `Context low (N% remaining)`,
+// alone or with `· /compact to free up space`; either may end in `· /model <alias>` instead.
+const PERCENT = String.raw`(?:100|[1-9]?\d)%`;
+const CONTEXT_NOTICE = String.raw`(?:(?:${PERCENT} until auto-compact|auto-compact is next|${PERCENT} context used)`
+  + String.raw`(?: · \/model [A-Za-z0-9._\[\]-]+)?`
+  + String.raw`|Context low \(${PERCENT} remaining\)(?: · (?:\/compact to free up space|\/model [A-Za-z0-9._\[\]-]+))?)`;
+// Claude can leave these noninteractive warnings BELOW the input box and mode bar.
+// Recognize the complete input block, never a warning or historical prompt alone.
+export const CLAUDE_STATUS_WARNINGS = [
+  /^✘ Auto-update failed(?:: [^·\r\n]+)? · Run claude doctor$/,
+  /^✘ Auto-update failed · Try claude doctor or (?:npm i -g @anthropic-ai\/claude-code|cd ~\/\.claude\/local && npm update @anthropic-ai\/claude-code)$/,
+  /^✘ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai\/claude-c…$/,
+  /^tmux focus-events off · add 'set -g focus-events on' to ~\/\.tmux\.conf and re…$/,
+  /^You've used (?:\d|[1-9]\d)% of your weekly limit · resets \d{1,2}(?::\d{2})?(?:am|pm) \(UTC\)$/,
+  // #1641: Claude 2.1.293's update banner, whatever installer it names.
+  /^Update available! Run: \S.*$/,
+  // The context hint, as Claude prints it; reported as the last line below the mode bar on one seat.
+  /^new task\? \/clear to save \d+(?:\.\d+)?k tokens$/,
+  /^~\d+(?:\.\d+)?k uncached · \/clear to start fresh$/,
+  // After Claude installs an update: "/restart to apply" (a Claude seat, 2026-10-30), "Restart to apply", or
+  // "Restart to update" on its own row (Claude 2.1.319, #2605).
+  /^✔ Update installed · (?:\/restart to apply|Restart to (?:apply|update))$/,
+];
+// Claude can draw noninteractive UI rows after its mode footer. They do not
+// replace the composer and should only be skipped when they match a known row.
+export const CLAUDE_STATUS_DECORATIONS = [
+  /^\d[\d,]* tokens$/,
+  /^current: \d+(?:\.\d+){2} · latest: \d+(?:\.\d+){2} ✔ Update installed · Restart to update$/,
+  /^\/rc$/,
+];
+// Claude's Remote Control indicator, on its own row under the mode footer, in its other unselected labels (Claude Code
+// 2.1.316 to 2.1.332): connecting, active ("/rc" above once it has been seen a few times), reconnecting and failed. The
+// footer search skips these exact rows only. A selected indicator (↓) is drawn inverse with its "· <key> view" hint, and
+// Enter opens its panel, so it is never one of them. Not in STATUS_NOTICE: no frame shows one on the paste hint's row.
+export const CLAUDE_REMOTE_CONTROL_ROWS = [/^\/rc (?:connecting…|active|reconnecting|failed)$/];
+// Only a known effort hint, context warning, or a notice the reader knows on its own row (the lists above, each
+// `^…$`) may share the paste-hint row. A wide pane draws a notice there in full; a narrow one gives it its own row,
+// skipped as a status row, so a row clipped to that width (ending in `…`) never shares the hint's (#3231). Any other
+// right side, such as a draft's text, is not the hint (#2429).
+const STATUS_NOTICE = [...CLAUDE_STATUS_WARNINGS, ...CLAUDE_STATUS_DECORATIONS].filter(row => !row.source.endsWith("…$"))
+  .map(row => `(?:${row.source.slice(1, -1)})`).join("|");
+const PASTE_HINT = new RegExp(String.raw`^paste again to expand(?:\s{2,}(?:[◐●○◑◒◓] (?:low|medium|high|xhigh|max) · \/effort|${STATUS_NOTICE}|${CONTEXT_NOTICE}))?$`);
 export const isClaudePasteHint = (line: string): boolean => PASTE_HINT.test(line.replace(VIM_MODE_PREFIX, ""));
 export const isComposerFooter = (line: string): boolean => {
   const bar = line.replace(VIM_MODE_PREFIX, "");
   return (bar === "" && line !== "") || /(?:shift\+tab to cycle|\? for shortcuts)/i.test(bar) || MODE_BAR_START.test(bar)
     || PASTE_HINT.test(bar);
 };
+// A row between Claude's closing rule and its footer that a person's statusLine does not print, or that a menu, picker
+// or dialog could be drawing (#2798): a blank row (a fullscreen renderer reserves one for a statusLine that prints
+// nothing), `❯`, `›` or `»` anywhere in the row (so a statusLine that uses one as a separator reads as not one), a row
+// that starts with a numbered choice (`1. `, `2) `) with or without a border or gutter before it, a box corner, or a row
+// framed by side borders. Anything else there is read by position as a statusLine row, including the indicator Claude
+// draws at the right of the first one (`● high · /effort`, which sits on the footer row when no statusLine prints).
+export const CLAUDE_NOT_STATUS_LINE_ROW = /^\s*$|[❯›»╭╮╰╯┌┐└┘]|^[\s│┃⎿]*\d+[.)]\s|^\s*[│┃].*[│┃]\s*$/;
 // This placeholder occupies an empty composer while submitted text is queued.
 export const QUEUED_PLACEHOLDER = normalize("Press up to edit queued messages");
 
@@ -33,10 +81,17 @@ export function composerRegion(pane: string | null, runtime: string | null = nul
     // Prompt text can itself contain rules (the startup challenge does), and a rule in the prompt can be followed by a
     // line that looks like a mode bar. The composer's closing rule is the last rule on the screen: only the footer
     // lines come after it. An unrecognized footer under it leaves the region unverified rather than falling back to
-    // a rule inside the prompt.
+    // a rule inside the prompt. On Claude, a person's statusLine draws its rows between that rule and the footer; they
+    // are read by position, as claudeSeatIdle reads them, and none may be a row a statusLine does not print (#2798).
     for (let i = lines.length - 1; i > inputAt; i--) {
       if (!/^[─═-]{10,}$/.test(lines[i]!.trim())) continue;
-      if (isComposerFooter((lines.slice(i + 1).find((next) => next.trim()) ?? "").trim())) end = i;
+      const below = lines.slice(i + 1);
+      const footer = below.findIndex((row) => row.trim() !== "" && isComposerFooter(row.trim()));
+      const gap = footer < 0 ? [] : below.slice(0, footer);
+      // Only blank rows above the footer: as before. With statusLine rows there, every row of the gap, blank ones too,
+      // must pass the rule (a blank row between them is what a fullscreen renderer or a menu could leave).
+      if (footer >= 0 && (gap.every((row) => !row.trim())
+        || (runtime === "claude-code" && !gap.some((row) => CLAUDE_NOT_STATUS_LINE_ROW.test(row))))) end = i;
       break;
     }
   }
@@ -68,8 +123,9 @@ export function inspectStartupStagedText(pane: string | null, expected: string, 
 }
 
 // Claude 2.1.289 shows a long bracketed paste as this label until it is submitted; +M is the number of
-// newlines in the pasted text (8 of 8 pastes in retained native runs). Matched on the normalized body.
-export const COLLAPSED_PASTE = /^\[Pastedtext#\d+\+(\d+)lines\]$/;
+// newlines in the pasted text (8 of 8 pastes in retained native runs). Matched on the normalized body. A paste with no
+// newline (a single line over 800 characters in 2.1.326) shows no count: `[Pasted text #N]` (#2429).
+export const COLLAPSED_PASTE = /^\[Pastedtext#\d+(?:\+(\d+)lines)?\]$/;
 
 export const STARTUP_UNCONFIRMED_REASON = {
   staged: "the prompt still looked staged in the input box",
@@ -82,7 +138,7 @@ export const STARTUP_UNCONFIRMED_REASON = {
 export function startupOwnCollapsedPaste(pane: string | null, expected: string, runtime: string | null = null): boolean {
   const { body } = composerRegion(pane, runtime);
   const label = body === null ? null : COLLAPSED_PASTE.exec(body);
-  return label !== null && Number(label[1]) === expected.split("\n").length - 1;
+  return label !== null && Number(label[1] ?? 0) === expected.split("\n").length - 1;
 }
 
 // A fresh Claude's first input, as startup sends it; a runtime switch's handover to a Claude successor uses the same rules.
