@@ -1,3 +1,4 @@
+import { recordedQueueGraph } from "../domain/queue-recorded-graph.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import { Hono, type Context } from "hono";
 import { classifierOccupant } from "../domain/classification-sources.js";
@@ -10,14 +11,18 @@ import type {
   QueuePriority,
   QueueState,
 } from "../domain/queue-repository.js";
-import { QueueRepositoryError, newQitemId, deriveCrossHostSuccessorId, stampSelfHostSuffix, classifyNudgeFailure } from "../domain/queue-repository.js";
+import { QueueRepositoryError, newQitemId, deriveCrossHostSuccessorId, stampSelfHostSuffix, classifyNudgeFailure, isTypedGateBlocker, isTerminalState, DEFAULT_RECENT_TRANSITIONS_LIMIT } from "../domain/queue-repository.js";
 import type { QueueItem, QueueCreateInput } from "../domain/queue-repository.js";
+import { NO_TIMED_BACKSTOP } from "../domain/queue-waiting.js";
 import { parseSessionName, isHumanSeatSessionRef } from "../domain/session-name.js";
-import { requireSenderIdentity, resolveRecordedProvenance, resolveRecordedIdentity, ORIGIN_UNKNOWN_HEADER, transportSenderSession } from "./require-sender-identity.js";
+import { requireSenderIdentity, resolveRecordedProvenance, resolveRecordedIdentity, ORIGIN_UNKNOWN_HEADER, SENDER_IDENTITY_HEADER, RELAY_HEADER, IDENTITY_PROVENANCE_HEADER, transportSenderSession, canonicalSenderSession, evidenceRefRootsFrom } from "./require-sender-identity.js";
+import { inheritedReturnRoute, issuedReturnAddress, isRouteAddress, RETURN_ROUTE_BASES, RETURN_ROUTE_NOT_CARRIED, RETURN_ROUTE_NOT_CARRIED_TAG, RETURN_ROUTE_NOTE_PREFIX,
+  routeIsPersonMessage, routeNotCarriedMessage, splitRoute, type ReturnRouteBasis } from "../domain/return-route.js";
 import { hostname as osHostname } from "node:os";
 import type { InboxHandler } from "../domain/inbox-handler.js";
 import { InboxHandlerError } from "../domain/inbox-handler.js";
 import { type OutboxHandler } from "../domain/outbox-handler.js";
+import { recordRefusal, refusalReason } from "../domain/refusal-trace.js";
 import { aggregateAttention } from "../domain/feed/attention-aggregator.js";
 import type { AttentionItem } from "../domain/feed/attention-aggregator.js";
 import { loadHostRegistry, resolveHost } from "../domain/hosts/hosts-registry-reader.js";
@@ -25,16 +30,34 @@ import { eligibleQueueBindings, ineligibleBindingDetail, loadLearnedHostBindings
 import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contract.js";
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
-import { deriveCurrentWork, deriveCurrentWorkChoice, deriveRole, deriveWorkCandidates, type CurrentWorkRow, type MissionsRootResolver, type RoleOrientation } from "../domain/current-work.js";
-import { listProjects, projectCatalogPaths } from "../domain/workspace/project-read.js";
-import { readProjectCatalog } from "../domain/workspace/project-catalog.js";
+import {
+  deriveCurrentWork,
+  deriveCurrentWorkChoice,
+  deriveRole,
+  deriveWorkCandidates,
+  listProjectMissions,
+  evaluateCreateScope,
+  skippedCreateScopeAdvisory,
+  toCreateScopeAdvisory,
+  type CreateScopeAdvisoryContext,
+  type CurrentWorkRow,
+  type MissionsRootResolver,
+  type RoleOrientation,
+} from "../domain/current-work.js";
+import { listProjects, namesProject, projectCatalogPaths, projectIds as projectIdsOf } from "../domain/workspace/project-read.js";
+import { inferCatalogProject, ProjectReadError, readProjectCatalog, rigFromSession, selectCatalogProject } from "../domain/workspace/project-catalog.js";
+import { physicalSessionName } from "../domain/session-registry.js";
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
+import { EraseRefusal, eraseQueue, type EraseAction, type EraseScope, type HostClass } from "../domain/queue-erasure.js";
 import { HumanModeService } from "../domain/gateway/human-operating-modes.js";
+import { HUMAN_ALERT_TAG } from "../domain/gateway/human-registry.js";
 import type { HumanQuestion } from "../domain/human-questions.js";
 import { sharedChannelFor } from "../domain/gateway/participants.js";
 import { queryLimit, SQL_LIMIT_BOUND } from "./query-limit.js";
 import { feedPerspective } from "../domain/feed-perspective.js";
+import { waitForQueueItem } from "../domain/queue-read-wait.js";
+import { exemptSlowOpRequest } from "../domain/slow-op-recorder.js";
 
 /**
  * Coordination L3 — Queue HTTP routes (PL-004 Phase A).
@@ -52,6 +75,15 @@ import { feedPerspective } from "../domain/feed-perspective.js";
 const QUEUE_FORWARD_TIMEOUT_MS = 10_000;
 /** OPR.0.7.0.12 — held and next rows listed in a refocus packet; past this the packet says the list was cut. */
 const WORK_CANDIDATE_LIST_LIMIT = 50;
+/** Private request opt-in for CLI diagnostics; its response acknowledgement is never forwarded. */
+const CLI_HANDOFF_SCOPE_ADVISORY_HEADER = "X-OpenRig-CLI-Handoff-Scope-Advisory";
+const HANDOFF_SCOPE_CHECK_ACKNOWLEDGED = "handoffScopeCheckAcknowledged";
+/** GET /list's page marker (#3572): the limit it applied, and "1" when more rows matched than it returned ("0" when not).
+ *  Headers, so the body stays a bare array for readers that don't look. */
+const LIST_LIMIT_HEADER = "X-OpenRig-Limit";
+const LIST_TRUNCATED_HEADER = "X-OpenRig-Truncated";
+/** QueueRepository's default for list and listAttention, applied here so the route can read one row past it. */
+const LIST_DEFAULT_LIMIT = 100;
 
 // OPR.0.4.6.MH3 D-4 (FR-2/R2a): the cross-host provenance shape appended to a
 // FORWARDED body's tags — a marker (`cross-host`) + the forwarding daemon's
@@ -62,11 +94,63 @@ const WORK_CANDIDATE_LIST_LIMIT = 50;
 // shipped registry has no canonical own-alias reader, and D-4 frames this name
 // as free-text best-effort by design.
 export const CROSS_HOST_TAG = "cross-host";
+/** A route this daemon sends to another host, naming this host (`member@rig@<self>`); one carried from another host keeps
+ *  its own. Null when this daemon doesn't know its host id, so the route can't say where it is. */
+export function hostQualifiedRoute(route: string): string | null {
+  if (splitRoute(route).host) return route;
+  const stamped = stampSelfHostSuffix(route);
+  return stamped === route ? null : stamped;
+}
+
+/** A forwarded row's tags, with the mark that its return route wasn't carried when that's so. */
+function withRouteNotCarriedTag(tags: string[] | undefined, notCarried: string | null): string[] | undefined {
+  if (!notCarried) return tags;
+  return [...(tags ?? []).filter(t => t !== RETURN_ROUTE_NOT_CARRIED_TAG), RETURN_ROUTE_NOT_CARRIED_TAG];
+}
+
+/** How a named route was established: a route carried from another host keeps the basis it was sent with there. */
+function carriedRouteBasis(route: string, basis: unknown): ReturnRouteBasis {
+  return splitRoute(canonicalSenderSession(route)).host && RETURN_ROUTE_BASES.includes(basis as ReturnRouteBasis)
+    ? basis as ReturnRouteBasis : "named";
+}
+
 export function crossHostProvenanceTags(existing: string[] | undefined): string[] {
   const base = existing ?? [];
   const fromHost = `from-host:${osHostname()}`;
   const additions = [CROSS_HOST_TAG, fromHost].filter((t) => !base.includes(t));
   return [...base, ...additions];
+}
+
+/**
+ * #3018 — the identity a FORWARDING daemon relays to the host that keeps the record. The forwarded body
+ * carries only a `sourceSession`, so the receiving daemon fell back to `claimed:v1`; the CLI's
+ * `rig queue update --host` calls that host directly and already carries the sender header.
+ * The actor is re-stamped with THIS daemon's host suffix (the same value the forwarded body's
+ * sourceSession carries), and the relay/provenance markers keep the receiving hop from presenting a
+ * relayed actor as transport-verified (resolveRecordedProvenance records relay:v1). `Via` marks the
+ * request as another hop, so a loopback receiver doesn't read it as a direct local client. A request
+ * with no transport identity stays header-less: a body claim is never laundered into a relayed one.
+ */
+export function relayedSenderHeaders(c: { req: { header: (name: string) => string | undefined } }): Record<string, string> | undefined {
+  const sender = transportSenderSession(c as Context);
+  const selfId = getSelfHostId();
+  if (!sender || !selfId) return undefined;
+  if (c.req.header(ORIGIN_UNKNOWN_HEADER) === "true") {
+    return {
+      [SENDER_IDENTITY_HEADER]: sender,
+      [ORIGIN_UNKNOWN_HEADER]: "true",
+      [RELAY_HEADER]: selfId,
+      via: selfId,
+      [IDENTITY_PROVENANCE_HEADER]: "origin-unknown:v1",
+    };
+  }
+  const relayedHere = !!c.req.header(RELAY_HEADER)?.trim();
+  return {
+    [SENDER_IDENTITY_HEADER]: stampSelfHostSuffix(sender),
+    [RELAY_HEADER]: selfId,
+    via: selfId,
+    [IDENTITY_PROVENANCE_HEADER]: relayedHere ? "claimed:v1" : "transport:v1",
+  };
 }
 
 /** Human requests: canonical human destination or human blocker, excluding
@@ -78,6 +162,73 @@ export function isAttentionItem(q: { tier: string | null; destinationSession: st
   return q.state === "blocked" && isHumanSeatSessionRef(q.blockedOn ?? "");
 }
 
+
+/** A row a handoff of this one made: the rows naming it as `handedOffFrom`, and a local row its closure target names. */
+export interface HandoffSuccessor { qitemId: string; destinationSession: string; state: QueueState; via: "handedOffFrom" | "closureTarget" }
+
+/** #2794: a handed-off row records its new owner as the closure target, not the row the handoff made. This names that row
+ *  from what's already stored: the successor's own `handedOffFrom`, or a local row id in the closure target. A cross-host
+ *  successor is named as recorded (`<id>@<host>`), never looked up remotely. A lookup that fails says so; it never fails
+ *  the read. Past HANDOFF_SUCCESSOR_LIMIT rows naming it, the newest are named and `successorsTruncated` says so. */
+export const HANDOFF_SUCCESSOR_LIMIT = 20;
+type HandoffSuccessorFace = { successors: HandoffSuccessor[]; successorsTruncated?: true; successorNote?: string };
+export function handoffSuccessors(repo: QueueRepository, item: Pick<QueueItem, "qitemId" | "closureTarget" | "closureReason">): HandoffSuccessorFace {
+  return handoffSuccessorsMany(repo, [item]).get(item.qitemId)!;
+}
+
+/** #3645: handoffSuccessors for a page of rows, with the same face per row, from two statements for the whole page
+ *  (QueueRepository.handoffSuccessorReads) instead of a listing and a getById per row. A lookup that fails says so on
+ *  every row of the page; it never fails the read. */
+export function handoffSuccessorsMany(repo: QueueRepository, items: ReadonlyArray<Pick<QueueItem, "qitemId" | "closureTarget" | "closureReason">>): Map<string, HandoffSuccessorFace> {
+  const faces = new Map<string, HandoffSuccessorFace>();
+  if (items.length === 0) return faces;
+  let reads: ReturnType<QueueRepository["handoffSuccessorReads"]>;
+  try {
+    // Newest first, one past the bound so a cut list is known.
+    reads = repo.handoffSuccessorReads(items.map((item) => item.qitemId),
+      items.flatMap((item) => item.closureTarget?.startsWith("qitem-") ? [item.closureTarget] : []), HANDOFF_SUCCESSOR_LIMIT + 1);
+  } catch {
+    for (const item of items) faces.set(item.qitemId, { successors: [], successorNote: "Its successor couldn't be looked up; the closure target is as recorded." });
+    return faces;
+  }
+  for (const item of items) {
+    const found = reads.bySource.get(item.qitemId) ?? [];
+    const truncated = found.length > HANDOFF_SUCCESSOR_LIMIT;
+    const successors: HandoffSuccessor[] = found.slice(0, HANDOFF_SUCCESSOR_LIMIT)
+      .sort((a, b) => a.tsCreated.localeCompare(b.tsCreated) || a.qitemId.localeCompare(b.qitemId))
+      .map((row) => ({ qitemId: row.qitemId, destinationSession: row.destinationSession, state: row.state, via: "handedOffFrom" }));
+    const target = item.closureTarget;
+    if (target?.startsWith("qitem-") && !successors.some((s) => s.qitemId === target)) {
+      const named = reads.byId.get(target);
+      if (named) successors.push({ qitemId: named.qitemId, destinationSession: named.destinationSession, state: named.state, via: "closureTarget" });
+    }
+    if (successors.length > 0) { faces.set(item.qitemId, { successors, ...(truncated ? { successorsTruncated: true as const } : {}) }); continue; }
+    faces.set(item.qitemId, {
+      successors,
+      successorNote: target && /^qitem-[^@\s]+@[^@\s]+$/.test(target)
+        ? `${item.closureReason === "superseded" ? "Its recorded successor on another host is" : "It was handed to another host; its successor there is"} ${target}. This daemon has no copy.`
+        : item.closureReason === "superseded" ? "No successor row was found on this daemon for this supersession."
+          : "No row on this daemon was made by this handoff.",
+    });
+  }
+  return faces;
+}
+
+/** The read limit for GET /list: one row past the page, so a full page can tell a cut from an exact fit. A negative limit
+ *  doesn't bound the read in SQLite, so it's passed as is. */
+function listReadLimit(limit: number): number {
+  return limit >= 0 ? limit + 1 : limit;
+}
+
+/** Cut GET /list's read back to the page and mark it. A full page alone never says more rows exist: only the extra row
+ *  read past the limit does. */
+function cutListPage<T>(c: Context, limit: number, rows: T[]): T[] {
+  if (limit < 0) return rows;
+  const truncated = rows.length > limit;
+  c.header(LIST_LIMIT_HEADER, String(limit));
+  c.header(LIST_TRUNCATED_HEADER, truncated ? "1" : "0");
+  return truncated ? rows.slice(0, limit) : rows;
+}
 
 export function queueRoutes(): Hono {
   const app = new Hono();
@@ -113,6 +264,32 @@ export function queueRoutes(): Hono {
     try { return getRepo(c).destinationAdvisory(sessionRef); }
     catch { return null; }
   }
+  function createScopeAdvisory(c: { get: (key: string) => unknown }, tags: string[] | null, context?: CreateScopeAdvisoryContext) {
+    try {
+      const check = evaluateCreateScope(tags, () => {
+        const flat = (tags ?? []).flatMap((tag) => tag.split(",").map((part) => part.trim())).filter(Boolean);
+        const projectTags = flat.filter((tag) => tag.startsWith("project:"));
+        if (projectTags.some((tag) => !tag.slice("project:".length).trim())) return null;
+        const projectIds = [...new Set(projectTags.map((tag) => tag.slice("project:".length).trim()))];
+        if (projectIds.length > 1) return null;
+        if (projectIds.length === 1) {
+          const projectId = projectIds[0]!;
+          const { catalog } = projectCatalogPaths(c as never);
+          const entries = readProjectCatalog(catalog);
+          if (!entries) return null;
+          const project = listProjects(c as never).projects.find((entry) => namesProject(entry, projectId));
+          if (!project || project.error || !project.missionsRoot) return null;
+          return project.missionsRoot;
+        }
+        const store = c.get("settingsStore" as never) as SettingsStore | undefined;
+        const value = store?.resolveOne("workspace.slices_root").value;
+        return typeof value === "string" && value.trim() ? value : null;
+      });
+      return check ? toCreateScopeAdvisory(check, context) : null;
+    } catch {
+      return null;
+    }
+  }
   /** An ask (anything but an update) to a shared channel is accepted, with a word to the agent: the channel's replies
    *  come back as correspondence, never as an answer, so nothing there will settle it. Context, not a refusal. */
   function sharedChannelAskAdvisory(sessionRef: string, humanIntent: unknown) {
@@ -126,6 +303,36 @@ export function queueRoutes(): Hono {
         message: `${sessionRef} is a shared channel: its replies come back to you as correspondence from the channel, never as an answer, so nothing there will answer or close this. Read the replies and close it yourself; to answer someone or post a notice, send an update (--human-intent update, with --reply-to to stay in their thread).`,
       };
     } catch { return null; }
+  }
+  /** #2739: a park on an outside condition (external:, fold:, auth:) with no timed wake. That blocker isn't a row that
+   *  can finish, so no timer or watchdog will wake the owner: the reply says so and names the two existing ways out.
+   *  Read from the row's own waiting view, the one `rig queue show` reports. Context, not a refusal: the park stands. */
+  function parkWithoutWakeAdvisory(item: QueueItem) {
+    if (item.state !== "blocked" || !isTypedGateBlocker(item.blockedOn) || item.waiting?.nextBackstop.mechanism !== NO_TIMED_BACKSTOP) return null;
+    return {
+      code: "park_without_wake",
+      qitemId: item.qitemId,
+      blockedOn: item.blockedOn,
+      message: `No wake is set for this park: nothing wakes ${item.destinationSession} on a timer while ${item.qitemId} waits on ${item.blockedOn}. To add one, park it again with --wake-after <duration> (or --wake-watchdog <job-id>). When ${item.blockedOn} clears, rig queue resolve ${item.qitemId} --decision <evidence> unparks it.`,
+    };
+  }
+  /** A summary or evidence ref the update asked for but the stored row doesn't carry (a blank one, which isn't stored
+   *  because it would erase what the row has, or one the repository couldn't write): read from the stored row, so the
+   *  caller is told whatever the reason. */
+  function unstoredAdvisories(body: { summary?: unknown; evidenceRef?: unknown }, item: QueueItem) {
+    return ([["summary", "summary", "summary_not_stored"], ["evidenceRef", "evidence ref", "evidence_ref_not_stored"]] as const)
+      .flatMap(([field, name, code]) => {
+        const requested = body[field];
+        const stored = item[field];
+        if (typeof requested !== "string" || stored === requested) return [];
+        const why = requested.trim().length === 0 ? `The ${name} was blank, so it wasn't stored` : `The ${name} wasn't stored`;
+        return [{
+          code,
+          qitemId: item.qitemId,
+          field,
+          message: `${why}: ${item.qitemId} keeps ${stored ? `its ${name} "${stored}"` : `no ${name}`}. The rest of the update was applied.`,
+        }];
+      });
   }
   function getInbox(c: { get: (key: string) => unknown }): InboxHandler {
     return c.get("inboxHandler" as never) as InboxHandler;
@@ -210,10 +417,15 @@ export function queueRoutes(): Hono {
         : err.code === "qitem_not_claimable" ? 409
         : err.code === "qitem_not_in_progress" ? 409
         : err.code === "qitem_already_terminal" ? 409
+        : err.code === "relayed_answer_refused" ? 409
+        // An update's expected state (--expect-state) no longer matches the row; nothing was written.
+        : err.code === "qitem_state_changed" ? 409
         // OPR.0.4.6.MH3 Q-a: same minted id, different destination/source =
         // caller id-reuse (a bug, not an idempotent retry) — surface as a
         // conflict, never overwrite.
         : err.code === "qitem_id_reuse" ? 409
+        // Queue erasure deleted this id's row; it isn't created again.
+        : err.code === "qitem_erased" ? 409
         // OPR.0.4.6.MH3 FR-4 (C2): a cross-host source-close re-drive naming a
         // DIFFERENT closure_target than the recorded one — someone else closed
         // the source meanwhile; surfaced, never overwritten.
@@ -226,9 +438,6 @@ export function queueRoutes(): Hono {
         : err.code === "reply_to_requires_update" ? 400
         : err.code === "reply_to_not_found" ? 400
         : err.code === "invalid_human_questions" ? 400
-        // OPR.0.5.1 slice-51-06 D2: summary/evidence_ref on a non-park transition — a client
-        // input error surfaced as a structured 400 (the daemon rejects before any mutation).
-        : err.code === "summary_evidence_not_persistable" ? 400
         // OPR.0.4.6.WF3 FR-6: the frontier close-path guard — operator
         // misuse of a queue verb on a live workflow packet; structured
         // 400 with the what/why/fix message, never a 500.
@@ -291,6 +500,8 @@ export function queueRoutes(): Hono {
     hostId: string,
     path: string,
     forwardBody: Record<string, unknown>,
+    /** #3018: relay this daemon's resolved sender to the host that keeps the record (create only). */
+    relayIdentity = false,
   ): Promise<
     | { ok: true; payload: unknown; status: number }
     | { ok: false; response: Response }
@@ -326,12 +537,16 @@ export function queueRoutes(): Hono {
         "unsupported-transport",
       );
     }
+    const relay = relayIdentity ? relayedSenderHeaders(c) : undefined;
     const res = await remoteJsonRequest(resolved.host, path, {
       method: "POST",
       body: forwardBody,
       timeoutMs: QUEUE_FORWARD_TIMEOUT_MS,
       fetchImpl,
-      headers: c.req.header(ORIGIN_UNKNOWN_HEADER) === "true" ? { [ORIGIN_UNKNOWN_HEADER]: "true" } : undefined,
+      headers: {
+        ...(c.req.header(ORIGIN_UNKNOWN_HEADER) === "true" ? { [ORIGIN_UNKNOWN_HEADER]: "true" } : {}),
+        ...(relay ?? {}),
+      },
     });
     if (res.ok) {
       // The origin daemon's structured response, verbatim — its row is the
@@ -424,6 +639,7 @@ export function queueRoutes(): Hono {
     },
     createSuccessor: (forwardBody: Record<string, unknown>) => Promise<{ ok: true; payload: unknown } | { ok: false; response: Response }> =
       (forwardBody) => forwardQueueWrite(c, hostId, "/api/queue/create", forwardBody),
+    delivery: "forwarded" | "in-process" = "forwarded",
   ): Promise<Response> {
     const repo = getRepo(c);
     const source = repo.getById(qitemId);
@@ -455,8 +671,12 @@ export function queueRoutes(): Hono {
       );
     }
 
-    // (2) The deterministic successor identity + forwarded body.
-    const effectiveTags = body.tags ?? source.tags ?? undefined;
+    // (2) The deterministic successor identity + forwarded body. The goal's return route goes with the work, naming the host
+    // it's on. Without this host's id it can't say where the conversation is, so the work goes without it, and the response,
+    // the source row and the successor say so; the route is never sent as a bare address the other host would read as its own.
+    const carriedRoute = source.returnRoute ? hostQualifiedRoute(source.returnRoute) : null;
+    const routeNotCarried = source.returnRoute && !carriedRoute ? routeNotCarriedMessage(source.returnRoute) : null;
+    const effectiveTags = withRouteNotCarriedTag(body.tags ?? source.tags ?? undefined, routeNotCarried);
     const forwardBody: Record<string, unknown> = {
       qitemId: successorId,
       // 51-09 incr 4a — stamp-at-FORWARD: this forwarding daemon IS the origin,
@@ -478,6 +698,7 @@ export function queueRoutes(): Hono {
       ...(body.evidenceRef !== undefined ? { evidenceRef: body.evidenceRef } : {}),
       ...(body.nudge !== undefined ? { nudge: body.nudge } : {}),
       ...(body.humanAlert !== undefined ? { humanAlert: body.humanAlert } : {}),
+      ...(carriedRoute ? { returnRoute: carriedRoute, returnRouteBasis: source.returnRouteBasis ?? "named" } : {}),
     };
 
     // (3) Successor-create FIRST — origin-owns-the-record; failure leaves the
@@ -502,10 +723,40 @@ export function queueRoutes(): Hono {
     } catch (err) {
       return errorResponse(c, err);
     }
+    const notCarriedNote = routeNotCarried ? `${RETURN_ROUTE_NOTE_PREFIX}not-carried: ${routeNotCarried}` : null;
+    if (notCarriedNote && !repo.listTransitions(source.qitemId).some(t => t.transitionNote === notCarriedNote)) {
+      repo.transitionLog.append({ qitemId: source.qitemId, state: closed.item.state, actorSession: body.fromSession, transitionNote: notCarriedNote });
+    }
 
-    // Same {closed, created} shape as the local transactional handoff;
-    // `created` is the origin daemon's row, verbatim.
-    return c.json({ closed: closed.item, created: fwd.payload }, 201);
+    // `created` is the origin daemon's row, verbatim. The origin can also report
+    // that its own scope check was skipped, without pretending the forwarding
+    // daemon inspected remote filesystem state.
+    const receiverReportedTags = fwd.payload && typeof fwd.payload === "object" && !Array.isArray(fwd.payload)
+      ? (fwd.payload as { tags?: unknown }).tags
+      : undefined;
+    const hasAcceptedTags = receiverReportedTags === null || Array.isArray(receiverReportedTags);
+    const acceptedTags = Array.isArray(receiverReportedTags)
+      ? receiverReportedTags.filter((tag): tag is string => typeof tag === "string")
+      : [];
+    const requestedTags = forwardBody.tags as string[];
+    const acceptedScopeTags = acceptedTags.filter((tag) => tag !== HUMAN_ALERT_TAG);
+    const requestedScopeTags = requestedTags.filter((tag) => tag !== HUMAN_ALERT_TAG);
+    const acceptedTagsMatchRequest = acceptedScopeTags.length === requestedScopeTags.length
+      && acceptedScopeTags.every((tag, index) => tag === requestedScopeTags[index]);
+    const scopeCheckRequested = c.req.header(CLI_HANDOFF_SCOPE_ADVISORY_HEADER) === "1";
+    const scopeCheck = scopeCheckRequested
+      ? skippedCreateScopeAdvisory(hasAcceptedTags ? acceptedTags : requestedTags)
+      : null;
+    const scopeAdvisory = scopeCheck ? toCreateScopeAdvisory(scopeCheck, {
+      verb: terminalState === "done" ? "handoff-and-complete" : "handoff",
+      tagSource: hasAcceptedTags && acceptedTagsMatchRequest ? (body.tags == null ? "inherited" : "explicit") : "unknown",
+      delivery,
+    }) : null;
+    const advisories = [...(scopeAdvisory ? [scopeAdvisory] : []),
+      ...(routeNotCarried ? [{ code: RETURN_ROUTE_NOT_CARRIED, message: routeNotCarried }] : [])];
+    return c.json({ closed: closed.item, created: fwd.payload,
+      ...(advisories.length ? { advisories } : {}),
+      ...(scopeCheckRequested ? { [HANDOFF_SCOPE_CHECK_ACKNOWLEDGED]: true } : {}) }, 201);
   }
 
   /**
@@ -529,7 +780,9 @@ export function queueRoutes(): Hono {
       if (refusal) return { ok: false, response: refusal };
       try {
         // Recorded as the receiving /create records a forwarded write: no transport header, so claimed:v1.
-        const item = await getRepo(c).create({ ...input, identityProvenance: "claimed:v1" });
+        // A route naming this host is one of this host's own addresses.
+        const route = typeof input.returnRoute === "string" ? canonicalSenderSession(input.returnRoute) : input.returnRoute;
+        const item = await getRepo(c).create({ ...input, ...(route ? { returnRoute: route } : {}), identityProvenance: "claimed:v1" });
         const advisory = destinationAdvisory(c, item.destinationSession);
         return { ok: true, payload: { ...item, ...(advisory ? { advisories: [advisory] } : {}) } };
       } catch (err) {
@@ -538,8 +791,30 @@ export function queueRoutes(): Hono {
     };
   }
 
+  /** #3728: leaves a trace in the event log when /create refuses (a 4xx), or a forwarded write's result is unknown. It only
+   *  reads the response the handler already decided, so nothing the caller receives changes. */
+  async function traceCreateOutcome(c: Context, next: () => Promise<void>): Promise<void> {
+    await next();
+    const status = c.res.status;
+    if (status < 400) return;
+    const payload = await c.res.clone().json().catch(() => null) as Record<string, unknown> | null;
+    const sent = await c.req.json<{ destinationSession?: unknown; hostId?: unknown; qitemId?: unknown }>().catch(() => ({} as never));
+    const text = (value: unknown): string | null => typeof value === "string" && value ? value : null;
+    // The actor /create resolved (a body claim when no header came), else the transport sender.
+    const sourceSession = text(c.get("refusalSource" as never)) ?? transportSenderSession(c) ?? null;
+    const destinationSession = text(sent.destinationSession);
+    if (status === 502 && payload?.error === "remote_queue_write_failed" && payload.outcome === "indeterminate") {
+      recordRefusal(getEventBus(c), { type: "queue.create_remote_unknown", qitemId: text(c.get("refusalQitemId" as never)) ?? text(sent.qitemId), sourceSession, destinationSession,
+        hostId: text(payload.hostId) ?? text(sent.hostId) ?? "unknown", failureClass: text(payload.failureClass) ?? "unknown" });
+      return;
+    }
+    if (status >= 500 && payload?.error !== "remote_queue_write_failed") return; // a daemon fault, not a refusal
+    recordRefusal(getEventBus(c), { type: "queue.create_refused", sourceSession, destinationSession, reason: refusalReason(payload), status,
+      hostId: text(sent.hostId) });
+  }
+
   // POST /create
-  app.post("/create", async (c) => {
+  app.post("/create", traceCreateOutcome, async (c) => {
     const body = await c.req.json<{
       qitemId?: string;
       sourceSession?: string;
@@ -564,15 +839,52 @@ export function queueRoutes(): Hono {
       // session string stays member@rig; the host is NEVER in-string).
       // Absent / "" / "local" = today's local path, byte-identical.
       hostId?: string;
+      /** The first-user return route (return-route.ts): auto, self, or an agent conversation's queue address. */
+      returnRoute?: string;
+      /** How a route carried from another host was established there. */
+      returnRouteBasis?: string;
     }>().catch(() => ({} as never));
+
+    // The return route, when the caller asks for one: `auto` issues a conversation address for this create (from its id, so
+    // an exact retry issues the same one), `self` takes the caller's own identity, and anything else is an address the
+    // caller named. Absent, the create is exactly as before.
+    const requestedRoute = typeof body.returnRoute === "string" ? body.returnRoute.trim() : undefined;
+    if (body.returnRoute !== undefined && (!requestedRoute
+      || (requestedRoute !== "auto" && requestedRoute !== "self" && !isRouteAddress(canonicalSenderSession(requestedRoute))))) {
+      return c.json({ error: "invalid_return_route", message: "A return route is auto, self, or an agent conversation's queue address (member@rig). A person is reached through the gateway, not a return route." }, 400);
+    }
+    const createId = body.qitemId ?? (requestedRoute ? newQitemId() : undefined);
+    const issued = requestedRoute === "auto" ? issuedReturnAddress(createId!) : null;
 
     // P21 I3 — the source is the transport-derived sender (X-OpenRig-Session), NEVER the body claim.
     // P18 deliver-and-label: absent header + a body sourceSession → recorded as the claimed-era stamp
     // claimed:v1; absent header + no body → 400 actor_required; a body sourceSession that DIFFERS from the
     // header → the wire SUPERSEDES it (transport:v1), not a 409. `sourceSession` below is authoritative.
-    const identity = requireSenderIdentity(c, { verb: "queue create", bodyClaim: body.sourceSession });
+    // A caller with neither that asks for an issued route is declared by it: the issued address is the row's actor,
+    // recorded as claimed:v1 (declared here, not verified), never as a transport identity. A known caller keeps its own.
+    const derived = requireSenderIdentity(c, { verb: "queue create", bodyClaim: body.sourceSession });
+    const identity: typeof derived = !derived.ok && issued ? { ok: true, session: issued, provenance: "claimed:v1" } : derived;
     if (!identity.ok) return identity.response;
     const sourceSession = identity.session;
+    c.set("refusalSource" as never, sourceSession as never); // read by traceCreateOutcome
+    let route: { address: string; basis: ReturnRouteBasis } | null = requestedRoute === undefined ? null
+      : requestedRoute === "auto" ? { address: issued!, basis: sourceSession === issued ? "issued-actor" : "issued" }
+        : requestedRoute === "self" ? { address: sourceSession, basis: "caller" }
+          : { address: canonicalSenderSession(requestedRoute), basis: carriedRouteBasis(requestedRoute, body.returnRouteBasis) };
+    if (route && !isRouteAddress(route.address)) {
+      return c.json({ error: "invalid_return_route", message: `--return-route self takes the caller's own address, and this caller is ${sourceSession}, which isn't an agent conversation's queue address. Use auto, or name the address.` }, 400);
+    }
+    // A registered person's alias on this host is a person, reached through the gateway: the work goes on without that route,
+    // and the response and the row say so. An unreadable registry decides nothing.
+    let routeNotKept: string | null = null;
+    if (route && route.basis !== "issued" && route.basis !== "issued-actor" && !splitRoute(route.address).host) {
+      let person = false;
+      try { person = getRepo(c).isHumanDestination(route.address); } catch { /* unreadable registry: the route is kept as given */ }
+      if (person) {
+        routeNotKept = routeIsPersonMessage(route.address);
+        route = null;
+      }
+    }
     { const held = switchCustody(c, sourceSession); if (held) return held; }
     // Required destination and body, then PL-007: validate target_repo against
     // source rig's workspace.repos[].
@@ -595,32 +907,58 @@ export function queueRoutes(): Hono {
     if (typeof body.hostId === "string" && !resolvesToLocalHost(body.hostId, getSelfHostId())) {
       if (body.classificationBinding !== undefined)
         return c.json({ error: "invalid_classification_binding", message: "Classifier-bound effects belong to this daemon's local queue." }, 400);
-      const mintedId = body.qitemId ?? newQitemId();
-      const { hostId: _dropped, ...rest } = body;
+      const mintedId = createId ?? newQitemId();
+      c.set("refusalQitemId" as never, mintedId as never); // read by traceCreateOutcome
+      // The route names this host, so the receiving daemon never reads it as one of its own addresses. Without this host's id
+      // the work goes without the route, and the response and the row say so.
+      const carried = route ? hostQualifiedRoute(route.address) : null;
+      const routeNotCarried = routeNotKept ?? (route && !carried ? routeNotCarriedMessage(route.address) : null);
+      const { hostId: _dropped, returnRoute: _route, returnRouteBasis: _basis, ...rest } = body;
       const forwardBody: Record<string, unknown> = {
         ...rest,
+        ...(route && carried ? { returnRoute: carried, returnRouteBasis: route.basis } : {}),
         qitemId: mintedId,
         // 51-09 incr 4a — stamp-at-FORWARD: this forwarding daemon is the origin,
         // so it stamps its OWN self-id (overriding the bare spread) before the
         // remote create() runs — else the remote would forge member@rig@RECEIVER.
         sourceSession: c.req.header(ORIGIN_UNKNOWN_HEADER) === "true" ? sourceSession : stampSelfHostSuffix(sourceSession),
-        tags: crossHostProvenanceTags(body.tags),
+        tags: crossHostProvenanceTags(withRouteNotCarriedTag(body.tags, routeNotCarried)),
       };
-      const fwd = await forwardQueueWrite(c, body.hostId, "/api/queue/create", forwardBody);
-      return fwd.ok ? c.json(fwd.payload as Record<string, unknown>, fwd.status as 200) : fwd.response;
+      // #3018: relay this daemon's resolved sender (relayedSenderHeaders), so the host that keeps the
+      // record writes a relayed actor instead of falling back to a bare body claim.
+      const fwd = await forwardQueueWrite(c, body.hostId, "/api/queue/create", forwardBody, true);
+      if (!fwd.ok) return fwd.response;
+      const skippedScope = skippedCreateScopeAdvisory(body.tags);
+      const payload = fwd.payload;
+      // A same-id retry returns the row the receiver already stored: say the route wasn't carried only when it has none.
+      const returnedRoute = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+        && typeof (payload as { returnRoute?: unknown }).returnRoute === "string";
+      const added = [...(skippedScope ? [toCreateScopeAdvisory(skippedScope)] : []),
+        ...(routeNotCarried && !returnedRoute ? [{ code: RETURN_ROUTE_NOT_CARRIED, message: routeNotCarried }] : [])];
+      if (!added.length || payload === null || typeof payload !== "object" || Array.isArray(payload))
+        return c.json(payload, fwd.status as 200);
+      const objectPayload = payload as Record<string, unknown>;
+      const existingAdvisories = Array.isArray(objectPayload.advisories) ? objectPayload.advisories : [];
+      return c.json({ ...objectPayload, advisories: [...existingAdvisories, ...added] }, fwd.status as 200);
     }
 
     try {
       const fence = classificationRefusal(c, sourceSession, body.classificationBinding);
       if (fence) return fence;
+      // Work a seat gives out as a new row keeps the route of the one routed row it holds, so its prompts still reach the
+      // person's conversation (return-route.ts). A route named here, or none at all, is unchanged.
+      if (requestedRoute === undefined && !route) {
+        const inherited = inheritedReturnRoute(getRepo(c).db, sourceSession, body.destinationSession!);
+        if (inherited) route = { address: inherited, basis: "inherited" };
+      }
       const item = await getRepo(c).create({
-        qitemId: body.qitemId,
+        qitemId: createId,
         sourceSession,
         destinationSession: body.destinationSession!, // required by createInputRefusal
         body: body.body!,
         priority: body.priority,
         tier: body.tier,
-        tags: body.tags,
+        tags: withRouteNotCarriedTag(body.tags, routeNotKept),
         expiresAt: body.expiresAt,
         chainOfRecord: body.chainOfRecord,
         targetRepo: body.targetRepo,
@@ -631,13 +969,122 @@ export function queueRoutes(): Hono {
         humanQuestions: body.humanQuestions,
         summary: body.summary,
         evidenceRef: body.evidenceRef,
+        evidenceRefRoots: evidenceRefRootsFrom(c),
         nudge: (body as { nudge?: boolean }).nudge,
         ...resolveRecordedIdentity(c, identity), // P21 §4 era-stamp, plus the MCP adapter's caller on a direct attributed request (principal:v1)
+        ...(route ? { returnRoute: route.address, returnRouteBasis: route.basis } : {}),
       });
-      const advisories = [destinationAdvisory(c, item.destinationSession), sharedChannelAskAdvisory(item.destinationSession, body.humanIntent)].filter(Boolean);
+      const scopeAdvisory = !(body.tags ?? []).includes(CROSS_HOST_TAG) ? createScopeAdvisory(c, item.tags) : null;
+      const advisories = [destinationAdvisory(c, item.destinationSession), sharedChannelAskAdvisory(item.destinationSession, body.humanIntent), scopeAdvisory,
+        // A same-id retry returns the stored row unchanged: say the route wasn't kept only when that row has none.
+        routeNotKept && !item.returnRoute ? { code: RETURN_ROUTE_NOT_CARRIED, message: routeNotKept } : null].filter(Boolean);
       return c.json({ ...item, ...(advisories.length ? { advisories } : {}) }, 201);
     } catch (err) {
       return errorResponse(c, err);
+    }
+  });
+
+  // POST /erase — queue erasure in one exact scope: account deletion (members, the account's recorded sessions),
+  // explicit ids (a ledger's reapply after a restore), or the routine closed-work windows from this daemon's settings,
+  // run now. A dry run unless apply is true. domain/queue-erasure.ts; docs/reference/queue-erasure.md.
+  app.post("/erase", async (c) => {
+    const body = await c.req.json<{ members?: unknown; rig?: unknown; ids?: unknown; action?: unknown; routine?: unknown; apply?: unknown; actorSession?: string }>()
+      .catch(() => ({} as never));
+    const identity = requireSenderIdentity(c, { verb: "queue erase", bodyClaim: body.actorSession });
+    if (!identity.ok) return identity.response;
+    const refuse = (error: string, message: string) => c.json({ error, message }, 400);
+    const settings = c.get("settingsStore" as never) as { resolveOne(key: string): { value: unknown } } | undefined;
+    const named = [body.members !== undefined, body.ids !== undefined, body.routine !== undefined].filter(Boolean).length;
+    if (named === 0) return refuse("erase_scope_required", "Name one scope: members (account deletion), ids, or routine.");
+    if (named > 1) return refuse("erase_scope_conflict", "Name exactly one scope: members, ids, or routine.");
+    const exactList = (value: unknown): string[] | null =>
+      Array.isArray(value) && value.length > 0 && value.every((entry) => typeof entry === "string" && entry.length > 0 && entry.trim() === entry)
+        ? value as string[] : null;
+    let scope: EraseScope;
+    if (body.rig !== undefined && (body.members === undefined || typeof body.rig !== "string" || body.rig.length === 0 || body.rig.trim() !== body.rig)) {
+      return refuse("erase_rig_invalid", "rig is the account rig's id, given with members.");
+    }
+    if (body.members !== undefined) {
+      // An empty list, given with rig, is an account rig that never had a member; the erasure checks the rig's history.
+      const members = Array.isArray(body.members) && body.members.length === 0 && typeof body.rig === "string" ? [] : exactList(body.members);
+      if (!members) {
+        return refuse("erase_members_invalid", "members must be a non-empty list of exact session names, or [] with rig for an account rig that never had a member.");
+      }
+      scope = { kind: "members", members, ...(typeof body.rig === "string" ? { rig: body.rig } : {}) };
+    } else if (body.ids !== undefined) {
+      // Plain ids take the request's action (delete by default); a report's qitems entries keep their own.
+      const fallback = body.action ?? "delete";
+      const isAction = (value: unknown): value is EraseAction => value === "delete" || value === "scrub";
+      if (!isAction(fallback)) return refuse("erase_action_invalid", "action must be delete or scrub.");
+      const raw = Array.isArray(body.ids) ? body.ids : [];
+      // An erasure ledger's commit and abort lines ({batch, committed}) say which of its batches committed.
+      type Mark = { batch: string; committed: boolean };
+      const isMark = (entry: unknown): entry is Mark => !!entry && typeof entry === "object"
+        && (entry as { qitemId?: unknown }).qitemId === undefined && typeof (entry as { batch?: unknown }).batch === "string"
+        && typeof (entry as { committed?: unknown }).committed === "boolean";
+      const commits = raw.filter(isMark).map(({ batch, committed }) => ({ batch, committed }));
+      const listed = raw.filter((entry) => !isMark(entry));
+      const entries = listed.map((entry) => typeof entry === "string" ? { qitemId: entry, action: fallback as EraseAction }
+        : entry && typeof entry === "object" ? { qitemId: (entry as { qitemId?: unknown }).qitemId, action: (entry as { action?: unknown }).action ?? fallback,
+          batch: (entry as { batch?: unknown }).batch }
+        : null);
+      if (listed.length === 0 || entries.some((entry) => !entry || typeof entry.qitemId !== "string" || entry.qitemId.length === 0
+        || entry.qitemId.trim() !== entry.qitemId || (entry.batch !== undefined && typeof entry.batch !== "string"))) {
+        return refuse("erase_ids_invalid", "ids must be a non-empty list of qitem ids, or of {qitemId, action} entries.");
+      }
+      if (entries.some((entry) => !isAction(entry!.action))) return refuse("erase_action_invalid", "action must be delete or scrub.");
+      scope = { kind: "ids", entries: entries.map((entry) => ({ qitemId: entry!.qitemId as string, action: entry!.action as EraseAction,
+        ...(typeof entry!.batch === "string" ? { batch: entry!.batch } : {}) })), ...(commits.length > 0 ? { commits } : {}) };
+    } else {
+      const days = (key: string): number => {
+        const value = settings?.resolveOne(key).value;
+        return typeof value === "number" ? value : 0;
+      };
+      const contentDays = days("retention.closed_content_days");
+      const metadataDays = days("retention.closed_metadata_days");
+      if (contentDays === 0 && metadataDays === 0) {
+        return refuse("erase_routine_off", "retention.closed_content_days and retention.closed_metadata_days are both 0 (off).");
+      }
+      scope = { kind: "routine", contentDays, metadataDays };
+    }
+    // Whose host a host-qualified address at the rig names, for a never-member erase. Another host is proved only by a
+    // registered entry whose identity is established (declared, or a learned binding still eligible) and differs from this
+    // daemon's known id. This daemon's id, or an entry established as it, is this host. Anything else (an entry known only
+    // by its label, or no known id for this daemon) is unknown, which refuses. Routing is unchanged.
+    const registryLoader = (c.get("hostRegistryLoader" as never) as (() => ReturnType<typeof loadHostRegistry>) | undefined) ?? loadHostRegistry;
+    const bindingsLoader =
+      (c.get("hostBindingsLoader" as never) as (() => ReturnType<typeof loadLearnedHostBindings>) | undefined) ?? loadLearnedHostBindings;
+    let hosts: { registry: Parameters<typeof eligibleQueueBindings>[0]; learned: ReturnType<typeof eligibleQueueBindings> } | null | undefined;
+    const classifyHost = (host: string): HostClass => {
+      const self = getSelfHostId();
+      if (resolvesToLocalHost(host, self)) return "self";
+      if (self === null) return "unknown";
+      if (hosts === undefined) {
+        const reg = registryLoader();
+        hosts = reg.ok ? { registry: reg.registry, learned: eligibleQueueBindings(reg.registry, bindingsLoader()) } : null;
+      }
+      const known = hosts;
+      if (!known) return "unknown";
+      const match = resolveHost(known.registry, host, known.learned);
+      if (!match.ok) return "unknown";
+      const identity = match.host.hostId ?? known.learned[match.host.id]?.hostId;
+      if (identity === undefined) return "unknown";
+      return identity === self ? "self" : "other";
+    };
+    try {
+      const ledger = settings?.resolveOne("retention.erasure_ledger").value;
+      const report = await eraseQueue(c.get("db" as never) as Database.Database, {
+        scope, apply: body.apply === true, nowIso: new Date().toISOString(), classifyHost,
+        ...(typeof ledger === "string" && ledger.length > 0 ? { ledgerPath: ledger } : {}),
+      });
+      console.log(`[queue-erase] ${identity.session} ${scope.kind} ${report.applied ? "applied" : "dry run"}: `
+        + `${report.qitems.length} rows, ${report.mixed.length} mixed, ${report.gaps.length} gaps, complete=${report.complete}, `
+        + `clean=${report.clean}${report.error ? `, stopped at ${report.error.stage}: ${report.error.message}` : ""}`);
+      // A run that stopped on an error still returns what it committed, so its ids reach the caller's ledger.
+      return c.json(report, report.error ? 500 : 200);
+    } catch (err) {
+      if (err instanceof EraseRefusal) return refuse(err.code, err.message);
+      return c.json({ error: "erase_failed", message: err instanceof Error ? err.message : String(err) }, 500);
     }
   });
 
@@ -707,6 +1154,7 @@ export function queueRoutes(): Hono {
       actorSession?: string;
       classificationBinding?: unknown;
       state?: QueueState;
+      expectState?: QueueState | null;
       reopen?: boolean;
       closureRequiredAt?: string;
       transitionNote?: string;
@@ -735,6 +1183,8 @@ export function queueRoutes(): Hono {
         qitemId,
         actorSession,
         state: body.state,
+        // Optional compare-and-set: the repository checks it inside the update's transaction.
+        expectState: body.expectState,
         reopen: body.reopen,
         closureRequiredAt: body.closureRequiredAt,
         transitionNote: body.transitionNote,
@@ -749,9 +1199,34 @@ export function queueRoutes(): Hono {
         wakeAfterSeconds: body.wakeAfterSeconds,
         summary: body.summary,
         evidenceRef: body.evidenceRef,
+        evidenceRefRoots: evidenceRefRootsFrom(c),
         ...resolveRecordedIdentity(c, identity), // P21 §4 era-stamp, plus the MCP adapter's caller on a direct attributed request (principal:v1)
       });
-      return c.json(item);
+      const advisories = [body.state === "blocked" ? parkWithoutWakeAdvisory(item) : null, ...unstoredAdvisories(body, item)]
+        .filter((advisory) => advisory !== null);
+      return c.json({ ...item, ...(advisories.length > 0 ? { advisories } : {}) });
+    } catch (err) {
+      return errorResponse(c, err);
+    }
+  });
+
+  // POST /:qitemId/tags — add tags to a row, in any state ({ add: [...] }). Add-only: existing tags stay, a tag the
+  // row already has adds nothing, and nothing else about the row changes. The actor is the transport-derived sender,
+  // as for update, and the tags added are recorded on a transition naming it.
+  app.post("/:qitemId/tags", async (c) => {
+    const qitemId = c.req.param("qitemId");
+    const body = await c.req.json<{ add?: unknown; actorSession?: string }>().catch(() => ({} as never));
+    const identity = requireSenderIdentity(c, { verb: "queue tag", bodyClaim: body.actorSession });
+    if (!identity.ok) return identity.response;
+    const actorSession = identity.session;
+    { const held = switchCustody(c, actorSession); if (held) return held; }
+    const add = body.add;
+    if (!Array.isArray(add) || add.length === 0 || !add.every((tag) => typeof tag === "string" && tag.trim().length > 0)) {
+      return c.json({ error: "tags_required", message: "add takes one or more non-blank tags; nothing was written" }, 400);
+    }
+    try {
+      const { item, added } = getRepo(c).addTags({ qitemId, actorSession, tags: add as string[], ...resolveRecordedIdentity(c, identity) });
+      return c.json({ ...item, added });
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -817,7 +1292,7 @@ export function queueRoutes(): Hono {
     // Exact self id: finish a handoff that an earlier self-forward already started.
     if (typeof body.hostId === "string" && body.hostId === getSelfHostId()
       && priorSelfForwardSuccessor(c, qitemId, crossHostBody.toSession, body.hostId)) {
-      return crossHostHandoff(c, qitemId, body.hostId, "handed-off", crossHostBody, createSuccessorInProcess(c));
+      return crossHostHandoff(c, qitemId, body.hostId, "handed-off", crossHostBody, createSuccessorInProcess(c), "in-process");
     }
 
     try {
@@ -833,12 +1308,22 @@ export function queueRoutes(): Hono {
         targetRepo: body.targetRepo,
         summary: body.summary,
         evidenceRef: body.evidenceRef,
+        evidenceRefRoots: evidenceRefRootsFrom(c),
         nudge: (body as { nudge?: boolean }).nudge,
         humanAlert: body.humanAlert,
         ...resolveRecordedIdentity(c, identity), // P21 §4 era-stamp, plus the MCP adapter's caller on a direct attributed request (principal:v1)
       });
-      const advisory = destinationAdvisory(c, result.created.destinationSession);
-      return c.json({ ...result, ...(advisory ? { advisories: [advisory] } : {}) }, 201);
+      const destination = destinationAdvisory(c, result.created.destinationSession);
+      const scopeCheckRequested = c.req.header(CLI_HANDOFF_SCOPE_ADVISORY_HEADER) === "1";
+      const scope = scopeCheckRequested
+        ? createScopeAdvisory(c, result.created.tags, {
+          verb: "handoff",
+          tagSource: body.tags == null ? "inherited" : "explicit",
+        })
+        : null;
+      const advisories = [destination, scope].filter(Boolean);
+      return c.json({ ...result, ...(advisories.length > 0 ? { advisories } : {}),
+        ...(scopeCheckRequested ? { [HANDOFF_SCOPE_CHECK_ACKNOWLEDGED]: true } : {}) }, 201);
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -902,7 +1387,7 @@ export function queueRoutes(): Hono {
     // Exact self id: finish a handoff that an earlier self-forward already started.
     if (typeof body.hostId === "string" && body.hostId === getSelfHostId()
       && priorSelfForwardSuccessor(c, qitemId, crossHostBody.toSession, body.hostId)) {
-      return crossHostHandoff(c, qitemId, body.hostId, "done", crossHostBody, createSuccessorInProcess(c));
+      return crossHostHandoff(c, qitemId, body.hostId, "done", crossHostBody, createSuccessorInProcess(c), "in-process");
     }
 
     try {
@@ -918,12 +1403,44 @@ export function queueRoutes(): Hono {
         targetRepo: body.targetRepo,
         summary: body.summary,
         evidenceRef: body.evidenceRef,
+        evidenceRefRoots: evidenceRefRootsFrom(c),
         nudge: body.nudge,
         humanAlert: body.humanAlert,
         identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header named the actor here, else claimed:v1 (resolveRecordedProvenance degrades)
       });
-      const advisory = destinationAdvisory(c, result.created.destinationSession);
-      return c.json({ ...result, ...(advisory ? { advisories: [advisory] } : {}) }, 201);
+      const destination = destinationAdvisory(c, result.created.destinationSession);
+      const scopeCheckRequested = c.req.header(CLI_HANDOFF_SCOPE_ADVISORY_HEADER) === "1";
+      const scope = scopeCheckRequested
+        ? createScopeAdvisory(c, result.created.tags, {
+          verb: "handoff-and-complete",
+          tagSource: body.tags == null ? "inherited" : "explicit",
+        })
+        : null;
+      const advisories = [destination, scope].filter(Boolean);
+      return c.json({ ...result, ...(advisories.length > 0 ? { advisories } : {}),
+        ...(scopeCheckRequested ? { [HANDOFF_SCOPE_CHECK_ACKNOWLEDGED]: true } : {}) }, 201);
+    } catch (err) {
+      return errorResponse(c, err);
+    }
+  });
+
+  app.post("/:qitemId/relayed-answer", async (c) => {
+    const body = await c.req.json<Record<string, unknown> | null>().catch(() => null);
+    const { attributedTo, text, channel, questionId, optionId, answeredAt, actor } = body ?? {};
+    if (typeof attributedTo !== "string" || !attributedTo.trim() || typeof text !== "string" || !text.trim()
+      || typeof channel !== "string" || !channel.trim() || (questionId !== undefined && typeof questionId !== "string")
+      || (optionId !== undefined && typeof optionId !== "string")
+      || (answeredAt !== undefined && (typeof answeredAt !== "string"
+        || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.test(answeredAt) || !Number.isFinite(Date.parse(answeredAt))))) {
+      return c.json({ error: "invalid_relayed_answer", message: "Pass attributedTo, verbatim text and channel; name questionId/optionId as applicable, and supply answeredAt as an ISO timestamp only if known." }, 400);
+    }
+    const identity = requireSenderIdentity(c, { verb: "relay an answer", bodyClaim: typeof actor === "string" ? actor : null });
+    if (!identity.ok) return identity.response;
+    { const held = switchCustody(c, identity.session); if (held) return held; }
+    try {
+      return c.json(getRepo(c).writeRelayedAnswer({ qitemId: c.req.param("qitemId"), actorSession: identity.session,
+        identityProvenance: resolveRecordedProvenance(c, identity),
+        relay: { attributedTo, text, channel, questionId, optionId, answeredAt } }));
     } catch (err) {
       return errorResponse(c, err);
     }
@@ -1013,6 +1530,7 @@ export function queueRoutes(): Hono {
     // workspace.root, and the trace can only ascend to a root it knows (#2693).
     let workRoots: string[] = [];
     let catalogPath: string | null = null;
+    let catalogError: unknown;
     try {
       catalogPath = projectCatalogPaths(c).catalog;
     } catch {
@@ -1024,30 +1542,66 @@ export function queueRoutes(): Hono {
       if (entries) {
         catalogStatus = "usable";
         const projects = listProjects(c).projects;
-        projectMissionsRoots = new Map(projects.map((project) => [project.id, {
+        // A former id a project declares resolves to that project's root too (#3261).
+        projectMissionsRoots = new Map(projects.flatMap((project) => projectIdsOf(project).map((id) => [id, {
           root: project.error ? null : project.missionsRoot,
           error: project.error,
-        }]));
+        }] as const)));
         workRoots = projects.filter((project) => !project.error).map((project) => project.root);
       }
-    } catch {
+    } catch (error) {
       catalogStatus = "unavailable";
+      catalogError = error;
+    }
+    // The project this seat's broad refocus orientation belongs to when no typed baton names
+    // one (#3320), chosen as work-install chooses: the only catalog entry, then the rig's
+    // association, the seat's working folder, the only unclaimed entry. No unique answer is
+    // reported with its reason, never guessed.
+    let workProject: { id: string; root: string; selectedBy: string } | { error: string } | undefined;
+    const unselected = (error: unknown) => {
+      const candidates = error instanceof ProjectReadError && error.candidates?.length ? ` (candidates: ${error.candidates.join(", ")})` : "";
+      return { error: `${error instanceof Error ? error.message : String(error)}${candidates}` };
+    };
+    // An unreadable catalog selects nothing; say why, and the trace keeps the workspace root.
+    if (catalogStatus === "unavailable") workProject = unselected(catalogError);
+    if (catalogPath && catalogStatus === "usable") {
+      try {
+        const only = selectCatalogProject(catalogPath);
+        if (only) workProject = { ...only, selectedBy: "single" };
+      } catch (error) {
+        if (error instanceof ProjectReadError && error.code === "project_required") {
+          let cwd: string | null = null;
+          try {
+            const db = c.get("db" as never) as Database.Database | undefined;
+            const seat = db && db.prepare("SELECT n.cwd FROM sessions s JOIN nodes n ON n.id = s.node_id WHERE s.session_name = ? ORDER BY s.created_at DESC, s.rowid DESC LIMIT 1")
+              .get(physicalSessionName(db, session)) as { cwd: string | null } | undefined;
+            cwd = seat?.cwd ?? null;
+          } catch { /* No recorded working folder: selection continues without it. */ }
+          try { workProject = inferCatalogProject(catalogPath, error, { rigName: rigFromSession(session), cwd }, []); }
+          catch (inferred) { workProject = unselected(inferred); }
+        } else workProject = unselected(error);
+      }
     }
     const currentWorkRoot: MissionsRootResolver = (row: CurrentWorkRow) => {
       const projectIds = [...new Set((row.tags ?? []).flatMap((tag) => tag.split(",").map((part) => part.trim()))
         .filter((tag) => tag.startsWith("project:") && tag.slice("project:".length).trim())
         .map((tag) => tag.slice("project:".length).trim()))];
       if (projectIds.length === 0) return { root: missionsRoot };
+      // Whether another root could hold a same-named mission when the configured root stands in for the row's project:
+      // an unreadable catalogue can't say, and a readable one can only if it lists project roots. With no catalogue
+      // configured the configured root is the only one, so the stand-in is no ambiguity (the reasons are unchanged).
+      const otherRoots = catalogStatus === "unavailable" || (catalogStatus === "usable" && projectMissionsRoots.size > 0);
       if (projectIds.length !== 1) {
-        return { root: missionsRoot, reason: `multiple project tags (${projectIds.join(", ")}); used configured root` };
+        return { root: missionsRoot, reason: `multiple project tags (${projectIds.join(", ")}); used configured root`, ambiguous: otherRoots };
       }
       const projectId = projectIds[0]!;
       if (catalogStatus !== "usable") {
-        return { root: missionsRoot, reason: `project:${projectId} could not be used because the workspace catalog is ${catalogStatus === "missing" ? "not configured" : "unavailable"}; used configured root` };
+        return { root: missionsRoot, reason: `project:${projectId} could not be used because the workspace catalog is ${catalogStatus === "missing" ? "not configured" : "unavailable"}; used configured root`, ambiguous: otherRoots };
       }
       const project = projectMissionsRoots.get(projectId);
-      if (!project) return { root: missionsRoot, reason: `project:${projectId} is not in the project catalogue; used configured root` };
-      if (project.error || !project.root) return { root: missionsRoot, reason: `project:${projectId} is unavailable in the project catalogue; used configured root` };
+      if (!project) return { root: missionsRoot, reason: `project:${projectId} is not in the project catalogue; used configured root`, ambiguous: otherRoots };
+      // The row's own project is catalogued but its root can't be read: its mission may be there.
+      if (project.error || !project.root) return { root: missionsRoot, reason: `project:${projectId} is unavailable in the project catalogue; used configured root`, ambiguous: true };
       return { root: project.root };
     };
     // Deliberately NOT position.asDestination.recent: that is a capped, mixed-state display
@@ -1070,30 +1624,44 @@ export function queueRoutes(): Hono {
         ?.resolve({ sessionName: transportSenderSession(c) ?? session, compact: true });
       role = deriveRole(c.get("db" as never) as Database.Database | undefined, identity?.identity.nodeId ?? null);
     } catch { /* Ambiguous/unavailable identity is not an absent role declaration. */ }
-    // OPR.0.7.0.12: labelled work candidates for the refocus packet, only on request, so the
-    // default answer is unchanged. In-progress rows are the candidate evidence, so they come
-    // from the same unbounded read as the derivation; held and next work are bounded display lists.
+    // Held and next work are bounded display lists, read only in blocked and pending states.
     // Each list gets its own bound, so newer pending rows can never push a set-aside row out of
     // "held" (a parked row silently missing there is the costliest miss).
-    if (c.req.query("candidates") === "1") {
+    const readHeldAndNext = () => {
       const held = repo.list({ destinationSession: session, state: ["blocked"], limit: WORK_CANDIDATE_LIST_LIMIT + 1 });
       const next = repo.list({ destinationSession: session, state: ["pending"], limit: WORK_CANDIDATE_LIST_LIMIT + 1 });
-      const heldTruncated = held.length > WORK_CANDIDATE_LIST_LIMIT;
-      const nextTruncated = next.length > WORK_CANDIDATE_LIST_LIMIT;
-      const workCandidates = deriveWorkCandidates(
-        [...inProgress, ...held.slice(0, WORK_CANDIDATE_LIST_LIMIT), ...next.slice(0, WORK_CANDIDATE_LIST_LIMIT)],
-        currentWorkRoot,
-        {
-          getRow: (qitemId) => repo.getById(qitemId) ?? null,
-          continuationOf: (qitemId) => repo.currentParkContinuation(qitemId),
-        },
-        missionsRoot,
-      );
-      return c.json({ ...position, ...derived, ...choiceField, role, workRoots,
+      return { held: held.slice(0, WORK_CANDIDATE_LIST_LIMIT), next: next.slice(0, WORK_CANDIDATE_LIST_LIMIT),
+        heldTruncated: held.length > WORK_CANDIDATE_LIST_LIMIT, nextTruncated: next.length > WORK_CANDIDATE_LIST_LIMIT };
+    };
+    // OPR.0.7.0.12: labelled work candidates for the refocus packet, only on request, so the
+    // default answer is unchanged. In-progress rows are the candidate evidence, so they come
+    // from the same unbounded read as the derivation.
+    if (c.req.query("candidates") === "1") {
+      const { held, next, heldTruncated, nextTruncated } = readHeldAndNext();
+      const workCandidates = deriveWorkCandidates([...inProgress, ...held, ...next], currentWorkRoot, lookups, missionsRoot);
+      // The selected project's own missions, by its catalog entry's missions root, which may sit outside workspace.root:
+      // the trace lists these when it orients from that project. An unhealthy entry adds none and keeps today's listing.
+      const selectedMissionsRoot = workProject && "root" in workProject ? projectMissionsRoots.get(workProject.id)?.root : null;
+      const projectMissions = workProject && "root" in workProject && selectedMissionsRoot
+        ? listProjectMissions(workProject.id, selectedMissionsRoot) : null;
+      return c.json({ ...position, ...derived, ...choiceField, role, workRoots, ...(workProject ? { workProject } : {}),
         // heldAndNextTruncated stays for trace scripts that predate the per-list flags.
-        workCandidates: { ...workCandidates, heldTruncated, nextTruncated, heldAndNextTruncated: heldTruncated || nextTruncated } });
+        workCandidates: { ...workCandidates, ...(projectMissions ? { projectMissions } : {}),
+          heldTruncated, nextTruncated, heldAndNextTruncated: heldTruncated || nextTruncated } });
     }
-    return c.json({ ...position, ...derived, ...choiceField, role, workRoots });
+    // Nothing in progress: the seat's held and pending rows, each with its own resolved scope, so refocus can show them
+    // as context (never as current work) from its one lookup. Only on request (held=1), as candidates=1 is, so the
+    // default answer is unchanged. Absent when there are none.
+    let heldField = {};
+    if (c.req.query("held") === "1" && inProgress.length === 0) {
+      const { held, next, heldTruncated, nextTruncated } = readHeldAndNext();
+      if (held.length > 0 || next.length > 0) {
+        // No default missions root: the host's mission listing is the work packet's, not needed here.
+        const scoped = deriveWorkCandidates([...held, ...next], currentWorkRoot, lookups, null);
+        heldField = { heldAndPendingWork: { missionsRoot, held: scoped.held, next: scoped.next, heldTruncated, nextTruncated } };
+      }
+    }
+    return c.json({ ...position, ...derived, ...choiceField, ...heldField, role, workRoots, ...(workProject ? { workProject } : {}) });
   });
 
   // GET /list — list with filters. MUST precede /:qitemId so the literal path wins.
@@ -1110,7 +1678,7 @@ export function queueRoutes(): Hono {
   // `state=...`). Composable with destinationSession/sourceSession/
   // targetRepo/limit.
   // OPR.0.4.4.15 FR-1 — the aggregated attention read: ONE payload in the
-  // shared P4 fanout contract ({items, hosts}), local always included,
+  // shared P4 fanout contract ({items, hosts}); absent a host query, local is included,
   // subscribed remote hosts fanned out DAEMON-SIDE (bearer never in the
   // browser). A NEW sibling endpoint by arch ruling 3 — the existing
   // /list?attention=1 wire below stays byte-preserved (the strongest form
@@ -1128,7 +1696,7 @@ export function queueRoutes(): Hono {
       listLocalAttention: () => repo.listAttention({ state: ["pending", "in-progress", "blocked"] }) as unknown as AttentionItem[],
       listSubscriptions: () => (store ? store.listFeedHostSubscriptions() : []),
       loadRegistry: registryLoader,
-    });
+    }, c.req.query("host"));
     return c.json(payload);
   });
 
@@ -1158,11 +1726,16 @@ export function queueRoutes(): Hono {
   app.get("/list", (c) => {
     const destinationSession = c.req.query("destinationSession") || undefined;
     const sourceSession = c.req.query("sourceSession") || undefined;
+    const rawTags = c.req.queries("tag") ?? [];
+    if (rawTags.some((tag) => tag.trim().length === 0)) {
+      return c.json({ error: "tag_invalid", message: "tag filters cannot be blank" }, 400);
+    }
+    const tags = [...new Set(rawTags)];
     const stateRaw = c.req.query("state") || undefined;
     const targetRepo = c.req.query("targetRepo") || undefined;
     const parsedLimit = queryLimit(c);
     if (!parsedLimit.ok) return parsedLimit.response;
-    const userLimit = parsedLimit.limit;
+    const pageLimit = parsedLimit.limit ?? LIST_DEFAULT_LIMIT;
     const asSession = c.req.query("as") || undefined;
     const compact = c.req.query("compact") === "1";
     const rig = c.req.query("rig") || undefined;
@@ -1187,12 +1760,14 @@ export function queueRoutes(): Hono {
         : undefined;
 
     if (!attention) {
-      const items = getRepo(c).list({
+      const repo = getRepo(c);
+      const items = cutListPage(c, pageLimit, repo.list({
+        tag: tags.length > 0 ? tags : undefined,
         destinationSession,
         sourceSession,
         state,
         targetRepo,
-        limit: userLimit,
+        limit: listReadLimit(pageLimit),
         asSession,
         compact,
         rig,
@@ -1200,8 +1775,23 @@ export function queueRoutes(): Hono {
         handedOffFrom,
         updatedSince,
         sortByUpdated: c.req.query("sort") === "updated",
-      });
-      return c.json(items);
+      }));
+      // A seat that lists its own active inbox is checking in; the stuck sweep reads that for hosted members that pick up
+      // work by polling. Another actor's read, a read with no sender, a read that can't return pending rows, a read of
+      // only what the seat sent (`as` and `sourceSession` both the seat, no destination) and the attention view aren't.
+      // A follow-through read (`handedOffFrom`, no destination) returns the seat's inbox only when the row was handed to
+      // it; one the seat handed on returns only what it sent, so it counts only when it returned a pending row addressed
+      // to the seat. A check-in proves the seat was reading, never that it saw or took any row.
+      const sender = transportSenderSession(c);
+      const named = [destinationSession, asSession].filter((s): s is string => !!s);
+      const sentOnly = !destinationSession && !!sender && ((!!sourceSession && repo.isSameSession(sender, sourceSession))
+        || (!!handedOffFrom && !items.some((item) => item.state === "pending" && repo.isSameSession(sender, item.destinationSession))));
+      if (sender && named.length > 0 && !sentOnly && (!state || state.includes("pending")) && named.every((s) => repo.isSameSession(sender, s))) {
+        repo.recordInboxCheckIn(sender);
+      }
+      const faces = handoffSuccessorsMany(repo, items.filter((item) => item.state === "handed-off" || item.closureReason === "handed_off_to"
+        || ((isTerminalState(item.state) || item.state === "canceled") && item.closureReason === "superseded" && item.closureTarget?.startsWith("qitem-"))));
+      return c.json(items.map((item) => faces.has(item.qitemId) ? { ...item, ...faces.get(item.qitemId) } : item));
     }
 
     // OPR.0.3.2.20 — attention path goes through
@@ -1221,8 +1811,9 @@ export function queueRoutes(): Hono {
     // attention=1&destinationSession=...) return ONLY the matching
     // attention items.
     const items = getRepo(c).listAttention({
-      limit: userLimit,
+      limit: listReadLimit(pageLimit),
       state,
+      tag: tags.length > 0 ? tags : undefined,
       destinationSession,
       sourceSession,
       targetRepo,
@@ -1231,10 +1822,14 @@ export function queueRoutes(): Hono {
     });
     // Defense-in-depth: refine with the JS predicate so the SQL
     // LIKE superset cannot leak a malformed destination through. An ask to a registered person addressed as a seat or
-    // an alias is a member by its classification, as listAttention selected it.
+    // an alias is a member by its classification, as listAttention selected it. The page is cut and marked after the
+    // refinement, so a row it drops never reads as more rows.
     const repo = getRepo(c);
     const filtered = items.filter((item) => isAttentionItem(item) || repo.isCurrentHumanAsk(item.qitemId));
-    return c.json(filtered);
+    // A full read that the refinement thinned to the limit or fewer can't tell whether accepted rows lie past it, so the
+    // page carries no marker rather than claim either way.
+    if (pageLimit >= 0 && items.length > pageLimit && filtered.length <= pageLimit) return c.json(filtered);
+    return c.json(cutListPage(c, pageLimit, filtered));
   });
 
   // GET /overdue — surfaces in-progress qitems past closure_required_at.
@@ -1254,6 +1849,11 @@ export function queueRoutes(): Hono {
     const items = getRepo(c).findOverdue({ rig, limit, compact });
     return c.json(items);
   });
+
+  // Each connected assistant on this host and whether it's checking its queue, with this daemon's own host id: the check-ins
+  // are this host's, so a reader matches members to it without needing a terminal seat to learn it. A status only:
+  // work addressed to an assistant that isn't checking in still queues and is rung as before. Precedes /:qitemId.
+  app.get("/hosted-members", (c) => c.json({ hostId: getSelfHostId(), members: getRepo(c).hostedMemberCheckIns() }));
 
   // GET /undelivered — surfaces pending create-path nudge failures plus active
   // human-notification episodes whose gateway delivery ledger failed or never posted.
@@ -1291,8 +1891,8 @@ export function queueRoutes(): Hono {
       return c.json({ error: "rig_required", message: "rig is required for a rig RECENT read" }, 400);
     }
     const raw = c.req.query("limit");
-    const parsed = raw == null ? 20 : Number.parseInt(raw, 10);
-    const limit = Number.isInteger(parsed) && parsed > 0 ? parsed : 20;
+    const parsed = raw == null ? DEFAULT_RECENT_TRANSITIONS_LIMIT : Number.parseInt(raw, 10);
+    const limit = Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_RECENT_TRANSITIONS_LIMIT;
     const scope = scopeKind === "instance"
       ? { kind: "instance" } as const
       : { kind: "rig", rig: rig! } as const;
@@ -1336,6 +1936,23 @@ export function queueRoutes(): Hono {
   app.get("/watch", sseHandler);
   app.get("/sse", sseHandler);
 
+  // Ordinary queue read authority; no app request, mutation or cross-host lookup.
+  app.get("/:qitemId/lineage", (c) => {
+    const rootId = c.req.param("qitemId");
+    const graph = recordedQueueGraph(getRepo(c), rootId, { includeAncestors: true });
+    const rootAvailable = graph.nodes.has(rootId);
+    const nodes = [...graph.nodes.values()].map(item => ({
+      qitemId: item.qitemId, state: item.state, body: item.body, summary: item.summary,
+      sourceSession: item.sourceSession, destinationSession: item.destinationSession,
+      replyTo: item.replyTo ?? null, handedOffFrom: item.handedOffFrom, handedOffTo: item.handedOffTo,
+      blockedOn: item.blockedOn, closureReason: item.closureReason, evidenceRef: item.evidenceRef,
+      completion: { status: ["done", "canceled", "denied", "failed", "handed-off"].includes(item.state) ? "closed-as-recorded" : "open" },
+    }));
+    return c.json({ rootId, scope: "this-daemon", status: !rootAvailable ? "unknown" : graph.partial ? "partial" : "available",
+      nodes, edges: graph.edges, partial: graph.partial, partialReasons: graph.partialReasons, unresolved: graph.unresolved,
+      limits: graph.limits, completion: { status: "unknown" }, ...(!rootAvailable ? { error: "qitem_not_found" } : {}) }, rootAvailable ? 200 : 404);
+  });
+
   // GET /:qitemId/transitions — registered before /:qitemId so the literal
   // suffix wins over the bare param route.
   app.get("/:qitemId/transitions", (c) => {
@@ -1346,11 +1963,16 @@ export function queueRoutes(): Hono {
   });
 
   // GET /:qitemId — show one
-  app.get("/:qitemId", (c) => {
+  app.get("/:qitemId", async (c) => {
     const qitemId = c.req.param("qitemId");
     const repo = getRepo(c);
-    const item = repo.getById(qitemId);
+    const seconds = Number(c.req.query("waitSeconds") ?? "0");
+    if (!Number.isInteger(seconds) || seconds < 0 || seconds > 50) {
+      return c.json({ error: "invalid_wait_seconds", message: "waitSeconds must be an integer from 0 to 50" }, 400);
+    }
+    const { item, parked, waited } = await waitForQueueItem(repo, getEventBus(c), qitemId, seconds, c.req.raw.signal);
     if (!item) return c.json({ error: "qitem_not_found" }, 404);
+    if (parked) exemptSlowOpRequest(c);
     // #1029: the wake path's own routing decision, so a reader never guesses a registered
     // person's alias from its spelling (there may be no wake result yet, e.g. --no-nudge).
     // The owner notification level is what the Slack selector keys on: a registered person who
@@ -1358,8 +1980,13 @@ export function queueRoutes(): Hono {
     const closing = repo.closingTransition(qitemId, item.state);
     return c.json({
       ...item,
+      ...(waited ? { waited } : {}),
       // #2446: what a settling Mission Control act can be guarded with (expectedRevision).
       decisionRevision: repo.decisionRevision(item),
+      // The answer rows returned to this row, read by their link rather than their text; empty when none came back here.
+      // Only this daemon's rows are read: an answer another host holds isn't in them, so empty isn't proof of none.
+      answers: repo.answersForAsk(qitemId),
+      answersFrom: "this-daemon",
       // A closed row's outcome (its note and reason) lives only in the transition log; omitted while the row is open.
       ...(closing ? { closingTransition: {
         transitionId: closing.transitionId,
@@ -1370,6 +1997,9 @@ export function queueRoutes(): Hono {
         actorSession: closing.actorSession,
         transitionNote: closing.transitionNote,
       } } : {}),
+      // #2794: a closed handoff or supersession names its successor (read only; nothing stored changes).
+      ...(item.state === "handed-off" || item.closureReason === "handed_off_to"
+        || ((isTerminalState(item.state) || item.state === "canceled") && item.closureReason === "superseded" && item.closureTarget?.startsWith("qitem-")) ? handoffSuccessors(repo, item) : {}),
       destinationClass: repo.classifyDestinationOf(item.destinationSession).class,
       ownerNotificationLevel: repo.transitionLog.latestOwnerNotificationForQitem(qitemId)?.ownerNotificationLevel ?? null,
     });

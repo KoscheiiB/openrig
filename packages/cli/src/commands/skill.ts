@@ -56,6 +56,9 @@ interface SeatInspection {
   bootstrapLine?: { state: "unasked" | "unknown" } | { state: "yes" | "no"; by: "saved" | "environment" } | null;
   /** OPR.0.7.0.9: what the seat's launch passes of its own additions; absent from an older daemon. */
   launchAdditions?: SeatLaunchAdditionsView | null;
+  /** #2895 (b): set for a seat on a runtime without seat skills; absent from an older daemon. */
+  unsupported?: true;
+  note?: string;
 }
 
 interface SeatApplyResponse {
@@ -185,6 +188,10 @@ export function skillCommand(depsOverride?: StatusDeps): Command {
       process.exitCode = 1;
       return;
     }
+    if (!opts.apply && data.unsupported) {
+      if (!opts.json) console.log(data.note);
+      return;
+    }
     const inspection = opts.apply ? data.inspection : data;
     if (!opts.json) printSeat(inspection);
     if (!opts.apply) {
@@ -267,7 +274,7 @@ it. Don't move global skills into a project just to get a record.
     .action(async (opts: { json?: boolean }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (!daemonStatusGuard(status)) return;
+      if (!daemonStatusGuard(status, { json: opts.json })) return;
       const client = deps.clientFactory(getDaemonUrl(status));
 
       const res = await client.get<AuditResponse>("/api/skills/audit");

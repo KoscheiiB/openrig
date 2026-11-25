@@ -154,8 +154,58 @@ it("neither recursive diagnosis traffic nor prose closures become product progre
   expect(t.projection.list().records).toHaveLength(1);
   expect(t.projection.list().records[0]!.ceremony!.transitionIds).toHaveLength(30);
   t.time("2026-09-05T13:00:00Z");
-  expect(t.projection.list().records[0]!.freshness.state).toBe("stale");
-  expect((await t.service.evaluate("system:health", true)).actions.every((a) => a.action !== "create" && a.action !== "represent")).toBe(true);
+  // A quiet lineage is read successfully, so the read is fresh; its last activity does not move.
+  const quiet = t.projection.list().records[0]!;
+  expect(quiet.freshness.state).toBe("fresh");
+  expect(quiet.lastObservedAt).toBe("2026-09-05T12:00:29.000Z");
+  // An existing occurrence is not re-presented for a lineage that stayed quiet.
+  const actions = (await t.service.evaluate("system:health", true)).actions;
+  expect(actions.map((a) => a.action)).toEqual(["deferred"]);
+  expect(t.send).toHaveBeenCalledTimes(1); expect(t.service.list()).toHaveLength(1);
+});
+
+it("admits a quiet unassessed lineage once; repeated reads of unchanged evidence do not summon the owner again", async () => {
+  const t = await setup();
+  t.time("2026-09-05T13:00:00Z");
+  expect(t.projection.list().records[0]).toMatchObject({ status: "indeterminate", freshness: { state: "fresh" }, ceremony: { stage: "needs-diagnosis" } });
+  expect((await t.service.evaluate("system:health", true)).actions.map((a) => a.action)).toEqual(["create"]);
+  for (let i = 0; i < 3; i++) {
+    t.time(`2026-09-05T${14 + i}:00:00Z`);
+    expect((await t.service.evaluate("system:health", true)).actions.map((a) => a.action)).toEqual(["deferred"]);
+  }
+  expect(t.send).toHaveBeenCalledTimes(1); expect(t.service.list()).toHaveLength(1);
+});
+
+it("a matching false-positive assessment recorded after the lineage went quiet clears it; changed evidence reopens it", async () => {
+  const t = await setup(); const id = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.time("2026-09-05T13:00:00Z");
+  t.dispose(id, t.assessment("false-positive"));
+  expect(t.projection.list({ status: "cleared" }).records[0]).toMatchObject({ status: "cleared", freshness: { state: "fresh" }, lastObservedAt: "2026-09-05T12:00:29.000Z", ceremony: { stage: "cleared" } });
+  writeFileSync(t.proof, "Evidence changed after the assessment");
+  expect(t.projection.list().records[0]).toMatchObject({ status: "indeterminate", ceremony: { stage: "indeterminate" } });
+});
+
+it("a quiet lineage is never confirmed, even by an established assessment at the confirming ratio", async () => {
+  const t = await setup(); const id = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.time("2026-09-05T13:00:00Z");
+  t.dispose(id, t.assessment());
+  expect(t.projection.list().records[0]).toMatchObject({ status: "indeterminate", severity: "info", ceremony: { stage: "indeterminate" } });
+  expect(t.projection.list({ status: "active" }).records).toEqual([]);
+});
+
+it("incomplete or unavailable evidence stays indeterminate after the lineage went quiet", async () => {
+  const t = await setup(); const id = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.time("2026-09-05T13:00:00Z");
+  t.dispose(id, t.assessment("false-positive"));
+  expect(t.projection.list({ status: "cleared" }).records).toHaveLength(1);
+  // Retention clips the opening transition: the cleared interval is no longer fully readable.
+  t.db.prepare("UPDATE queue_transitions SET ts = '2026-09-01T00:00:00.000Z' WHERE transition_id = 1").run();
+  expect(t.projection.list({ status: "cleared" }).records).toEqual([]);
+  expect(t.projection.list().records[0]).toMatchObject({ status: "indeterminate", ceremony: { stage: "indeterminate" } });
+  // A failed read reports the source unavailable and clears nothing.
+  vi.spyOn(t.source, "read").mockImplementation(() => { throw new Error("health_passive_queue_window_truncated"); });
+  expect(t.projection.list({ status: "cleared" }).records).toEqual([]);
+  expect(t.projection.coverage()).toEqual([expect.objectContaining({ status: "unavailable", reason: "health_passive_queue_window_truncated" })]);
 });
 
 
@@ -264,6 +314,22 @@ it("finds every family's closed boundaries with one lineage-tag read per evaluat
   expect(tagReads).toHaveLength(1);
 });
 
+it("reads the lineage tags through migration 183's partial index, not a scan of every queue row", async () => {
+  const t = await setup();
+  addFamilies(t, [22]);
+  const original = t.queue.db.prepare;
+  const tagReads: string[] = [];
+  t.queue.db.prepare = function(sql: string) {
+    if (sql.includes("health-lineage")) tagReads.push(sql);
+    return original.call(this, sql);
+  } as typeof t.queue.db.prepare;
+  try { expect(t.projection.records().map((r) => r.ceremony!.lineageId).sort()).toEqual(["family-000", "root"]); } finally { t.queue.db.prepare = original; }
+  expect(tagReads).toHaveLength(1);
+  const plan = (t.queue.db.prepare(`EXPLAIN QUERY PLAN ${tagReads[0]}`).all() as Array<{ detail: string }>).map((row) => row.detail);
+  expect(plan.join(" | ")).toContain("idx_queue_items_health_lineage");
+  expect(plan).not.toContain("SCAN queue_items");
+});
+
 it("past the family limit evaluates exactly the busiest families and reports the rest as omitted, not healthy", async () => {
   const t = await setup();
   // root has 30 transitions; 198 families have 22; three tie at 21. The limit keeps root,
@@ -277,8 +343,113 @@ it("past the family limit evaluates exactly the busiest families and reports the
   // Omitted families are never read, so nothing about them can be concluded.
   expect(new Set(read.mock.calls.map((c) => c[0]))).toEqual(new Set(lineages));
   expect(t.projection.list({ limit: 200 })).toMatchObject({ total: 200, coverage: [{ source: "passive-ceremony", unit: "handoff families",
-    limit: 200, total: 202, evaluated: 200, omitted: 2, partial: true, order: "most queue transitions in the observation window, then lineage ID" }] });
+    limit: 200, total: 202, evaluated: 200, omitted: 2, partial: true, screened: 0, deepCandidates: 202, order: expect.stringContaining("most transitions first, then lineage ID") }] });
   expect(t.projection.records().map((r) => r.ceremony!.lineageId).sort()).toEqual(lineages);
+});
+
+it("covers every family past 200 when the rest are below the ceremony threshold, reading none of them", async () => {
+  const t = await setup();
+  // root has 30 transitions; 250 families have 19 (threshold 20), so none can qualify.
+  addFamilies(t, Array<number>(250).fill(19));
+  const read = vi.spyOn(t.queue.transitionLog, "listForQitemWindow");
+  expect(t.projection.records().map((r) => r.ceremony!.lineageId)).toEqual(["root"]);
+  expect(new Set(read.mock.calls.map((c) => c[0]))).toEqual(new Set(["root"]));
+  const [coverage] = t.projection.list({ limit: 200 }).coverage;
+  expect(coverage).toMatchObject({ unit: "handoff families", total: 251, evaluated: 251, omitted: 0, partial: false, limit: 200, screened: 250, deepCandidates: 1 });
+  expect(coverage!.order).toContain("below the ceremony threshold");
+});
+
+it("spends the 200 deep budget only on families that can qualify and omits only their overflow", async () => {
+  const t = await setup();
+  // root plus 201 families at the threshold exceed the budget by 2; 50 below it are screened, not omitted.
+  addFamilies(t, [...Array<number>(201).fill(20), ...Array<number>(50).fill(5)]);
+  const lineages = t.projection.records().map((r) => r.ceremony!.lineageId);
+  expect(lineages).toHaveLength(200);
+  expect(t.projection.list({ limit: 200 }).coverage).toEqual([expect.objectContaining({ total: 252, evaluated: 250, omitted: 2, partial: true, limit: 200, screened: 50, deepCandidates: 202 })]);
+});
+
+it("screens on live and archived transitions together: a family split across the archive still qualifies", async () => {
+  const t = await setup();
+  addFamilies(t, [24, ...Array<number>(240).fill(19)]);
+  // Retention archived the 5 oldest of family-000: 19 live plus 5 archived is 24 in the window.
+  t.db.prepare(`INSERT INTO queue_transitions_archive (transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, archived_at)
+    SELECT transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, '2026-09-05T12:00:10.000Z' FROM queue_transitions
+    WHERE qitem_id = 'family-000' AND transition_id IN (SELECT transition_id FROM queue_transitions WHERE qitem_id = 'family-000' ORDER BY ts LIMIT 5)`).run();
+  t.db.prepare("DELETE FROM queue_transitions WHERE transition_id IN (SELECT transition_id FROM queue_transitions_archive WHERE qitem_id = 'family-000')").run();
+  expect((t.db.prepare("SELECT COUNT(*) n FROM queue_transitions WHERE qitem_id = 'family-000'").get() as { n: number }).n).toBe(19);
+  expect(t.projection.records().map((r) => r.ceremony!.lineageId).sort()).toEqual(["family-000", "root"]);
+  expect(t.projection.list({ limit: 200 }).coverage).toEqual([expect.objectContaining({ total: 242, evaluated: 242, omitted: 0, partial: false, screened: 240, deepCandidates: 2 })]);
+});
+
+function archiveRows(t: Awaited<ReturnType<typeof setup>>, qitemId: string, where = "1 = 1", ...args: string[]) {
+  t.db.prepare(`INSERT INTO queue_transitions_archive (transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, archived_at)
+    SELECT transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, '2026-09-05T12:00:10.000Z' FROM queue_transitions WHERE qitem_id = ? AND ${where}`).run(qitemId, ...args);
+  t.db.prepare(`DELETE FROM queue_transitions WHERE qitem_id = ? AND transition_id IN (SELECT transition_id FROM queue_transitions_archive WHERE qitem_id = ?) AND ${where}`).run(qitemId, qitemId, ...args);
+}
+const lineageIds = (t: Awaited<ReturnType<typeof setup>>) => t.projection.records().map((r) => r.ceremony!.lineageId).sort();
+const coverageOf = (t: Awaited<ReturnType<typeof setup>>) => t.projection.list({ limit: 200 }).coverage;
+
+it("discovers a family whose in-window transitions are all archived", async () => {
+  const t = await setup();
+  addFamilies(t, [24, 3]);
+  archiveRows(t, "family-000");
+  expect((t.db.prepare("SELECT COUNT(*) n FROM queue_transitions WHERE qitem_id = 'family-000'").get() as { n: number }).n).toBe(0);
+  expect(lineageIds(t)).toEqual(["family-000", "root"]);
+  expect(coverageOf(t)).toEqual([expect.objectContaining({ total: 3, evaluated: 3, omitted: 0, partial: false, screened: 1, deepCandidates: 2 })]);
+});
+
+it("counts a handed-off member that exists only in the archive toward its family", async () => {
+  const t = await setup();
+  addFamilies(t, [10]);
+  t.db.prepare("INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,tags,body,handed_off_from) VALUES('family-000-child','2026-09-05T11:59:00.000Z','2026-09-05T11:59:00.000Z','a@rig','b@rig','pending',?,'child','family-000')")
+    .run(JSON.stringify(["mission:mission", "slice:slice-1"]));
+  const add = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES('family-000-child',?,'pending','a@rig')");
+  for (let k = 0; k < 15; k++) add.run(new Date(Date.parse("2026-09-05T11:59:00.000Z") + k * 1000).toISOString());
+  archiveRows(t, "family-000-child");
+  expect(lineageIds(t)).toEqual(["family-000", "root"]);
+});
+
+it("counts a qitem stored in both tables once, with both counts summed, and ignores archived rows outside the window", async () => {
+  const t = await setup();
+  addFamilies(t, [24, 10]);
+  archiveRows(t, "family-000", "ts < ?", "2026-09-05T11:59:12.000Z");
+  const live = (t.db.prepare("SELECT COUNT(*) n FROM queue_transitions WHERE qitem_id = 'family-000'").get() as { n: number }).n;
+  expect(live).toBe(12);
+  // family-001 has 10 live rows and 15 archived rows far outside the window: it must not qualify.
+  const old = t.db.prepare("INSERT INTO queue_transitions_archive (transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, archived_at) VALUES(?,?,?,'pending',NULL,'a@rig',NULL,NULL,'2026-09-05T12:00:10.000Z')");
+  for (let k = 0; k < 15; k++) old.run(9_000_000 + k, "family-001", new Date(Date.parse("2026-01-01T00:00:00.000Z") + k * 1000).toISOString());
+  expect(lineageIds(t)).toEqual(["family-000", "root"]);
+  expect(coverageOf(t)).toEqual([expect.objectContaining({ total: 3, evaluated: 3, omitted: 0, partial: false, screened: 1, deepCandidates: 2 })]);
+});
+
+it("reads a schema without an archive table from the live table alone", async () => {
+  const t = await setup();
+  addFamilies(t, [24, 3]);
+  t.db.exec("DROP TABLE queue_transitions_archive");
+  // A queue built on a schema with no archive, as an old database presents it.
+  const queue = new QueueRepository(t.db, new EventBus(t.db));
+  const source = new PassiveCeremonySource(t.workspace, queue, t.policy, () => "2026-09-05T12:00:30.000Z");
+  const read = new HealthProjectionService(source, () => t.policy.read(), delegatedPostureFixture);
+  expect(read.records().map((r) => r.ceremony!.lineageId).sort()).toEqual(["family-000", "root"]);
+  expect(read.list({ limit: 200 }).coverage).toEqual([expect.objectContaining({ total: 3, evaluated: 3, omitted: 0, partial: false })]);
+});
+
+it("throws on the combined live and archived discovery past 2000 qitems, and accepts exactly 2000", async () => {
+  const t = await setup();
+  addFamilies(t, Array<number>(1999).fill(1));
+  for (let i = 1000; i < 1999; i++) archiveRows(t, `family-${String(i).padStart(3, "0")}`);
+  expect(() => t.source.read()).not.toThrow();
+  addFamilies(t, [1], "extra");
+  archiveRows(t, "extra-000");
+  expect(() => t.source.read()).toThrow("health_passive_queue_window_truncated");
+});
+
+it("a family that does not qualify on counted transitions stays evaluated, and a real stale family stays a finding", async () => {
+  const t = await setup();
+  addFamilies(t, [...Array<number>(240).fill(2), 25]);
+  const lineages = t.projection.records().map((r) => r.ceremony!.lineageId).sort();
+  expect(lineages).toEqual(["family-240", "root"]);
+  expect(t.projection.list({ limit: 200 }).coverage).toEqual([expect.objectContaining({ total: 242, evaluated: 242, omitted: 0, partial: false })]);
 });
 
 it("at the family limit evaluates every family as before and reports complete coverage", async () => {
@@ -290,7 +461,7 @@ it("at the family limit evaluates every family as before and reports complete co
 
 it("the scheduled evaluation records partial coverage instead of failing past the family limit", async () => {
   const t = await setup();
-  addFamilies(t, Array<number>(201).fill(1));
+  addFamilies(t, Array<number>(201).fill(20));
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   t.service.start();
   await vi.advanceTimersByTimeAsync(60000);
@@ -302,9 +473,9 @@ it("the scheduled evaluation records partial coverage instead of failing past th
 
 it("the scheduled evaluation keeps its own coverage when another health read runs during delivery", async () => {
   const t = await setup();
-  addFamilies(t, Array<number>(201).fill(1));
+  addFamilies(t, Array<number>(201).fill(20));
   // A health-list request served while the evaluation awaits delivery replaces the source's latest coverage.
-  t.send.mockImplementation(async () => { addFamilies(t, [1, 1, 1], "late"); t.projection.list(); return { ok: true, verified: true }; });
+  t.send.mockImplementation(async () => { addFamilies(t, [20, 20, 20], "late"); t.projection.list(); return { ok: true, verified: true }; });
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   t.service.start();
   await vi.advanceTimersByTimeAsync(60000);
@@ -427,4 +598,240 @@ it("#613 additional: disabled real checkpoint source never opens malformed files
   const read = vi.spyOn(source, "read");
   expect(new HealthProjectionService(source, () => t.policy.read()).list().records).toEqual([]);
   expect(read).not.toHaveBeenCalled();
+});
+
+it("#2762: the daemon's own actors, including the bare claim-generation `system`, are not coordination", async () => {
+  const t = await setup(15);
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  const daemonActors = ["system", "watchdog@system", "queue@system", "stuck-sweep@system", "wake-ladder@system"];
+  for (const [i, actor] of [...daemonActors, ...daemonActors].entries()) insert.run("root", `2026-09-05T12:00:${String(16 + i).padStart(2, "0")}.000Z`, "in-progress", actor);
+  t.time("2026-09-05T12:00:30.000Z");
+  expect(t.projection.list().records).toHaveLength(0);
+  for (let i = 0; i < 5; i++) insert.run("root", `2026-09-05T12:00:${30 + i}.000Z`, "in-progress", "builder@rig");
+  t.time("2026-09-05T12:00:40.000Z");
+  const [observation] = t.source.read();
+  expect(observation?.coordinationTransitions).toBe(20);
+  const counted = t.db.prepare(`SELECT transition_id AS id FROM queue_transitions WHERE qitem_id = 'root' AND actor_session NOT IN (${daemonActors.map(() => "?").join(",")}) ORDER BY transition_id`).all(...daemonActors) as Array<{ id: number }>;
+  expect(observation?.ceremony?.transitionIds).toEqual(counted.map((r) => r.id));
+});
+
+it("#2762: a disposition recorded before the filter that cut at a daemon transition still closes its segment at its own end", async () => {
+  const t = await setup(); const id = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  const first = t.projection.list().records[0]!;
+  t.dispose(id, t.assessment("false-positive"));
+  // Rewrite the cleared disposition as an older daemon recorded it: its cut is a watchdog transition the filter now drops.
+  const watchdog = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session,transition_note) VALUES(?,?,?,?,?)")
+    .run("root", "2026-09-05T12:00:31.000Z", "blocked", "watchdog@system", "park wake fired: watchdog job-1; delivery=delivered; awaiting owner consumption").lastInsertRowid as number;
+  const row = t.db.prepare("SELECT transition_id AS tid, transition_note AS note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC").all(id) as Array<{ tid: number; note: string }>;
+  const disposition = row.find((r) => r.note?.includes('"action":"disposition"'))!;
+  const receipt = JSON.parse(disposition.note) as { finding: { ceremony: { transitionIds: number[] }; window: { endedAt: string } } };
+  receipt.finding.ceremony.transitionIds.push(watchdog);
+  t.db.prepare("UPDATE queue_transitions SET transition_note = ? WHERE transition_id = ?").run(JSON.stringify(receipt), disposition.tid);
+  for (let i = 0; i < 20; i++) t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)").run("root", `2026-09-05T12:02:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-05T12:02:30.000Z");
+  const closed = t.source.read().find((o) => o.episodeKey === "root")!;
+  expect(closed.ceremony?.transitionIds).toEqual(first.ceremony?.transitionIds);
+  expect(closed.source.query.endedAt).toBe(receipt.finding.window.endedAt);
+  expect(t.projection.get(first.id)?.status).toBe("cleared");
+});
+
+it("#2889 follow-up: a resumed episode keeps its id and diagnosis when its first transition after the cut stops counting", async () => {
+  const t = await setup(); const first = t.projection.list().records[0]!;
+  const id0 = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.dispose(id0, t.assessment("false-positive"));
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  const opener = insert.run("root", "2026-09-05T12:02:00.000Z", "pending", "builder@rig").lastInsertRowid as number;
+  for (let i = 1; i <= 20; i++) insert.run("root", `2026-09-05T12:02:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-05T12:02:30.000Z");
+  const resumed = t.projection.list().records.find((r) => r.id !== first.id)!;
+  expect(resumed).toBeDefined();
+  expect((await t.service.evaluate("system:health", true)).actions).toContainEqual(expect.objectContaining({ findingId: resumed.id, action: "create" }));
+  const diagnoses = t.service.list().length;
+  // A later change to what counts (here an upgrade that drops daemon@kernel) turns the episode's first transition
+  // after the cut into bookkeeping: the open episode and its diagnosis keep their identity.
+  t.db.prepare("UPDATE queue_transitions SET actor_session = ? WHERE transition_id = ?").run("daemon@kernel", opener);
+  t.time("2026-09-05T12:04:00.000Z");
+  expect(t.projection.list().records.filter((r) => r.id !== first.id).map((r) => r.id)).toEqual([resumed.id]);
+  const { actions } = await t.service.evaluate("system:health", true);
+  expect(actions.map((a) => a.action)).not.toContain("create");
+  expect(t.service.list()).toHaveLength(diagnoses);
+});
+
+it("#3192 review: a resumed episode keeps its id when its non-counting opener ages out of the window", async () => {
+  const t = await setup();
+  const first = t.projection.list().records[0]!;
+  const id0 = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.dispose(id0, t.assessment("false-positive"));
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  // The first raw transition after the cut is daemon bookkeeping (never counted) and is a day older than the counted ones.
+  insert.run("root", "2026-09-05T12:02:00.000Z", "pending", "daemon@kernel");
+  for (let i = 0; i < 20; i++) insert.run("root", `2026-09-06T12:00:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-06T12:01:00.000Z");   // the opener is still inside the 24 h window
+  const resumed = t.projection.list().records.filter((r) => r.id !== first.id);
+  expect(resumed).toHaveLength(1);
+  expect((await t.service.evaluate("system:health", true)).actions).toContainEqual(expect.objectContaining({ findingId: resumed[0]!.id, action: "create" }));
+  const diagnoses = t.service.list().length;
+  t.time("2026-09-06T12:05:00.000Z");   // the opener ages out; the counted transitions stay fresh
+  expect(t.projection.list().records.filter((r) => r.id !== first.id).map((r) => r.id)).toEqual([resumed[0]!.id]);
+  const { actions } = await t.service.evaluate("system:health", true);
+  expect(actions.map((a) => a.action)).not.toContain("create");
+  expect(t.service.list()).toHaveLength(diagnoses);
+});
+
+it("#3192 review: the opener is found in a dormant member of the family, not only in the touched ones", async () => {
+  const t = await setup();
+  const first = t.projection.list().records[0]!;
+  const id0 = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.dispose(id0, t.assessment("false-positive"));
+  // The first raw transition after the cut is a non-counting one on a child; the counted ones stay on the root.
+  await t.queue.create({ qitemId: "child", sourceSession: "builder@rig", destinationSession: "owner@rig", body: "Part", tags: ["mission:mission", "slice:slice-1"], nudge: false });
+  t.db.prepare("UPDATE queue_items SET handed_off_from = ? WHERE qitem_id = ?").run("root", "child");
+  t.db.prepare("UPDATE queue_transitions SET ts = ?, actor_session = ? WHERE qitem_id = ?").run("2026-09-05T12:02:00.000Z", "daemon@kernel", "child");
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  for (let i = 0; i < 20; i++) insert.run("root", `2026-09-06T12:00:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-06T12:01:00.000Z");
+  const resumed = t.projection.list().records.filter((r) => r.id !== first.id);
+  expect(resumed).toHaveLength(1);
+  expect((await t.service.evaluate("system:health", true)).actions).toContainEqual(expect.objectContaining({ findingId: resumed[0]!.id, action: "create" }));
+  const diagnoses = t.service.list().length;
+  t.time("2026-09-06T12:05:00.000Z");   // the child, and with it the opener, leaves the window
+  expect(t.projection.list().records.filter((r) => r.id !== first.id).map((r) => r.id)).toEqual([resumed[0]!.id]);
+  const { actions } = await t.service.evaluate("system:health", true);
+  expect(actions.map((a) => a.action)).not.toContain("create");
+  expect(t.service.list()).toHaveLength(diagnoses);
+});
+
+it("#3192 review: a family that crosses the member limit keeps its resumed episode's name and says how it is read", async () => {
+  const t = await setup();
+  const first = t.projection.list().records[0]!;
+  const id0 = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.dispose(id0, t.assessment("false-positive"));
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  // The opener is a non-counting transition on the root, an active member, before the counted ones.
+  insert.run("root", "2026-09-06T11:59:00.000Z", "pending", "daemon@kernel");
+  for (let i = 0; i < 20; i++) insert.run("root", `2026-09-06T12:00:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-06T12:01:00.000Z");
+  const before = t.projection.list().records.filter((r) => r.id !== first.id);
+  expect(before.map((r) => r.startedAt)).toEqual(["2026-09-06T11:59:00.000Z"]);
+  // 1001 dormant children under the root: the family walk stops at its limit.
+  t.db.exec("CREATE TEMP TABLE kid AS SELECT * FROM queue_items WHERE qitem_id = 'root'");
+  const rename = t.db.prepare("UPDATE kid SET qitem_id = ?, handed_off_from = 'root'");
+  const copy = t.db.prepare("INSERT INTO queue_items SELECT * FROM kid");
+  for (let i = 0; i < 1001; i++) { rename.run(`kid-${i}`); copy.run(); }
+  const after = t.projection.list().records.filter((r) => r.id !== first.id);
+  expect(after.map((r) => [r.id, r.startedAt])).toEqual([[before[0]!.id, "2026-09-06T11:59:00.000Z"]]);
+  expect(after[0]!.ceremony!.missingFacts).toContainEqual(expect.stringContaining("exceeds 1000 members"));
+  expect(before[0]!.ceremony!.missingFacts).not.toContainEqual(expect.stringContaining("exceeds 1000 members"));
+});
+
+it("#3192 review: the opener is read from the archive when retention moved the member that opened the episode", async () => {
+  const t = await setup();
+  const first = t.projection.list().records[0]!;
+  const id0 = (await t.service.evaluate("system:health", true)).actions[0]!.qitemId;
+  t.dispose(id0, t.assessment("false-positive"));
+  await t.queue.create({ qitemId: "child", sourceSession: "builder@rig", destinationSession: "owner@rig", body: "Part", tags: ["mission:mission", "slice:slice-1"], nudge: false });
+  t.db.prepare("UPDATE queue_items SET handed_off_from = ? WHERE qitem_id = ?").run("root", "child");
+  t.db.prepare("UPDATE queue_transitions SET ts = ?, actor_session = ? WHERE qitem_id = ?").run("2026-09-05T12:02:00.000Z", "daemon@kernel", "child");
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  for (let i = 0; i < 20; i++) insert.run("root", `2026-09-06T12:00:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-06T12:01:00.000Z");
+  const resumed = t.projection.list().records.filter((r) => r.id !== first.id);
+  expect(resumed).toHaveLength(1);
+  expect((await t.service.evaluate("system:health", true)).actions).toContainEqual(expect.objectContaining({ findingId: resumed[0]!.id, action: "create" }));
+  // The episode is named by the first raw transition after the cut: the child's, a day older than the counted ones.
+  expect(resumed[0]!.startedAt).toBe("2026-09-05T12:02:00.000Z");
+  const diagnoses = t.service.list().length;
+  // Retention moves the opening member's transitions to the archive (the queue row itself stays), as queue-retention does.
+  t.db.prepare(`INSERT INTO queue_transitions_archive (transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, archived_at)
+    SELECT transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, ? FROM queue_transitions WHERE qitem_id = ?`).run("2026-09-06T12:04:00.000Z", "child");
+  t.db.prepare("DELETE FROM queue_transitions WHERE qitem_id = ?").run("child");
+  insert.run("root", "2026-09-06T12:04:30.000Z", "pending", "builder@rig");   // one more counted transition after naming
+  t.time("2026-09-06T12:05:00.000Z");
+  expect(t.projection.list().records.filter((r) => r.id !== first.id).map((r) => [r.id, r.startedAt]))
+    .toEqual([[resumed[0]!.id, "2026-09-05T12:02:00.000Z"]]);
+  const { actions } = await t.service.evaluate("system:health", true);
+  expect(actions.map((a) => a.action)).not.toContain("create");
+  expect(t.service.list()).toHaveLength(diagnoses);
+});
+
+it("#3192 review: a family whose root's transitions were archived by retention is still read", async () => {
+  const t = await setup();
+  expect(t.projection.list().records).toHaveLength(1);
+  t.db.prepare(`INSERT INTO queue_transitions_archive (transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, archived_at)
+    SELECT transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, ? FROM queue_transitions WHERE qitem_id = ? AND ts < ?`)
+    .run("2026-09-05T12:00:10.000Z", "root", "2026-09-05T12:00:05.000Z");
+  t.db.prepare("DELETE FROM queue_transitions WHERE qitem_id = ? AND ts < ?").run("root", "2026-09-05T12:00:05.000Z");
+  const list = t.projection.list();
+  expect(list.records).toHaveLength(1);
+  expect(list.records[0]!.startedAt).toBe("2026-09-05T12:00:00.000Z");
+  expect(list.coverage).not.toContainEqual(expect.objectContaining({ state: "unavailable" }));
+});
+
+it("#3192 review: an over-limit family falls back alone; the families before and after it keep their full-history opener", async () => {
+  const t = await setup();
+  const tags = JSON.stringify(["mission:mission", "slice:slice-1"]);
+  const item = t.db.prepare("INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,tags,body) VALUES(?,?,?,'a@rig','b@rig','pending',?,'family')");
+  const insert = t.db.prepare("INSERT INTO queue_transitions(qitem_id,ts,state,actor_session) VALUES(?,?,?,?)");
+  for (const id of ["aaa", "zzz"]) {
+    item.run(id, "2026-09-05T12:00:00.000Z", "2026-09-05T12:00:00.000Z", tags);
+    for (let i = 0; i < 30; i++) insert.run(id, `2026-09-05T12:00:${String(i).padStart(2, "0")}.000Z`, "pending", "a@rig");
+  }
+  const firsts = t.projection.list().records;
+  expect(firsts.map((r) => r.ceremony!.lineageId).sort()).toEqual(["aaa", "root", "zzz"]);
+  // The owner cooldown presents one diagnosis per 60 s: evaluate until each first episode has one.
+  const created: Array<{ findingId: string; qitemId: string }> = [];
+  for (let i = 0; i < 6 && created.length < 3; i++) {
+    created.push(...(await t.service.evaluate("system:health", true)).actions.filter((a) => a.action === "create"));
+    t.time(new Date(Date.parse("2026-09-05T12:00:30.000Z") + (i + 1) * 61000).toISOString());
+  }
+  expect(created).toHaveLength(3);
+  for (const r of firsts) {
+    const qitemId = created.find((a) => a.findingId === r.id)!.qitemId;
+    t.dispose(qitemId, { ...t.assessment("false-positive"), basis: r.ceremony!.basis });
+  }
+  const firstIds = new Set(firsts.map((r) => r.id));
+  // root: 1001 dormant children, over the family member limit.
+  t.db.exec("CREATE TEMP TABLE kid AS SELECT * FROM queue_items WHERE qitem_id = 'root'");
+  const rename = t.db.prepare("UPDATE kid SET qitem_id = ?, handed_off_from = 'root'");
+  const copy = t.db.prepare("INSERT INTO queue_items SELECT * FROM kid");
+  for (let i = 0; i < 1001; i++) { rename.run(`kid-${i}`); copy.run(); }
+  // aaa and zzz: a dormant child whose non-counting transition opens the resumed episode.
+  for (const id of ["aaa", "zzz"]) {
+    item.run(`${id}-child`, "2026-09-05T12:02:00.000Z", "2026-09-05T12:02:00.000Z", tags);
+    t.db.prepare("UPDATE queue_items SET handed_off_from = ? WHERE qitem_id = ?").run(id, `${id}-child`);
+    insert.run(`${id}-child`, "2026-09-05T12:02:00.000Z", "pending", "daemon@kernel");
+  }
+  for (const id of ["aaa", "root", "zzz"]) for (let i = 0; i < 20; i++) insert.run(id, `2026-09-06T12:00:${String(i).padStart(2, "0")}.000Z`, "pending", "builder@rig");
+  t.time("2026-09-06T12:01:00.000Z");
+  const resumed = t.projection.list().records.filter((r) => !firstIds.has(r.id));
+  const by = (rs: typeof resumed) => Object.fromEntries(rs.map((r) => [r.ceremony!.lineageId, r]));
+  const now1 = by(resumed);
+  expect(Object.keys(now1).sort()).toEqual(["aaa", "root", "zzz"]);
+  // The normal families are named by their full-history opener (the child's transition), with no limit fact.
+  for (const id of ["aaa", "zzz"]) {
+    expect(now1[id]!.startedAt).toBe("2026-09-05T12:02:00.000Z");
+    expect(now1[id]!.ceremony!.missingFacts).not.toContainEqual(expect.stringContaining("exceeds 1000 members"));
+  }
+  // Only the over-limit family falls back to its window's first transition, and says so.
+  expect(now1.root!.startedAt).toBe("2026-09-06T12:00:00.000Z");
+  expect(now1.root!.ceremony!.missingFacts).toContainEqual(expect.stringContaining("exceeds 1000 members"));
+  const resumedIds = new Set(Object.values(now1).map((r) => r.id));
+  const creates: string[] = [];
+  creates.push(...(await t.service.evaluate("system:health", true)).actions.filter((a) => a.action === "create").map((a) => a.findingId));
+  expect(creates).toHaveLength(1);
+  // Retention archives the openers of aaa and zzz; one more counted transition arrives on each family.
+  for (const id of ["aaa-child", "zzz-child"]) {
+    t.db.prepare(`INSERT INTO queue_transitions_archive (transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, archived_at)
+      SELECT transition_id, qitem_id, ts, state, transition_note, actor_session, closure_reason, closure_target, ? FROM queue_transitions WHERE qitem_id = ?`).run("2026-09-06T12:04:00.000Z", id);
+    t.db.prepare("DELETE FROM queue_transitions WHERE qitem_id = ?").run(id);
+  }
+  for (const id of ["aaa", "root", "zzz"]) insert.run(id, "2026-09-06T12:04:30.000Z", "pending", "builder@rig");
+  t.time("2026-09-06T12:05:00.000Z");
+  const now2 = by(t.projection.list().records.filter((r) => !firstIds.has(r.id)));
+  expect(Object.fromEntries(Object.entries(now2).map(([k, r]) => [k, r.id]))).toEqual(Object.fromEntries(Object.entries(now1).map(([k, r]) => [k, r.id])));
+  creates.push(...(await t.service.evaluate("system:health", true)).actions.filter((a) => a.action === "create").map((a) => a.findingId));
+  // Every diagnosis presented is for an episode named before the archive: none for a renamed one.
+  expect(creates.length).toBeGreaterThanOrEqual(1);
+  expect(creates.every((id) => resumedIds.has(id))).toBe(true);
+  expect(t.service.list()).toHaveLength(3 + creates.length);
 });

@@ -3,8 +3,9 @@
 This is the contributor-facing statement of which checks BLOCK a change and which are
 advisory. Every pull request to `main` runs `.github/workflows/tests.yml` on a clean GitHub
 runner: build and packaging, typecheck, the repository scripts (`npm run test:repo`), each
-workspace's test suite (daemon, cli, tui and ui) on macOS without ambient credentials or
-external network, and an installed-package scenario (`scripts/run-pr-scenarios.sh`). The root
+workspace's test suite (daemon and cli on macOS once a maintainer approves the pull request's
+current head, tui and ui on Ubuntu) without ambient credentials or external network, and an
+installed-package scenario (`scripts/run-pr-scenarios.sh`). The root
 `package.json` scripts below run the same build, typecheck, repository and test checks locally,
 with one difference: `npm test` does not include the UI suite, which CI runs as
 `package-tests (ui)`. Run `npm run test:ui` for it.
@@ -33,7 +34,7 @@ suite. Both sets are readable in the root `package.json` scripts.
 
 | Lane | Command | Meaning |
 |---|---|---|
-| Portability report | `node scripts/portability-report.mjs` | lists added lines with machine-specific values; findings never fail it (`.github/workflows/portability-report.yml`) |
+| Portability report | `node scripts/portability-report.mjs` | lists added lines with machine-specific values; findings don't fail it by default, and `--strict` exits 1 when it finds any. The workflow (`.github/workflows/portability-report.yml`) runs it without `--strict`. |
 
 ## The norm (web-UI freeze at 0.5.0)
 

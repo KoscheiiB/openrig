@@ -1,3 +1,4 @@
+import { nobodyRegistered, REGISTRATION_OFFER } from "../person-registration-offer.js";
 import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import { resolveSenderSession, SENDER_FALLBACK } from "../sender-identity.js";
@@ -120,6 +121,36 @@ export async function daemonHumanReadiness(entityId: string): Promise<HumanReadi
       nextAction: "rig status",
     };
   }
+}
+
+/** How long add waits for the seat names before registering without the warning. */
+const SEAT_NAMES_TIMEOUT_MS = 2_000;
+
+/** The seats on this daemon whose session names `isPerson` reads as a registered person, for add's warning: a seat
+ *  whose member name is a person's id is treated as that person. One read (`/api/ps?seats=true`), bounded by
+ *  SEAT_NAMES_TIMEOUT_MS. Best effort: none when the daemon can't be read in time, or doesn't list seat names. */
+export async function seatsReadAsPerson(isPerson: (session: string) => boolean): Promise<string[]> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // The request's timer starts after client preflight. Bound the whole optional lookup as well, so a slow owner or
+    // sender-identity probe cannot extend the person's wait; abort prevents a later business request after the bound.
+    return await Promise.race([
+      (async () => {
+        const { DaemonClient } = await import("../client.js");
+        const rigs = await new DaemonClient().get<Array<{ seats?: unknown }>>("/api/ps?seats=true", {
+          timeoutMs: SEAT_NAMES_TIMEOUT_MS, signal: controller.signal,
+        });
+        if (rigs.status !== 200 || !Array.isArray(rigs.data)) return [];
+        return rigs.data.flatMap((rig) => Array.isArray(rig.seats)
+          ? rig.seats.filter((seat): seat is string => typeof seat === "string" && isPerson(seat)) : []);
+      })(),
+      new Promise<string[]>((resolve) => {
+        timer = setTimeout(() => { controller.abort(); resolve([]); }, SEAT_NAMES_TIMEOUT_MS);
+      }),
+    ]);
+  } catch { return []; }
+  finally { clearTimeout(timer); }
 }
 
 /** Default queue-row half of the remove guard: non-terminal rows addressed to the human,
@@ -246,7 +277,12 @@ export function gatewayCommand(deps: GatewayCommandDeps = {}): Command {
           followUps.default = res.ok ? { path: res.path } : { error: res.error };
         }
         const failed = Object.values(followUps).some((value) => "error" in (value as object));
-        console.log(JSON.stringify({ ok: !failed, entityId, path: result.value.path, receipt: result.receipt, ...followUps }));
+        // With no connector the person is asked in the Feed and Steering only (the list view's wording); say so now.
+        const noConnector = result.value.fragment.connectorBindings.length === 0;
+        console.log(JSON.stringify({ ok: !failed, entityId, path: result.value.path, receipt: result.receipt, ...(noConnector ? { delivery: "Feed and Steering only" } : {}), ...followUps }));
+        if (noConnector) console.error(`${entityId} has no connector binding, so messages and questions reach them only in the TUI's Feed and Steering until one is added: rerun rig gateway human add ${entityId} --replace with the same options plus --binding <kind:connectorRef:secretsRef:primary[:handle=<id>]> (rig gateway human set's binding.<n> changes only a binding that exists).`);
+        const sharing = await seatsReadAsPerson((session) => registry.resolveRegisteredHumanAddress(session, [result.value.fragment]) !== null);
+        if (sharing.length) console.error(`warning: ${sharing.join(", ")} ${sharing.length === 1 ? "is a seat whose member name is" : "are seats whose member names are"} ${entityId}, so work and messages addressed to ${sharing.length === 1 ? "it" : "them"} are treated as addressed to the person ${entityId}. That's intended for the person's own pane; otherwise rename the seat or choose another id.`);
         if (failed) { console.error(`the person was registered, but part of their placement wasn't saved; fix it with rig gateway human set ${entityId} … or rig gateway default ${entityId}`); process.exitCode = 1; }
       } catch (error) { console.error(`refused: ${(error as Error).message}`); process.exitCode = 1; }
     })
@@ -281,7 +317,7 @@ Examples:
     .description("List the registered people, with delivery readiness and quiet hours (rig gateway participants adds organizations, groups, policy and shared channels)")
     .option("--json", "Complete record(s) as JSON")
     .action(async (opts: { json?: boolean }) => {
-      const { listHumans } = await import("@openrig/daemon/gateway-human-registry");
+      const { listHumans, NO_HUMAN_CONFIGURED } = await import("@openrig/daemon/gateway-human-registry");
       const res = listHumans();
       if (!res.ok) { console.error(`refused: ${res.error}`); process.exitCode = 1; return; }
       const humans = await Promise.all(res.humans.map(async (record) => {
@@ -290,7 +326,7 @@ Examples:
           quiet: quiet.ok ? quiet.quiet : { unknown: `quiet hours could not be read from the daemon: ${quiet.reason}` } };
       }));
       if (opts.json) { console.log(JSON.stringify({ ok: true, humans })); return; }
-      if (res.humans.length === 0) { console.log("no human configured yet — register one: rig gateway human add <entityId> --display-name … --binding … --delivery-class …"); return; }
+      if (res.humans.length === 0) { console.log(NO_HUMAN_CONFIGURED); return; }
       for (const h of humans) {
         const inbound = h.bindings.inboundResolvable || !h.bindings.primary ? "" : "  [outbound-only]";
         const primary = h.bindings.primary ? `primary ${h.bindings.primary.kind}:${h.bindings.primary.connectorRef}` : "no connector: Feed and Steering only";
@@ -567,9 +603,14 @@ Examples:
 
   human
     .command("set <entityId> <field> <value>")
-    .description("Edit one field through the verb (same validation as add; re-projection immediate). Fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), slack-subscription (the person's Slack subscription: every-ask, the default, posts every ask to Slack too; urgent-only posts only asks created with --alert, the rest wait on Steering and the TUI; or unset), binding.<n>; and, kept in the participant side file: organization (an id, or unset), groups (comma-separated ids, or unset), policy (text, @<path> to read a file, or unset)")
+    .description("Edit one field through the verb (same validation as add; re-projection immediate). Fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), slack-subscription (the person's Slack subscription: every-ask, the default, posts every ask to Slack too; urgent-only posts only asks created with --alert, the rest wait on Steering and the TUI; or unset), binding.<n> (a full kind:connectorRef:secretsRef:role[:handle=<id>] spec, or unset to remove that binding); and, kept in the participant side file: organization (an id, or unset), groups (comma-separated ids, or unset), policy (text, @<path> to read a file, or unset)")
     .option("--reason <reason>", "Reason recorded with connector binding changes", "update human binding")
     .option("--actor <actor>", "Named operator when outside a managed seat")
+    .addHelpText("after", `
+Removing a connector binding (binding.<n> unset):
+  - The one-primary rule stays: no replacement primary is chosen silently. If removing a primary binding would leave other bindings, the command refuses. To replace the primary in place, set its slot to the new primary spec; to promote an existing secondary binding, first save that binding's full spec (kind:connectorRef:secretsRef:role[:handle=<id>]) from rig gateway human show <entityId> --json, then unset that secondary slot, then find the primary's current slot in remainingBindings (or rig gateway human show <entityId> --json, since the primary's slot shifts down when a lower-index secondary is removed) and set it to the saved spec with role primary (promotion replaces the former primary binding; its connector reference and inbound handle are not retained as a secondary); to remove every binding, unset the secondary bindings first using their current slot indexes from remainingBindings or rig gateway human show <entityId>, then finish at binding.0 (once all secondaries are gone, the primary is at binding.0).
+  - Remaining bindings are printed with their shifted binding.<n> slot indexes (the primary's slot shifts down too when a lower-index secondary is removed). Because indexes shift after removal, do not blindly retry 'binding.0 unset'; check remainingBindings, the receipt, or 'rig gateway human show <entityId>' before retrying.
+  - Removing a binding keeps the person, their preferences, their other bindings and their open questions. Removing the last binding makes the current delivery episode inactive, so new missing-post findings stop (an already-open recovery item for an undelivered notice may remain); the current delivery-outcome display may disappear too, while historical receipt notes remain. It does not answer, close or cancel open questions, cancel or reroute already-prepared deliveries, or retract anything a bridge has already accepted.`)
     .action(async (entityId: string, field: string, value: string, opts: { reason: string; actor?: string }) => {
       const registry = await import("@openrig/daemon/gateway-human-registry");
       if (field === "organization" || field === "groups" || field === "policy") {
@@ -602,7 +643,19 @@ Examples:
               return { value: res, after: { digest }, effect: digest === prior ? "no-op" : "applied" };
             },
           });
-          console.log(JSON.stringify({ ok: true, entityId, field, path: result.value.path, receipt: result.receipt }));
+          console.log(JSON.stringify({
+            ok: true,
+            entityId,
+            field,
+            path: result.value.path,
+            receipt: result.receipt,
+            ...(value === "unset"
+              ? {
+                  remainingBindings: result.value.remainingBindings ?? [],
+                  note: result.value.note,
+                }
+              : {}),
+          }));
         } catch (error) { console.error(`refused: ${(error as Error).message}`); process.exitCode = 1; }
         return;
       }
@@ -758,6 +811,8 @@ Examples:
       console.log(defaultPerson.id ? `default: ${defaultPerson.id} (${defaultPerson.source === "chosen" ? "chosen" : "the only person"})` : `default: none — ${defaultPerson.reason}`);
       for (const warning of view.warnings) console.log(`warning: ${warning}`);
       if (view.sideFile.error) console.log(`participant file: ${view.sideFile.error}`);
+      // The same offer `rig daemon start` prints, for an agent meeting the person first (such as the kernel operator).
+      if (!opts.organization && nobodyRegistered(view.participants)) for (const line of REGISTRATION_OFFER) console.log(line);
     });
 
   cmd

@@ -1,13 +1,16 @@
+import { inputReadDiagnostic, type InputReadDiagnostic } from "./input-read-diagnostic.js";
+import { RunnerChannel, RunnerChannelError } from "./runner-channel.js";
 import { expectedConversation, sameConversation, resolveExpectedConversation, type ExpectedConversation } from "./expected-conversation.js";
 import type { ContextUsageStore } from "./context-usage-store.js";
 import { physicalSessionName } from "./session-registry.js";
 import { currentClaudeMcpMenu } from "./claude-mcp-menu.js";
 import { currentClaudeThemeMenu } from "./claude-theme-menu.js";
+import { currentClaudeModelMenu, currentCodexModelPicker, isModelPickerHeader } from "./native-model-picker.js";
 import { currentClaudeResumePicker } from "./native-resume-probe.js";
 import stringWidth from "string-width";
 import { CODEX_LIVE_WORKING_FRAME_PATTERN, CODEX_TURN_STATUS_PATTERN } from "./codex-pane-patterns.js";
-import { randomUUID } from "node:crypto";
-import { COLLAPSED_PASTE, composerRegion, isComposerFooter, isClaudePasteHint, inspectStartupStagedText, QUEUED_PLACEHOLDER, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
+import { createHash, randomUUID } from "node:crypto";
+import { CLAUDE_NOT_STATUS_LINE_ROW, CLAUDE_REMOTE_CONTROL_ROWS, CLAUDE_STATUS_DECORATIONS, CLAUDE_STATUS_WARNINGS, COLLAPSED_PASTE, composerRegion, isComposerFooter, isClaudePasteHint, inspectStartupStagedText, QUEUED_PLACEHOLDER, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 import {
   composerContainsOwnedText,
   composerNumberedChoicePattern,
@@ -29,12 +32,14 @@ import {
 } from "./composer-prompts.js";
 export { inspectStartupStagedText } from "./startup-submission-evidence.js";
 import { OutboxHandler, OutboxHandlerError } from "./outbox-handler.js";
+import { declaredCapabilities, readSendOutcome, type WrittenFact } from "./connection-contract.js";
 import { DraftAwareDelivery, type GuardedDeliverySummary, type QueueWakeFacts } from "./draft-aware-delivery.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { claudeResumeRotation, sessionCommunityHarnessSelect, type SessionRegistry } from "./session-registry.js";
 import type { TmuxAdapter, TmuxResult } from "../adapters/tmux.js";
+import { tmuxUnsetWindowSizeCommand } from "../adapters/tmux-server.js";
 import { newPinHolder, readPinSizing, recordPin, releasePin, WINDOW_SIZE_PRIOR_OPTION, withWindowPin, type PinRelease } from "../terminal/window-pin.js";
 import { latestHookPermissionPending, latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
 import type { EventBus } from "./event-bus.js";
@@ -51,6 +56,9 @@ import type { SlowOperationInstrumentation } from "./slow-op-recorder.js";
 import { hashSentText, type CaptureObserverSink, type CaptureSlot, type ObservationInput, type ObservedBinding } from "./capture-observer.js";
 import { isAttentionRequiredReadinessCode, type NodeBinding, type ReadinessOptions, type ReadinessResult } from "./runtime-adapter.js";
 import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, isRecoverableStartupFailure } from "./startup-orchestrator.js";
+import { resolveSeatKind, seatInboundTransport } from "./seat-kinds.js";
+import type { HookBridge } from "./hook-bridge.js";
+import type { WatchdogUsageLimitState } from "./watchdog-usage-limit.js";
 
 // OPR.0.4.1.10 — send-readiness freshness. The runtime-hook store keeps a 5min freshness for activity
 // DISPLAY, but "safe to send NOW" needs a tight window: a stale "idle" read must not authorize a send
@@ -74,13 +82,29 @@ const INPUT_BOX_READ_DEADLINE_MS = 500;
 const STALE_BOUND_PANE = "The session does not have the expected bound pane";
 
 // Mid-work detection patterns (cheap heuristics)
+const WORKING_WORD_PATTERN = /Working/;
 const MID_WORK_PATTERNS = [
   /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/, // spinner chars
-  /Working/,
+  WORKING_WORD_PATTERN,
   /^[✶✢✳✻✽·]\s+\S.*(?:…|\.{3})\s+\([^)]*\bthinking\)$/m,
   /esc to interrupt/,
   COMPOSER_SELECTION_SCAN_PATTERN,   // trust/consent prompt choices (e.g. '› 1. Yes, continue')
 ];
+
+// Under an empty prompt, the word alone is a finished turn's prose ("Working tree is clean; ready for an
+// assignment.", #3544). There only a status-shaped row counts: "Working" after an optional marker, then a
+// timer paren, an ellipsis that ends the line or opens the timer, or the end of the line
+// ("• Working (3s • esc to interrupt)", "✻ Working…", "⠋ Working"), or a digit timer paren later on the row,
+// as in a reasoning header clipped before "esc to interrupt" ("• Working on the test fixtures (6m 12s").
+// Prose such as "Working (as requested), …" or "Working... then I committed it." has no timer. The timer paren holds
+// only timer parts, then closes the row, opens the "• esc to interrupt" tail or is clipped: prose such as
+// "Working on the tests (2s per test), I found it." has more words in the paren. A paren clipped right after
+// its first timer digit ("• Working on the test fixtures (6") still reads live.
+const LIVE_TIMER_PAREN = String.raw`\(\s*\d+(?:[hms](?:\s+\d+[hms]?)*\s*(?:\)\s*$|[•·]|$)|\s*$)`;
+const LIVE_WORKING_ROW_PATTERN = new RegExp(String.raw`^(?:\S\s+)?Working(?:\s*${LIVE_TIMER_PAREN}` +
+  String.raw`|\s*(?:…|\.{3})\s*(?:${LIVE_TIMER_PAREN}|$)|\s*$|\b.*${LIVE_TIMER_PAREN})`);
+const MID_WORK_PATTERNS_UNDER_IDLE_PROMPT = MID_WORK_PATTERNS.map(pattern =>
+  pattern === WORKING_WORD_PATTERN ? LIVE_WORKING_ROW_PATTERN : pattern);
 
 // Idle-prompt patterns: empty prompt line (no typed text after the char).
 // Lines like '❯ Working on a task.' have text after the prompt char and
@@ -147,12 +171,61 @@ const PERMISSION_PROMPT_PATTERNS = [
 // after hitting this. Erring toward "prompt detected" is the SAFE direction for this guard: a false
 // refusal is overridable; a false-idle lets a message land on a prompt. (EXA: ntm e28763e; AgentDeck.)
 const PROMPT_SCAN_LINES = 12;
-const CLAUDE_QUESTION_FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
+// AskUserQuestion's footer. One question draws "Enter to select · ↑/↓ to navigate · Esc to cancel"; Claude Code 2.1.282's
+// bundle also draws "Tab/Arrow keys to navigate" for several questions and adds chords such as "ctrl+g to edit in <editor>",
+// always from "Enter to select" to "Esc to cancel".
+const CLAUDE_QUESTION_FOOTER = /^Enter to select · .+ · Esc to cancel$/;
 
 export interface PaneActivityClassification {
   state: "agent_active" | "agent_idle" | "attention" | "unknown";
   reason: string;
   evidence: string | null;
+}
+
+/** Refusal codes from the checks that run before Enter reaches the adapter (the seat's input guard, the expected
+ *  conversation and managed compaction): a written send that stopped with one left its text without Enter. */
+/** The written text's fingerprint, byte length and paste time, to match a harness's own prompt hook against; nulls when
+ *  nothing was pasted. The text itself is never recorded. */
+function wireFingerprint(wire: { text: string; at: string } | null): { wireSha256: string | null; wireBytes: number | null; writtenAt: string | null } {
+  if (wire === null) return { wireSha256: null, wireBytes: null, writtenAt: null };
+  const bytes = Buffer.from(wire.text, "utf8");
+  return { wireSha256: createHash("sha256").update(bytes).digest("hex"), wireBytes: bytes.length, writtenAt: wire.at };
+}
+
+function enterWithheld(reason: string | undefined): boolean {
+  return typeof reason === "string" && (reason.startsWith("expected_identity_") || reason.startsWith("draft_") || reason === "managed_compaction_pending");
+}
+
+/** What a send's own result shows reached the seat's input. A send that succeeded without being retained issued the text
+ *  and Enter, whether or not it checked the screen, except a bare Enter and a prompt answer typed without Enter. A
+ *  write that may have landed is uncertain. Text that was written reads text only when a pre-Enter check refused the
+ *  Enter, and otherwise text with the submission unknown, since Enter may have been attempted. A send that wrote
+ *  nothing says so. Anything else the result doesn't establish is unknown, never a guess. */
+export function writtenFact(result: SendResult): WrittenFact {
+  const native = result.runnerReceipt;
+  if (native) {
+    if (native.erasedAt) return "unknown";
+    if (native.reconciliation || native.result?.submissionUnknown) return "uncertain";
+    if (native.stage === "submitted" || native.stage === "completed") return "submitted";
+    if (native.stage === "pending" || native.stage === "rejected") return "none";
+    return "unknown"; // An offer or custody ACK establishes no native submission.
+  }
+  // Queued for the seat's hook bridge: nothing was typed; the result's outcome says it was deposited for the hook.
+  if (result.outcome === "bridged") return "none";
+  if (result.ok && result.outcome !== "retained") {
+    if (result.submitOnly) return "submit_only";
+    return result.promptInteraction === "unverified" ? "text_only" : "submitted";
+  }
+  if (result.inputPhase === "attempted") return "uncertain";
+  if (result.inputPhase === "written") return enterWithheld(result.reason) ? "text_only" : "text_submit_unknown";
+  if (result.inputPhase === "not_reached" || result.sent === false) return "none";
+  return "unknown";
+}
+
+/** The text reached the seat's input, or may have: the sends a usage-limit record describes. */
+function reachedInput(result: SendResult): boolean {
+  const fact = writtenFact(result);
+  return fact === "submitted" || fact === "text_only" || fact === "text_submit_unknown" || fact === "uncertain";
 }
 
 function trimPaneLines(paneContent: string): string[] {
@@ -237,36 +310,24 @@ function findCurrentClaudeQuestion(paneContent: string): string | null {
   // Anchor at its terminal footer, then follow only the adjoining choice block.
   // Preserve columns so indented draft/quoted text does not gain new authority.
   const lines = paneContent.split("\n").map(line => line.trimEnd()).filter(line => line.length > 0);
-  if (lines.at(-1) !== CLAUDE_QUESTION_FOOTER) return null;
+  if (!CLAUDE_QUESTION_FOOTER.test(lines.at(-1) ?? "")) return null;
+  // The preview layout (Claude Code 2.1.282's bundle) adds an unnumbered "Chat about this" row before the footer, which
+  // can hold the pointer itself, and rows under the options that carry only the preview column: options are 30 wide,
+  // then a 4-column gap. A pointer on that row still needs the numbered choices adjoining it.
+  let chat: string | null = null;
   for (let i = lines.length - 2; i >= 0; i--) {
     const line = lines[i]!;
     if (/^❯ \d+\.\s+\S/.test(line)) return truncateEvidence(line);
-    if (!/^(?: {2}\d+\.\s+\S| {5}\S|─{3,}$)/.test(line)) break;
+    if (/^(?:❯ | {2})Chat about this$/.test(line)) {
+      if (line.startsWith("❯")) chat = line;
+      continue;
+    }
+    if (chat && /^ {2}\d+\.\s+\S/.test(line)) return truncateEvidence(chat);
+    if (!/^(?: {2}\d+\.\s+\S| {5}\S| {34,}\S|─{3,}$)/.test(line)) break;
   }
   return null;
 }
 
-// Claude can leave these noninteractive warnings BELOW the input box and mode bar.
-// Recognize the complete input block, never a warning or historical prompt alone.
-const CLAUDE_STATUS_WARNINGS = [
-  /^✘ Auto-update failed: no write permission to npm prefix · Run claude doctor$/,
-  /^tmux focus-events off · add 'set -g focus-events on' to ~\/\.tmux\.conf and re…$/,
-  /^You've used (?:\d|[1-9]\d)% of your weekly limit · resets \d{1,2}(?::\d{2})?(?:am|pm) \(UTC\)$/,
-  // #1641: Claude 2.1.293's update banner, whatever installer it names.
-  /^Update available! Run: \S.*$/,
-  // The context hint, as Claude prints it; reported as the last line below the mode bar on one seat.
-  /^new task\? \/clear to save \d+(?:\.\d+)?k tokens$/,
-  // After Claude installs an update: "/restart to apply" (a Claude seat, 2026-10-30), "Restart to apply", or
-  // "Restart to update" on its own row (Claude 2.1.319, #2605).
-  /^✔ Update installed · (?:\/restart to apply|Restart to (?:apply|update))$/,
-];
-// Claude can draw noninteractive UI rows after its mode footer. They do not
-// replace the composer and should only be skipped when they match a known row.
-const CLAUDE_STATUS_DECORATIONS = [
-  /^\d[\d,]* tokens$/,
-  /^current: \d+(?:\.\d+){2} · latest: \d+(?:\.\d+){2} ✔ Update installed · Restart to update$/,
-  /^\/rc$/,
-];
 // Current Claude status rows need not end in "thinking)" or show "esc to interrupt".
 // Completed summaries such as "✻ Crunched for 2s" lack the live ellipsis/timer shape.
 // While a hook runs, the timer follows its label: "(running PostToolUse hook · 3m 12s · …)".
@@ -301,11 +362,15 @@ function skipClaudeStatusRows(lines: string[], from: number): number {
   while (bar >= 0) {
     const row = lines[bar]!.trim();
     if (row && !CLAUDE_STATUS_WARNINGS.some(pattern => pattern.test(row)) &&
-        !CLAUDE_STATUS_DECORATIONS.some(pattern => pattern.test(row))) break;
+        !CLAUDE_STATUS_DECORATIONS.some(pattern => pattern.test(row)) &&
+        !CLAUDE_REMOTE_CONTROL_ROWS.some(pattern => pattern.test(row))) break;
     bar--;
   }
   return bar;
 }
+
+/** Claude's Remote Control indicator row, in any label the footer search skips. */
+const isRemoteControlRow = (row: string): boolean => row === "/rc" || CLAUDE_REMOTE_CONTROL_ROWS.some(pattern => pattern.test(row));
 
 /** The first row of Claude's task panel when it sits right under a recognized footer (#2700), or -1. The panel is
  * recognized in its own shape only, past blank and known status rows (#2605's banner can sit between them). */
@@ -448,14 +513,18 @@ function closesFramedPromptAbove(lines: string[], open: number, indent: number, 
 const codexFooter = (line: string): boolean => isComposerFooter(line)
   || /(?:\b\d+% context left\b|\bContext \[)/.test(line);
 
-/** Preserve faint styling so autocomplete ghosts can be separated from authored
- * text. Color channel values must never be interpreted as style codes. */
+/** Preserve the styling used for autocomplete ghosts and the drawn cursor.
+ * Color channel values must never be interpreted as style codes. */
 function styledTextLines(screen: string) {
-  let faint = false;
+  let faint = false, inverse = false;
   return screen.replace(/\r\n/g, "\n").split("\n").map(raw => {
     let text = "", offset = 0;
-    const faintCells: boolean[] = [];
-    const append = (value: string) => { text += value; faintCells.push(...Array<boolean>(value.length).fill(faint)); };
+    const faintCells: boolean[] = [], inverseCells: boolean[] = [];
+    const append = (value: string) => {
+      text += value;
+      faintCells.push(...Array<boolean>(value.length).fill(faint));
+      inverseCells.push(...Array<boolean>(value.length).fill(inverse));
+    };
     for (const match of raw.matchAll(/\x1b\[([0-9;:]*)m/g)) {
       append(raw.slice(offset, match.index));
       const codes = match[1]!.split(";");
@@ -466,15 +535,18 @@ function styledTextLines(screen: string) {
           const skip = codes[i + 1] === "5" ? 2 : codes[i + 1] === "2" ? (codes[i + 2] === "" ? 5 : 4) : 0;
           // Color channels are not style codes. Ambiguous compound sequences
           // provide no faint-style proof, rather than interpreting an RGB 2 as dim.
-          if (!skip || i + skip !== codes.length - 1) { faint = false; break; }
+          if (!skip || i + skip !== codes.length - 1) { faint = inverse = false; break; }
           i += skip;
-        } else if (code === "" || code === "0" || code === "22") faint = false;
+        } else if (code === "" || code === "0") faint = inverse = false;
+        else if (code === "22") faint = false;
         else if (code === "2") faint = true;
+        else if (code === "7") inverse = true;
+        else if (code === "27") inverse = false;
       }
       offset = match.index! + match[0].length;
     }
     append(raw.slice(offset));
-    return { text, faintCells };
+    return { text, faintCells, inverseCells };
   });
 }
 
@@ -493,6 +565,10 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
   if (lines.length > height || !lines[y]) return unknown("incomplete_frame", snapshot.cursor);
   const footerAt = findClaudeFooterIndex(lines);
   const footer = lines[footerAt]?.trim() ?? "";
+  // Claude draws its Remote Control indicator inverse while it is selected (↓), when Enter opens its panel.
+  if (lines.slice(footerAt + 1).some((line, i) => isRemoteControlRow(line.trim()) && styled[footerAt + 1 + i]!.inverseCells.some(Boolean))) {
+    return unknown("unrecognized_composer", snapshot.cursor);
+  }
   const candidates: ComposerInput[] = [];
   for (let start = 0; start <= y; start++) {
     const prompt = readComposerPromptLine(lines[start] ?? "", promptClass);
@@ -569,7 +645,11 @@ export function inspectComposerInput(snapshot: ComposerSnapshot | null, runtime:
       else if (cursorOffset >= 0 && !rows[cursorRow]!.slice(cursorOffset).trim()) visible[cursorRow] = rows[cursorRow]!.slice(0, cursorOffset);
     }
     const atStart = y === start && x === prefix;
-    const empty = atStart && rows.length === 1 && rows[0] === "";
+    // Claude can draw an inverse-video blank in the cursor cell (#2925). Only
+    // that single cell at the start is padding; ordinary/preceding spaces stay input.
+    const inverseCells = styled[start]!.inverseCells;
+    const cursorBlank = prompt.glyph === "❯" && rows[0] === " " && inverseCells[prefix] && !inverseCells[prefix - 1];
+    const empty = atStart && rows.length === 1 && (rows[0] === "" || cursorBlank);
     const last = visible.length - 1;
     const cursorAtEnd = y === start + last && x === prefix + stringWidth(visible[last] ?? "");
     const label = visible.length === 1 && COMPOSER_COLLAPSED_PASTE_PATTERN.test(visible[0]!) ? visible[0]! : null;
@@ -763,7 +843,7 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
   const idleStatusBarLine = IDLE_STATUS_BAR_PATTERNS.some((pattern) => pattern.test(lastLine))
     ? lastLine
     : null;
-  const oldQuestionEnd = promptScanLines.lastIndexOf(CLAUDE_QUESTION_FOOTER);
+  const oldQuestionEnd = promptScanLines.map(line => CLAUDE_QUESTION_FOOTER.test(line)).lastIndexOf(true);
   // Above Claude's complete, empty input box with its mode bar, a permission question counts only with its numbered
   // choices after it, as every native menu draws them: a bare question there is a finished reply quoting one, and
   // refusing on it held wakes until the line scrolled out of the scan. Without that box, or on another runtime, any
@@ -796,7 +876,10 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
   const claudePicker = options.runtime === "codex" || options.runtime === "pi" ? null : currentClaudeResumePicker(paneContent);
   const themeMenu = options.runtime === undefined || options.runtime === "claude-code"
     ? currentClaudeThemeMenu(paneContent) : null;
-  const selectionPromptEvidence = themeMenu ?? claudePicker ?? currentClaudeMcpMenu(paneContent) ?? findCurrentClaudeQuestion(paneContent) ??
+  // The program's own /model picker: its highlighted row can sit above the scan window, and Enter there confirms it.
+  const modelPicker = options.runtime === "codex" ? currentCodexModelPicker(paneContent)
+    : options.runtime === undefined || options.runtime === "claude-code" ? currentClaudeModelMenu(paneContent) : null;
+  const selectionPromptEvidence = modelPicker ?? themeMenu ?? claudePicker ?? currentClaudeMcpMenu(paneContent) ?? findCurrentClaudeQuestion(paneContent) ??
     currentComposerSelection ?? (options.currentClaudeDialogueOnly ? null
       : findPatternEvidence(selectionLines, [COMPOSER_SELECTION_SCAN_PATTERN]));
   if (selectionPromptEvidence) {
@@ -860,7 +943,7 @@ export function classifyPaneActivity(paneContent: string, options: ClassifyPaneO
   }
 
   const midWorkEvidence = findPatternEvidence(recentLines, [
-    ...MID_WORK_PATTERNS,
+    ...(idlePromptLine ? MID_WORK_PATTERNS_UNDER_IDLE_PROMPT : MID_WORK_PATTERNS),
     CLAUDE_LIVE_STATUS_PATTERN,
     ...(options.timerlessStatusIsLive ? [CLAUDE_TIMERLESS_STATUS_PATTERN] : []),
   ]);
@@ -969,7 +1052,7 @@ export async function probeSessionActivity(input: {
     };
   }
   const readTarget = binding?.pane ?? sessionName;
-  if (attachmentType === "external_cli") {
+  if (seatInboundTransport(resolveSeatKind(attachmentType)) === "none") {
     return {
       state: "unknown",
       reason: "unsupported_attachment",
@@ -1386,34 +1469,58 @@ export function hasExpectedStagedText(pane: string | null, expected: string, run
   return stagedEvidence;
 }
 
-/** An interaction may consume its answer immediately. Only add Enter when the
- * complete answer is still visible in a bounded current text input, never a
- * numbered choice or a partial prefix. Unknown rendering is not consumption. */
-function promptAnswerStaged(pane: string | null, answer: string, runtime: string | null): boolean {
-  if (!pane || !answer.trim() || /[\r\n\x1b]/.test(answer)) return false;
-  // Fail closed for an unknown runtime: with no scoped glyph set there is no way to
-  // say which prompt line is the live input (the pre-shared-matcher check did the same).
-  if (runtime !== "codex" && runtime !== "claude-code") return false;
+/** An interaction may consume its answer immediately, so Enter is added for the complete answer still visible in a
+ *  bounded current text input (`staged`), never a numbered choice or a partial prefix. `not_staged` is positive
+ *  evidence against it: a recognized box holding something else, a numbered choice, a menu whose key-hint row ends
+ *  the current screen, or no Enter by contract. A screen that couldn't be read (`unreadable`), or one with no input box
+ *  the parser recognizes (`unrecognized`), is unknown, not evidence: unknown rendering is not consumption. */
+function promptAnswerStaged(pane: string | null, answer: string, runtime: string | null): "staged" | "not_staged" | "unreadable" | "unrecognized" {
+  // The caller's own keys (CR, LF, Esc) or an empty answer never get an added Enter.
+  if (!answer.trim() || /[\r\n\x1b]/.test(answer)) return "not_staged";
+  // A runtime with no scoped glyph set has no known input line; there the caller puts CR in the payload.
+  if (runtime !== "codex" && runtime !== "claude-code") return "not_staged";
+  if (!pane) return "unreadable";
   const promptClass = composerPromptClassForRuntime(runtime);
   const lines = pane.split("\n");
   // Only the LAST prompt line of this runtime's glyph set can be the current input;
   // everything above it is transcript history, and another harness's glyph is not ours.
   const inputIndex = findComposerInputLineIndex(lines, promptClass);
-  if (inputIndex < 0) return false;
-  const input = lines[inputIndex]!.trimStart();
   // A numbered choice (`.` or `)`), e.g. `» 1)` or `❯ 1.`, is a menu selection, never the answer.
-  if (composerNumberedChoicePattern(promptClass).test(input)) return false;
+  if (inputIndex >= 0 && composerNumberedChoicePattern(promptClass).test(lines[inputIndex]!.trimStart())) return "not_staged";
   // Where the input ends: Codex closes the composer on a blank line, Claude Code on a rule line.
-  const end = lines.findIndex((line, index) => index > inputIndex && (runtime === "codex"
+  const end = inputIndex < 0 ? -1 : lines.findIndex((line, index) => index > inputIndex && (runtime === "codex"
     ? line.trim() === "" : /^[─═-]{10,}$/.test(line.trim())));
-  return end > inputIndex && lines.slice(inputIndex, end).join("\n").trimStart().slice(1).trim() === answer.trim();
+  if (end <= inputIndex) return currentMenuKeyHint(lines) ? "not_staged" : "unrecognized";
+  return lines.slice(inputIndex, end).join("\n").trimStart().slice(1).trim() === answer.trim() ? "staged" : "not_staged";
+}
+
+/** Whether the current screen ends in a list or menu's key-hint row, where Enter acts on the focused item and Esc
+ *  dismisses it: `Enter to select · Esc to cancel`, `Space to select · Enter to confirm · Esc to reject all`, or
+ *  `t trust all · enter review · esc close`. Like the native menu recognizers, it reads only the last row (below
+ *  OpenRig's seat rule, if drawn), so an old hint in the transcript holds nothing. A send or newline hint, or Esc to
+ *  interrupt work, is a composer's or a busy seat's, not a menu's. */
+function currentMenuKeyHint(lines: string[]): boolean {
+  const rows = lines.map((line) => line.trim()).filter(Boolean);
+  if (/^─{3,} [\w.-]+@[\w.-]+ ─+$/.test(rows.at(-1) ?? "")) rows.pop();
+  const segments = (rows.at(-1) ?? "").split(/\s+·\s+/);
+  return segments.length > 1
+    && segments.some((segment) => /^(?:enter\b|⏎|↵)\s*(?:to\s+)?(?:select|confirm|choose|review|open|accept)\b/i.test(segment))
+    && segments.some((segment) => /^esc\b\s*(?:to\s+)?(?:cancel|close|reject|dismiss|exit)\b/i.test(segment));
 }
 
 // Codex 0.160 input box: the last prompt line plus indented continuation rows, one blank row, then a footer
 // of at most two rows: the `<model> · <~ or /path>` status line, optionally followed by one known hint row.
+// While a turn runs and the box holds text, Codex 0.167 draws its queue hint on that row instead ("tab to queue
+// message", or "tab to queue" when narrow, optionally followed by a mode label or the right-side context).
 const CODEX_STATUS_LINE = /^ {2}[^\s·][^·]* · [~/]/;
 const CODEX_NATIVE_STATUS_LINE = /^ {2}[^\s·][^·]* · [A-Za-z]:[\\/]/;
-const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2 to view\s*$/;
+const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2 to view\s*$|^\s*tab to queue(?: message)?(?:\s*$|\s{2,}| · )/;
+// A person can choose the status line's items with Codex's `/statusline` (0.170.0: model, approval mode, context,
+// limits, version and more; its default is model, current dir and thread name, which CODEX_STATUS_LINE matches), so a
+// chosen row needn't carry a path: a reporter's 0.170.0 seat drew `GPT-6.2-Sol xhigh · Approve for me · Context 72% used
+// · weekly 31% left · 0.170.0`. Such a row counts only with at least two items (Codex joins them with ` · `) and a known
+// hint row under it. A one-item row, or one with no hint row, still needs the path shape above.
+const CODEX_CHOSEN_STATUS_LINE = /^ {2}[^\s·›»❯>][^·]* · \S/;
 // Codex shows a long paste as this label until it is submitted. Matched on the normalized body.
 const CODEX_COLLAPSED_PASTE = /^\[PastedContent\d+chars\]$/;
 
@@ -1425,7 +1532,10 @@ function codexFooterSeparator(lines: string[], allowNativePath = false): number 
   let footerStart = last;
   while (footerStart > 0 && lines[footerStart - 1]!.trim()) footerStart--;
   const footer = lines.slice(footerStart, last + 1);
-  if (last < 0 || footer.length > 2 || !(CODEX_STATUS_LINE.test(footer[0]!) || (allowNativePath && CODEX_NATIVE_STATUS_LINE.test(footer[0]!)))
+  const chosenStatusLine = footer.length === 2 && CODEX_CHOSEN_STATUS_LINE.test(footer[0]!) && !CODEX_HINT_ROW.test(footer[0]!)
+    && !composerNumberedChoicePattern(composerPromptClassForRuntime("codex")).test(footer[0]!.trimStart());
+  if (last < 0 || footer.length > 2
+    || !(CODEX_STATUS_LINE.test(footer[0]!) || (allowNativePath && CODEX_NATIVE_STATUS_LINE.test(footer[0]!)) || chosenStatusLine)
     || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return -1;
   const separator = footerStart - 1;
   return separator >= 1 && !lines[separator]!.trim() ? separator : -1;
@@ -1699,7 +1809,6 @@ const SEAT_IDLE_SHAPES: {
   claude: {
     openingRules: { plain: RegExp; named: (sessionName: string) => RegExp };
     footers: Record<"bypassPermissions" | "acceptEdits" | "auto" | "dontAsk" | "plan" | "default", string>;
-    statusLineRows: string[];
     boxes: RegExp[];
     notices: string[];
     statusSlot: Record<"finishedTurn" | "freshSession", RowShape>;
@@ -1734,11 +1843,14 @@ const SEAT_IDLE_SHAPES: {
       plan: "⏸ plan mode on (shift+tab to cycle) · ← for agents",
       default: "⏸ manual mode on · ← for agents",
     },
-    // The rows OpenRig's statusLine collector (provisionContextCollector, assets/claude-statusline-context.cjs) draws
-    // between the closing rule and the footer: none. It prints nothing to stdout, and Claude Code 2.1.296 draws no
-    // row for an empty statusLine in the classic renderer OpenRig launches with (CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1).
-    // A statusLine that prints anything (a person's own command) is not on this list.
-    statusLineRows: [],
+    // No rows list the statusLine between the closing rule and the footer. OpenRig's collector
+    // (provisionContextCollector, assets/claude-statusline-context.cjs) prints nothing to stdout, and Claude Code
+    // 2.1.296 draws no row for an empty statusLine in the classic renderer OpenRig launches with
+    // (CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1), so the footer sits right under the closing rule. A person's own
+    // statusLine command (kept by provisionContextCollector) prints rows there that no list can name, so
+    // claudeSeatIdle trusts them by position, as findClaudeComposer does since #2703 and composerRegion (the send's box
+    // reader) does too, except the rows CLAUDE_NOT_STATUS_LINE_ROW rules out: blank, prompt-, menu- or dialog-shaped
+    // rows (#2798). That includes the indicator Claude draws at the right of the first statusLine row.
     // The one row between the box's two rules: empty (after-enter-15s.J), or the Try suggestion (idle-fresh-suggestion).
     boxes: [/^❯$/, /^❯\s+Try "[^"]*"$/],
     // The row just above the opening rule: blank (after-enter-15s.J), the effort row (idle-fresh-suggestion), or a
@@ -1773,8 +1885,9 @@ const SEAT_IDLE_SHAPES: {
     },
   },
   codex: {
-    // The hint row under the status line of an empty box (product-path-idle.J, idle).
-    hints: [/^\? for shortcuts$/, /^\? for shortcuts\s+⚠ \d+ warnings? · f2 to view$/],
+    // Empty-box hints: 0.160 product-path-idle.J/idle, and the captured 0.167 completed frame.
+    hints: [/^\? for shortcuts$/, /^\? for shortcuts\s+⚠ \d+ warnings? · f2 to view$/,
+      /^← for agents · \? for shortcuts\s+⚠ \d+ warnings? · f2 to view$/],
     // The last non-blank row above the empty box: the completion row Codex adds when a turn completes
     // (after-enter-15s.J; its grammar is CODEX_COMPLETION_ROW above), or the greeting under the session header
     // before any turn (idle, product-path-idle.J, cleared-without-enter.J). A running or streaming turn draws rows
@@ -1796,14 +1909,20 @@ function claudeSeatIdle(lines: string[], sessionName?: string): boolean {
   const idle = SEAT_IDLE_SHAPES.claude;
   let footer = lines.length - 1;
   while (footer >= 0 && !lines[footer]!.trim()) footer--;
-  const closing = footer - 1 - idle.statusLineRows.length;
-  if (closing < 4) return false;
+  if (footer < 0 || !Object.values(idle.footers).includes(lines[footer]!.trim())) return false;
+  // The closing rule is the first rule above the footer. The rows between them are a statusLine's (#2798), trusted
+  // by position, as findClaudeComposer trusts them (#2703): the frame above must check out below, and none of them
+  // may be a row a statusLine does not print or a menu could draw (CLAUDE_NOT_STATUS_LINE_ROW, which composerRegion
+  // shares). A rule drawn below the box (a second box opened under it, or a statusLine that prints one) is taken as the
+  // closing rule, so the frame check fails there and the seat reads unknown.
+  let closing = footer - 1;
+  while (closing >= 0 && !rule(lines[closing]!)) closing--;
+  if (closing < 4 || lines.slice(closing + 1, footer).some((row) => CLAUDE_NOT_STATUS_LINE_ROW.test(row))) return false;
   const width = (row: string) => [...row].length;
   const plainRule = (row: string) => idle.openingRules.plain.test(row);
   const openingRule = (row: string) => plainRule(row)
     || (!!sessionName && idle.openingRules.named(sessionName).test(row) && width(row) === width(lines[closing]!));
-  return Object.values(idle.footers).includes(lines[footer]!.trim())
-    && idle.statusLineRows.every((row, i) => lines[closing + 1 + i]!.trim() === row) && plainRule(lines[closing]!)
+  return plainRule(lines[closing]!)
     && idle.boxes.some((box) => box.test(lines[closing - 1]!)) && openingRule(lines[closing - 2]!)
     && idle.notices.includes(lines[closing - 3]!.trim()) && claudeStatusSlotIdle(lines, closing - 4);
 }
@@ -1834,16 +1953,21 @@ function codexSeatIdle(pane: string): boolean {
 // (`Update available! 0.160.0 -> 0.162.1`). These are only what the frames show; nothing here discovers a version. A frame where one of them names another version is not read as these
 // layouts. Most frames name no version (the banner and header scroll away), and then a matching layout is evidence
 // about the layout only, not proof of the client version: another version that draws the same rows reads the same.
-const RECORDED_CLIENT_VERSION: Record<"claude-code" | "codex", string> = { "claude-code": "2.1.296", codex: "0.160.0" };
+// Codex 0.167.1 and 0.167.2 count as 0.167.0: they changed no TUI code from it (openai/codex
+// rust-v0.167.0...rust-v0.167.2). A later patch, a prerelease or a later minor is another version until it's checked.
+const RECORDED_CLIENT_VERSIONS: Record<"claude-code" | "codex", RegExp> = {
+  "claude-code": /^2\.1\.296$/,
+  codex: /^(?:0\.160\.0|0\.167\.[0-2])$/,
+};
 const VISIBLE_CLIENT_VERSION: Record<"claude-code" | "codex", RegExp[]> = {
   "claude-code": [/Claude Code v(\d[\w.+-]*)/g],
   codex: [/OpenAI Codex \(v(\d[\w.+-]*)\)/g, /Update available! (\d[\w.+-]*) -> /g],
 };
 
-/** Whether a frame visibly names a client version other than the recorded one (see RECORDED_CLIENT_VERSION). */
-function namesAnotherClientVersion(pane: string, runtime: "claude-code" | "codex"): boolean {
+/** Whether a frame visibly names a client version other than the recorded ones (see RECORDED_CLIENT_VERSIONS). */
+export function namesAnotherClientVersion(pane: string, runtime: "claude-code" | "codex"): boolean {
   return VISIBLE_CLIENT_VERSION[runtime].some((pattern) =>
-    [...pane.matchAll(pattern)].some((match) => match[1] !== RECORDED_CLIENT_VERSION[runtime]));
+    [...pane.matchAll(pattern)].some((match) => !RECORDED_CLIENT_VERSIONS[runtime].test(match[1]!)));
 }
 
 /** The seat before the paste (see SeatReading), read from the capture the transport already takes before it.
@@ -1861,7 +1985,7 @@ export function readSeatBeforePaste(pane: string | null, runtime: "claude-code" 
  *  placeholders (Claude's queued label and Try suggestion, collapsed pastes, Codex's empty-box placeholder) are
  *  checked before the sent text, so none of them can read as `exact`. The sent text is `exact` only with its word
  *  boundaries kept, and `ambiguous` where the box's row breaks leave them uncertain (boxHoldsText). A frame that
- *  names another client version reads `unrecognized` (RECORDED_CLIENT_VERSION).
+ *  names another client version reads `unrecognized` (RECORDED_CLIENT_VERSIONS).
  *
  *  An empty box also reads `queued` where the frames say the message may wait behind a turn: Codex's
  *  pending-input rows above the box, rows between Codex's running-turn status row and the box, or
@@ -1898,7 +2022,22 @@ export function readInputBox(pane: string | null, runtime: "claude-code" | "code
 }
 
 export interface SendOpts {
+  /** Internal dedicated native wake, never accepted by the transport HTTP route. */
+  nativeWake?: true;
   expectedIdentity?: ExpectedConversation;
+  /** Internal: a message the seat's hook bridge couldn't deliver, typed under its own outbox id (sent as its committed
+   *  id) with the admission it was queued with, taken back from the bridge under the seat's lease. Never accepted from the
+   *  public transport route. */
+  hookBridgeFallback?: { nodeId: string; reason: string; admission: AdmissionInput | null };
+  /** Internal, evidence only: told why the seat's hook bridge couldn't take this send when it goes to typed delivery
+   *  instead, so the send's delivery record can say so. It asks nothing of the write. */
+  onHookBridgeUnavailable?: (reason: string) => void;
+  /** Internal: this caller can't yet represent a message queued for the seat's hook bridge (the watchdog's receipts
+   *  and accounting read only typed outcomes), so its send is typed. */
+  noHookBridge?: true;
+  /** Internal: an explicit queue notification (a resolve's), which passes a rig's delivery drain as on the typed path;
+   *  the hook bridge then queues it as a direct send, not an automatic one. */
+  drainExempt?: true;
   /** Internal provenance derived by the transport route. */
   identityProvenance?: string;
   /** Internal: with identityProvenance principal:v1, the MCP adapter's caller (the route's resolveRecordedIdentity). */
@@ -1915,14 +2054,19 @@ export interface SendOpts {
    *  decision), with how the seat's level would treat each input now. It returns the members that still go with this send:
    *  their text and outbox ids. Never accepted from HTTP. */
   recheckMembers?: (holds: (input: AdmissionInput) => boolean, held: boolean) => { text: string; outboxIds: string[] };
-  /** Internal observation of a completed input effect; never a permission callback. */
-  onInputEffect?: (phase: "pasted" | "submitted") => void;
+  /** Internal observation of a completed input effect; never a permission callback. A paste reports the exact text it
+   *  wrote, for delivery evidence. */
+  onInputEffect?: (phase: "pasted" | "submitted", written?: { text: string }) => void;
   /** Internal managed lifecycle prerequisite; never accepted from HTTP send options. */
   beforeWrite?: () => void;
-  /** Internal: managed lifecycle input must preserve a person's draft even when the optional typing guard is off.
+  /** Explicit internal composer-preservation request. Managed compaction instead uses ordinary draft-delivery defaults.
    *  `"typed"` (#2575) holds only a box that reads typed or typed-with-suggestion; any other reading that isn't empty is
    *  pasted over and named in `pastedOverInputBox`, never called empty. */
   preserveInput?: true | "typed";
+  /** A managed idle wait follows the ordinary draft-delivery setting; menus and running work still wait/refuse. */
+  allowDraftWhileIdle?: true;
+  /** Internal owed-restore fallback after bounded unknown polls; running work and prompts still wait/refuse. */
+  allowUnknownWhileIdle?: true;
   /** The caller's request. Aborted while the send still waits, before any input starts, the send ends with
    *  `caller_cancelled` and never writes, then or later. Once input may have started it is ignored: the result stays
    *  attempted or written. Queue wakes and committed outbox deliveries have no caller and ignore it. */
@@ -1992,6 +2136,24 @@ export interface SendOpts {
   typedExactly?: true;
 }
 
+/** OpenRig's own delivery-evidence observers, added to a send whose caller watches no input effect. They only record
+ *  what a typed write did; they ask nothing of the write, so they don't make a send ineligible for the hook bridge. */
+const evidenceOnlyObservers = new WeakSet<NonNullable<SendOpts["onInputEffect"]>>();
+
+/** Whether the seat's hook bridge may take this send in place of typing it. Only a plain message: the bridge hands text
+ *  to the model at a turn boundary, so it can't run what is checked or done at the moment of writing (a write-time
+ *  check, an input-effect callback, staged or exact text, an idle or draft rule), it can't hold a send to an original
+ *  conversation, and Claude runs a slash command only from typed input. Those, and a caller that can't represent a
+ *  queued message, are typed as today. */
+function bridgeable(text: string, opts?: SendOpts): boolean {
+  if (!opts) return !/^\s*\/[A-Za-z]/.test(text);
+  return !opts.hookBridgeFallback && !opts.noHookBridge && !opts.expectedIdentity && !opts.submitOnly && !opts.dangerouslyInteract
+    && !opts.beforeWrite && (!opts.onInputEffect || evidenceOnlyObservers.has(opts.onInputEffect)) && !opts.postCompactTurnBoundary && !opts.readinessFromPaneOnly && !opts.preserveInput
+    && !opts.allowDraftWhileIdle && !opts.allowUnknownWhileIdle && !opts.typeWithoutChecking && opts.exactText === undefined && !opts.typedExactly
+    && opts.expectedStagedText === undefined && !opts.requireFullStagedText && !opts.onStartupMismatch
+    && !/^\s*\/[A-Za-z]/.test(text);
+}
+
 const CALLER_CANCELLED = "caller_cancelled";
 
 /** The readiness reason's tail when only the retained hook says the seat waits on a person: the pane shows no prompt it
@@ -2004,6 +2166,13 @@ function clearAttentionHint(sessionName: string, reason: string): string {
   return reason.endsWith(LATEST_HOOK_ONLY) || reason === "permission_request_unverified"
     ? ` Look first: rig capture ${sessionName}. If that prompt is gone (declined or answered), clear it: rig seat clear-attention ${sessionName} --reason "<what you saw>".`
     : "";
+}
+
+/** The way past a refused prompt. A program's own /model picker is closed, not driven: text typed there picks a model. */
+function promptRoute(sessionName: string, prompt: Pick<AgentActivity, "reason" | "evidence">): string {
+  return prompt.reason === "selection_prompt" && isModelPickerHeader(prompt.evidence)
+    ? ` A model picker is open (${prompt.evidence}): close it (Esc) in that pane, then send again.`
+    : ` To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>".`;
 }
 
 /** The caller's cancellation signal, or none for sends no caller owns (queue wakes, committed outbox deliveries). */
@@ -2042,6 +2211,7 @@ export interface ExistingInput {
 type OverrideInputAudit = { classification: ExistingInput["classification"]; visibleRows: number; suggestionRows: number; choice: "inspect" | "type_without_checking"; outcome: "stopped" | "proceed"; clearAttempted: false };
 
 export interface SendResult {
+  runnerReceipt?: import("./outbox-handler.js").RunnerReceipt;
   /** #2429: this delivery first submitted a paste OpenRig had left unsubmitted in the seat's input. */
   ownPasteSubmitted?: true;
   checkedIdentity?: ExpectedConversation;
@@ -2071,7 +2241,8 @@ export interface SendResult {
    *   set on the send_failed / submit_failed returns for vocabulary symmetry;
    *   their `ok:false` + HTTP mapping is unchanged.
    */
-  outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained";
+  /** "bridged": queued for the seat's hook bridge, delivered into its context at its next turn boundary (slice 13). */
+  outcome?: "delivered" | "rendered-unconfirmed" | "failed" | "retained" | "bridged";
   outboxIds?: string[];
   delivery?: GuardedDeliverySummary;
   warning?: string;
@@ -2088,6 +2259,15 @@ export interface SendResult {
   /** Context, not a status: the seat was in a managed compaction or restore OpenRig had recorded when this send ran. The
    *  send's own result (ok, outcome, error) is unchanged by it, and it never says the restore finished. */
   managedCompaction?: { stage: string; observed: "before_send" | "after_send"; notice: string };
+  /** Context, not a status: when this send started, OpenRig held a current usage-limit reading for the seat with its
+   *  stated reset (#3508's reader), and the send's text reached the seat's input or may have (submitted, written without
+   *  Enter, or uncertain). The agent isn't expected to read it before the reset. The send's own result, uncertain
+   *  delivery included, is unchanged by it, and a send that wrote nothing gets none. */
+  usageLimit?: { asOf: string; resetsAt: string; notice: string };
+  /** Context, not a status: when this send started, the seat's main session had a permission or elicitation request,
+   *  made after its latest activity report, that OpenRig hadn't seen settled. It never says a dialog is open (a hook or
+   *  host can decide one with nothing shown), and the send's own result is unchanged by it. */
+  inputRequest?: { observedAt: string; notice: string };
   /** How far the send got toward the seat's input, where that is positively known:
    *  `not_reached` — an idle wait refused the send before any write was attempted;
    *  `attempted` — the text write was issued and reported a failure (it may still have landed);
@@ -2099,6 +2279,9 @@ export interface SendResult {
   pastedOverInputBox?: InputBoxAnnotation["status"];
   /** A `preserveInput` hold: the input box reading it held on. */
   heldInputBox?: InputBoxAnnotation["status"];
+  /** The existing preserve-input reading, without the draft or suggestion text. No extra capture. */
+  heldInputBoxReading?: Pick<InputBoxAnnotation, "status" | "confidence" | "evidence" | "cursor">;
+  inputReadFailure?: InputReadDiagnostic;
 }
 
 /** One reading of a Claude Code or Codex input box: `exact` (the sent text, word boundaries kept), `ambiguous`
@@ -2140,6 +2323,8 @@ export interface CaptureResult {
 }
 
 export interface BroadcastResult {
+  pendingNative?: number;
+  indeterminateNative?: number;
   total: number;
   sent: number;
   retained?: number;
@@ -2152,6 +2337,7 @@ export interface TransportReadinessChecker {
 }
 
 interface SessionTransportDeps {
+  runnerChannel?: RunnerChannel;
   contextUsageStore?: ContextUsageStore;
   db: Database.Database;
   rigRepo: RigRepository;
@@ -2161,6 +2347,8 @@ interface SessionTransportDeps {
   // A positive-picker override requires a working audit sink. Other explicit interaction attempts
   // audit too, but an unavailable sink stays advisory so an already accepted send is not refused.
   eventBus?: EventBus;
+  /** Slice 13: an opted-in Claude seat's hook bridge. Absent, every seat gets typed delivery as before. */
+  hookBridge?: HookBridge;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   waitForIdlePollMs?: number;
@@ -2212,6 +2400,7 @@ interface SessionReconciliationSnapshot {
 }
 
 export class SessionTransport {
+  private readonly runnerChannel?: RunnerChannel;
   private contextUsageStore?: ContextUsageStore;
   readonly db: Database.Database;
   readonly guardedDelivery?: DraftAwareDelivery;
@@ -2220,6 +2409,10 @@ export class SessionTransport {
   private tmuxAdapter: TmuxAdapter;
   private agentActivityStore?: AgentActivityStore;
   private eventBus?: EventBus;
+  private hookBridge?: HookBridge;
+  private queueWakeApplicable?: (entries: readonly QueueWakeFacts[]) => boolean;
+  private hookBridgeSweep: Promise<Array<{ outboxId: string; result: SendResult }>> | null = null;
+  private hookBridgeSweepAgain = false;
   private now: () => Date;
   private sleep: (ms: number) => Promise<void>;
   private waitForIdlePollMs: number;
@@ -2234,6 +2427,7 @@ export class SessionTransport {
   private deliverOverDraft?: () => boolean;
 
   constructor(deps: SessionTransportDeps) {
+    this.runnerChannel = deps.runnerChannel;
     this.contextUsageStore = deps.contextUsageStore;
     this.db = deps.db;
     this.rigRepo = deps.rigRepo;
@@ -2241,6 +2435,7 @@ export class SessionTransport {
     this.tmuxAdapter = deps.tmuxAdapter;
     this.agentActivityStore = deps.agentActivityStore;
     this.eventBus = deps.eventBus;
+    this.hookBridge = deps.hookBridge;
     this.now = deps.now ?? (() => new Date());
     this.sleep = deps.sleep ?? delay;
     this.waitForIdlePollMs = deps.waitForIdlePollMs ?? 500;
@@ -2259,6 +2454,9 @@ export class SessionTransport {
 
   configureGuardedWakes(applicable: (entries: readonly QueueWakeFacts[]) => boolean): void {
     this.guardedDelivery?.configureWakes(applicable);
+    // The hook bridge checks the same predicate before it queues an automatic wake and before it hands one over.
+    this.queueWakeApplicable = applicable;
+    if (this.hookBridge) this.hookBridge.wakeApplicable = applicable;
   }
 
   attachRuntimeAdapters(adapters: Record<string, TransportReadinessChecker>): void {
@@ -2539,7 +2737,7 @@ export class SessionTransport {
       const binding = this.sessionRegistry.getBindingForNode(node.id);
       const latestSession = latestByNode.get(node.id);
 
-      if (binding?.attachmentType === "external_cli" && binding.externalSessionName) {
+      if (resolveSeatKind(binding?.attachmentType).kind === "external_cli" && binding?.externalSessionName) {
         targets.push({
           sessionName: binding.externalSessionName,
           rigName,
@@ -2587,13 +2785,45 @@ export class SessionTransport {
    * agent input; a confirmed render does not prove agent consumption. */
   /** The managed compaction state OpenRig has recorded for a seat (the compaction enforcer's), for the sender's notice. */
   private compactionObserver?: (sessionName: string) => { stage: string; detail: string } | null;
+  private evidenceFailureLogged = false;
   setCompactionObserver(observer: (sessionName: string) => { stage: string; detail: string } | null): void {
     this.compactionObserver = observer;
+  }
+  /** #3508's usage-limit reader, for the sender's record. It reads recorded evidence only and never captures a pane. */
+  private usageLimitObserver?: (sessionName: string) => WatchdogUsageLimitState | null;
+  setUsageLimitObserver(observer: (sessionName: string) => WatchdogUsageLimitState | null): void {
+    this.usageLimitObserver = observer;
+  }
+  /** A limit is current when it has a future stated reset and no positive activity after it was recorded, as #3508's wake reads it. */
+  private currentUsageLimit(sessionName: string): { asOf: string; resetsAt: string } | null {
+    try {
+      const state = this.usageLimitObserver?.(sessionName) ?? null;
+      if (!state?.limit || Date.parse(state.limit.resetsAt) <= this.now().getTime()) return null;
+      return Date.parse(state.clearedAt ?? "") > Date.parse(state.limit.asOf) ? null : state.limit;
+    } catch {
+      return null; // An unreadable reading never changes a send.
+    }
+  }
+
+  /** The time of a permission or elicitation request the seat's main session made after its latest activity report and
+   *  that nothing has settled, else null. An unreadable record reads as none: it never changes a send. */
+  private unsettledInputRequestAt(sessionName: string): string | null {
+    try {
+      const nodeId = this.getSessionMeta(sessionName).nodeId;
+      const at = nodeId ? this.agentActivityStore?.getUnsettledInputRequestForNode?.(nodeId, sessionName) ?? null : null;
+      if (!at) return null;
+      const latest = this.agentActivityStore?.getLatestForNode({ sessionName, now: this.now(), order: "source" });
+      return latest?.eventAt && Date.parse(at) <= Date.parse(latest.eventAt) ? null : at;
+    } catch {
+      return null;
+    }
   }
 
   /**
    * Deliver as always; when the seat was in a managed compaction or restore OpenRig had recorded, before or after the
-   * send, add a notice saying so. The notice is context beside the send's own result, which it never changes.
+   * send, had an unsettled permission or elicitation request newer than its latest activity report, or was at its
+   * recorded usage limit while the text reached its input, add a notice saying so. Each notice is context beside the
+   * send's own result, which it never changes.
    */
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
     // A terminal seat's shell would run the envelope lines as commands. Swap before the guard,
@@ -2602,12 +2832,20 @@ export class SessionTransport {
     // segment must never edit a line of the exact text.
     if (opts?.exactText !== undefined && !opts.dangerouslyInteract) {
       const { exactText, ...rest } = opts;
-      if (!isBoundTerminalSeat(this.db, sessionName)) return this.send(sessionName, text, rest);
+      if (!isBoundTerminalSeat(this.db, sessionName) && !isBoundTerminalSeat(this.db, physicalSessionName(this.db, sessionName))) return this.send(sessionName, text, rest);
       return { ...(await this.send(sessionName, exactText, { ...rest, stampISO: undefined, typedExactly: true })), envelopeOmitted: true };
     }
     const observe = () => { try { return this.compactionObserver?.(sessionName) ?? null; } catch { return null; } };
     const before = observe();
-    const result = await this.sendWithoutCompactionNotice(sessionName, text, opts);
+    // A prompt answer or a bare Enter is aimed at the prompt itself, not a message for the agent to read.
+    const interacting = opts?.dangerouslyInteract || opts?.submitOnly;
+    const limit = interacting ? null : this.currentUsageLimit(sessionName);
+    const requestAt = interacting ? null : this.unsettledInputRequestAt(sessionName);
+    const sent = await this.sendWithoutCompactionNotice(sessionName, text, opts, limit);
+    const limited = limit && reachedInput(sent) ? { ...sent, usageLimit: { ...limit,
+      notice: `${sessionName} was at its usage limit when this send started (OpenRig recorded it at ${limit.asOf}; it resets at ${limit.resetsAt}). The message reached its input, or may have; the agent isn't expected to read it before then.` } } : sent;
+    const result = requestAt ? { ...limited, inputRequest: { observedAt: requestAt,
+      notice: `${sessionName}'s main session made a permission or elicitation request at ${requestAt}, after its latest activity report, and OpenRig hasn't seen it settled. That doesn't establish that a dialog is open; if this message matters, check the seat.` } } : limited;
     const seen = before ? { observed: "before_send" as const, ...before } : (() => { const after = observe(); return after ? { observed: "after_send" as const, ...after } : null; })();
     if (!seen) return result;
     const when = seen.observed === "before_send" ? "when this send started" : "when this send finished";
@@ -2615,7 +2853,68 @@ export class SessionTransport {
       notice: `${sessionName} was ${seen.detail} (${when}, as OpenRig's managed compaction recorded it). This doesn't mean the restore has finished; if this message matters, check the reply and follow up.` } };
   }
 
-  private async sendWithoutCompactionNotice(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+  private async sendWithoutCompactionNotice(sessionName: string, text: string, opts?: SendOpts, limit: { asOf: string; resetsAt: string } | null = null): Promise<SendResult> {
+    // The seat and occupant this send is for, frozen before it runs: a later handover doesn't relabel its evidence.
+    const seat = this.evidenceSeat(sessionName);
+    // The text the paste actually wrote (a terminal seat's exact text, a combined wake), not the text asked for.
+    let wire: { text: string; at: string } | null = null;
+    const observer: NonNullable<SendOpts["onInputEffect"]> = (phase, written) => {
+      if (phase === "pasted" && written) wire = { text: written.text, at: this.now().toISOString() };
+      opts?.onInputEffect?.(phase, written);
+    };
+    // Only the caller's own input-effect callback is a write-time contract; this observer alone isn't (bridgeable).
+    if (!opts?.onInputEffect) evidenceOnlyObservers.add(observer);
+    let bridgeUnavailable: string | null = null;
+    const observed: SendOpts | undefined = seat ? { ...opts, onInputEffect: observer, onHookBridgeUnavailable: (reason) => { bridgeUnavailable = reason; } } : opts;
+    const result = await this.sendMarkingUrgent(sessionName, text, observed);
+    this.recordDeliveryEvidence(sessionName, seat, opts, result, wire, bridgeUnavailable, limit && reachedInput(result) ? limit : null);
+    return result;
+  }
+
+  /** The seat a send is for, when evidence is recorded at all: its kind, pane and current occupant generation. */
+  private evidenceSeat(sessionName: string): { kind: "tmux" | "external_cli" | "unknown"; pane: string | null; occupant: string | null } | null {
+    if (!this.eventBus) return null;
+    try {
+      const meta = this.getSessionMeta(sessionName);
+      // The kind is the node's binding's; with no session row or no binding there's no kind to name.
+      const binding = meta.nodeId ? this.sessionRegistry.getBindingForNode(meta.nodeId) : null;
+      return { kind: binding ? resolveSeatKind(binding.attachmentType).kind : "unknown", pane: meta.pane, occupant: meta.occupant };
+    } catch {
+      return { kind: "unknown", pane: null, occupant: null };
+    }
+  }
+
+  /** One additive record of what this send's result says, beside it. Best effort: a record that
+   *  can't be written never changes the result, holds the send or resends anything. A fact the result doesn't give is
+   *  unknown. Only an outbox row that exists counts as admitted. */
+  private recordDeliveryEvidence(sessionName: string, seat: ReturnType<SessionTransport["evidenceSeat"]>, opts: SendOpts | undefined, result: SendResult,
+    wire: { text: string; at: string } | null, bridgeUnavailable: string | null, usageLimit: { asOf: string; resetsAt: string } | null = null): void {
+    if (!this.eventBus || !seat) return;
+    try {
+      const outboxIds = opts?.committedOutboxIds ?? result.outboxIds ?? [];
+      const outbox = new OutboxHandler(this.db);
+      // An outbox read that fails leaves admission unknown, never none or a partial list.
+      let admissionUnknown = false;
+      const admitted = outboxIds.filter((id) => { try { return Boolean(outbox.getById(id)); } catch { admissionUnknown = true; return false; } });
+      const attemptId = randomUUID();
+      this.eventBus.emit({
+        type: "transport.delivery_evidence", sessionName: result.sessionName ?? sessionName, seatKind: seat.kind,
+        pane: seat.pane, occupantGeneration: seat.occupant, messageId: opts?.deliveryId ?? outboxIds[0] ?? attemptId, attemptId,
+        admitted: admissionUnknown ? "unknown" : admitted.length > 0 ? { outboxIds: admitted } : "none", written: writtenFact(result),
+        terminalObserved: { outcome: result.outcome ?? null, verified: result.verified ?? null }, inputBoundary: "unknown", source: "send_result",
+        ...wireFingerprint(wire), outcome: readSendOutcome(result, writtenFact(result)),
+        ...(bridgeUnavailable ? { hookBridgeUnavailable: bridgeUnavailable } : {}),
+        ...(usageLimit ? { usageLimit } : {}),
+      });
+    } catch (err) {
+      if (!this.evidenceFailureLogged) {
+        this.evidenceFailureLogged = true;
+        console.warn(`[transport] delivery evidence wasn't recorded; sends are unaffected: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  private async sendMarkingUrgent(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
     if (!opts?.urgent) return this.sendClassified(sessionName, text, opts);
     // Shown on delivery, and kept with a held message: who marked it urgent.
     console.info(`[transport] urgent send to ${sessionName}, marked by ${opts.urgent.by}`);
@@ -2660,7 +2959,7 @@ export class SessionTransport {
       await resolveExpectedConversation(expected, this.sessionRegistry, this.tmuxAdapter, this.contextUsageStore);
       const result = await this.sendClassifiedInput(sessionName, text, { ...opts, expectedIdentity: expected,
         ...(opts?.committedOutboxIds ? {} : { deliveryId: ids[0] }) });
-      if (result.outcome !== "retained") {
+      if (result.outcome !== "retained" && result.outcome !== "bridged") {
         try {
           for (const id of ids) {
             if (result.ok) {
@@ -2690,14 +2989,182 @@ export class SessionTransport {
         sent: written ? true : attempted ? undefined : false,
         inputPhase: written ? "written" : attempted ? "attempted" : "not_reached",
         reason: (error as { code?: string }).code ?? "expected_identity_unavailable", error: (error as Error).message,
+        ...(error instanceof DeliveryGuardError && error.inputReadFailure ? { inputReadFailure: error.inputReadFailure } : {}),
         ...(receiptUnconfirmed ? { warning: "Conditional input receipt could not be finalized; inspect before retrying." } : {}) };
     }
   }
 
+  /** Slice 13: type the messages queued for a hook bridge that has no live arm (or, with `nodeId`, every message queued
+   *  for that seat), oldest first, each under its own outbox id through the ordinary send path. The daemon runs this on
+   *  an interval; a send that finds the bridge unavailable runs it for its seat. */
+  async sweepHookBridge(opts: { nodeId?: string } = {}): Promise<Array<{ outboxId: string; result: SendResult }>> {
+    // One sweep at a time: the interval's and a send's share the one running sweep, and a sweep asked for while one runs
+    // runs once after it.
+    if (this.hookBridgeSweep) { this.hookBridgeSweepAgain = true; return this.hookBridgeSweep; }
+    this.hookBridgeSweep = (async () => {
+      const typed: Array<{ outboxId: string; result: SendResult }> = [];
+      do {
+        this.hookBridgeSweepAgain = false;
+        typed.push(...await this.sweepHookBridgeOnce(opts));
+      } while (this.hookBridgeSweepAgain);
+      return typed;
+    })().finally(() => { this.hookBridgeSweep = null; });
+    return this.hookBridgeSweep;
+  }
+
+  private async sweepHookBridgeOnce(opts: { nodeId?: string }): Promise<Array<{ outboxId: string; result: SendResult }>> {
+    const bridge = this.hookBridge;
+    if (!bridge) return [];
+    bridge.reconcileUnacked();
+    const due = bridge.dueForFallback();
+    if (opts.nodeId && !due.some((d) => d.nodeId === opts.nodeId) && !bridge.live(opts.nodeId)) {
+      // By the same rule as the poll and the fallback: what a delivery drain holds stays queued (superseded wakes end).
+      const ids = bridge.queuedForTyping(opts.nodeId);
+      if (ids.length) due.push({ nodeId: opts.nodeId, outboxIds: ids, reason: bridge.unavailable(opts.nodeId) });
+    }
+    const outbox = new OutboxHandler(this.db);
+    const typed: Array<{ outboxId: string; result: SendResult }> = [];
+    for (const { nodeId, outboxIds, reason } of due) {
+      const saved = new Map(bridge.queued(nodeId).map((row) => [row.outboxId, row]));
+      // Oldest first. Each is taken back from the bridge only under the seat's lease, just before it's typed: one the
+      // bridge took first isn't typed, and the seat's loop stops there, so nothing is typed twice and nothing behind it
+      // overtakes it. Each keeps its own delivery contract: its admission, and the occupant it was queued for.
+      for (const outboxId of outboxIds) {
+        const entry = outbox.getById(outboxId);
+        const row = saved.get(outboxId);
+        if (!entry || !row) break;
+        // Its body already carries any urgent line; its admission says how the guard admits it.
+        const result = await this.send(entry.destinationSession, entry.body, { committedOutboxIds: [outboxId],
+          hookBridgeFallback: { nodeId, reason, admission: row.admission }, actorSession: entry.senderSession,
+          ...(entry.auditPointer ? { auditPointer: entry.auditPointer } : {}) });
+        if (result.reason === "hook_bridge_claimed") break;
+        // A drain that began since the selection holds it: untouched, and what's behind it may still go.
+        if (result.reason === "delivery_drain_held") continue;
+        // Its wake no longer applies: ended not delivered at the handback.
+        if (result.reason === "draft_wake_superseded" && result.sent === false) { typed.push({ outboxId, result }); continue; }
+        if (result.reason === "guard_target_changed" && result.sent === false) {
+          bridge.abandon(nodeId, entry.destinationSession, outboxId, "it was queued for an earlier occupant of the seat, which is gone");
+          typed.push({ outboxId, result });
+          continue;
+        }
+        if (result.outcome !== "retained") {
+          outbox.finalizeDelivery(outboxId, result.ok && result.outcome !== "rendered-unconfirmed" ? "delivered"
+            : result.ok || result.inputPhase === "attempted" || result.inputPhase === "written" ? "indeterminate" : "failed");
+        }
+        // Its sender's record (a queue wake's nudge result) reads how it actually ended.
+        bridge.typedEnd(outboxId, result);
+        typed.push({ outboxId, result });
+      }
+    }
+    return typed;
+  }
+
+  /** A hook-bridge fallback takes its row back from the bridge under the seat's lease, just before typing it. Null when
+   *  it may type; otherwise why it doesn't: the row was queued for an occupant who's gone (it isn't typed into the new
+   *  one), or the bridge's waiter took it first. */
+  private takeFromHookBridge(sessionName: string, ids: string[], opts?: SendOpts): SendResult | null {
+    const fallback = opts?.hookBridgeFallback;
+    if (!fallback) return null;
+    const outboxId = ids[0]!;
+    const entry = new OutboxHandler(this.db).getById(outboxId);
+    const target = this.tmuxAdapter.deliveryGuard!.target(sessionName);
+    if (entry?.guardBinding && JSON.stringify(entry.guardBinding) !== JSON.stringify(target)) {
+      return { ok: false, sessionName, sent: false, inputPhase: "not_reached", reason: "guard_target_changed", error: "This message was queued for another occupant of the seat; no input written." };
+    }
+    const refused = this.hookBridge?.handbackRefusal(fallback.nodeId, outboxId);
+    if (refused === "drained") {
+      return { ok: false, sessionName, sent: false, inputPhase: "not_reached", reason: "delivery_drain_held", error: "The seat's rig is in a delivery drain; this message stays queued until it ends." };
+    }
+    if (refused === "superseded") {
+      return { ok: false, sessionName, sent: false, inputPhase: "not_reached", reason: "draft_wake_superseded", error: "The queue wake is no longer applicable; it ended not delivered, and nothing was typed." };
+    }
+    if (!this.hookBridge?.releaseForTyping(fallback.nodeId, sessionName, outboxId, fallback.reason)) {
+      return { ok: false, sessionName, sent: false, inputPhase: "not_reached", reason: "hook_bridge_claimed", error: "The seat's hook bridge took this message first; nothing typed." };
+    }
+    return null;
+  }
+
+  sendNativeWake(sessionName: string, question: string, requestId: string, actorSession: string): Promise<SendResult> {
+    return this.send(sessionName, question, { nativeWake: true, deliveryId: requestId, actorSession });
+  }
+
+  private inputRoute(nodeId: string): "typed" | "native" {
+    if (!(this.db.prepare("PRAGMA table_info(nodes)").all() as { name: string }[]).some(column => column.name === "input_route")) return "typed";
+    return (this.db.prepare("SELECT input_route FROM nodes WHERE id=?").get(nodeId) as { input_route: "typed" | "native" } | undefined)?.input_route ?? "typed";
+  }
+
+  private nativeResult(sessionName: string, receipt: import("./outbox-handler.js").RunnerReceipt): SendResult {
+    const rejected = receipt.stage === "rejected";
+    return { ok: !rejected, sessionName, verified: false, outboxIds: receipt.memberIds ?? [receipt.requestId], runnerReceipt: receipt,
+      ...(!receipt.reconciliation && !receipt.result?.submissionUnknown && (receipt.stage === "submitted" || receipt.stage === "completed") ? { sent: true } : rejected ? { sent: false } : {}),
+      reason: receipt.reconciliation ?? `native_${receipt.stage}` };
+  }
+
+  private admitNative(sessionName: string, text: string, opts: SendOpts | undefined, ids: string[]): SendResult {
+    const target = this.tmuxAdapter.deliveryGuard!.target(sessionName);
+    if (!this.runnerChannel) throw new RunnerChannelError("runner_unavailable", "Native channel unavailable; no input offered.");
+    const primary = new OutboxHandler(this.db).getById(ids[0]!);
+    if (primary?.guardBinding && JSON.stringify(primary.guardBinding) !== JSON.stringify(target))
+      throw new DeliveryGuardError("guard_target_changed", "The retained native input belongs to another occupant; no input offered.");
+    opts?.beforeWrite?.();
+    const receipt = this.runnerChannel.admit(target.nodeId, { outboxId: ids[0]!, senderSession: opts?.committedOutboxIds ? primary?.senderSession ?? "unknown" : opts?.actorSession ?? "unknown",
+      destinationSession: sessionName, body: opts?.committedOutboxIds ? primary?.body ?? text : text, kind: opts?.nativeWake ? "wake" : "input", inputRoute: "native", payload: opts?.nativeWake ? { question: text } : { text },
+      ...(ids.length > 1 ? { memberIds: ids } : {}),
+      auditPointer: opts?.auditPointer, identityProvenance: opts?.identityProvenance, identityPrincipal: opts?.identityPrincipal });
+    return this.nativeResult(sessionName, receipt);
+  }
+
   private async sendClassifiedInput(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    // Explicit key/editor operations are not native model prompts. Pi's reserved compaction
+    // control keeps its existing guarded editor path; ordinary OpenRig notices still select native.
+    const typedControl = opts?.dangerouslyInteract === true || opts?.submitOnly === true || opts?.typedExactly === true
+      || opts?.openrigNotice === true && /^\/openrig-compact ([\w-]+)$/.test(text) && this.getSessionMeta(sessionName).runtime === "pi";
+    // A bridge handback continues its original typed attempt; a changed preference selects new messages only.
+    const inputRoute = (nodeId: string): "typed" | "native" => typedControl || opts?.hookBridgeFallback ? "typed" : this.inputRoute(nodeId);
+    const history = new OutboxHandler(this.db);
+    const inputId = opts?.committedOutboxIds?.[0] ?? opts?.deliveryId;
+    const primaryId = inputId ? history.runnerPrimary(inputId) : null;
+    const previous = primaryId ? history.runnerReceipt(primaryId) : null;
+    if (primaryId && !previous) return { ok: false, sessionName, reason: "native_receipt_unavailable", error: "Native operation evidence unavailable; no input offered." };
+    if (previous?.erasedAt) return { ok: false, sessionName, reason: "runner_receipt_erased", error: "Native request content was erased; no input offered." };
+    if (previous && typedControl) return { ok: false, sessionName, sent: false, reason: "delivery_identity_conflict",
+      error: "This request ID already selects native input; use a new request ID for terminal control." };
+    if (previous) {
+      const entry = history.getById(previous.requestId)!;
+      if (entry.destinationSession !== sessionName || !opts?.committedOutboxIds && entry.senderSession !== (opts?.actorSession ?? "unknown")
+        || (previous.payload.text ?? previous.payload.question) !== text || (opts?.nativeWake ? "wake" : "input") !== previous.kind || opts?.committedOutboxIds && JSON.stringify(previous.memberIds ?? [previous.requestId]) !== JSON.stringify(opts.committedOutboxIds))
+        return { ok: false, sessionName, sent: false, reason: "delivery_identity_conflict", error: "This request ID names different input or target." };
+      return this.nativeResult(sessionName, previous);
+    }
+    // Preferences select new requests. Retained IDs keep their recorded route; a legacy unmarked held row is typed.
+    const checkRetainedRoutes = (selected: "typed" | "native", selectedIds: readonly string[]) => {
+      for (const id of selectedIds) {
+        const kind = history.inputKind(id);
+        if (kind && kind !== (opts?.nativeWake ? "wake" : "input"))
+          throw new DeliveryGuardError("delivery_identity_conflict", "This delivery ID selects a different native kind; use a new request ID.");
+        const recorded = history.inputRoute(id);
+        const entry = recorded === null && selected === "native" ? history.getById(id) : null;
+        const saved = recorded ?? (entry && ["retained", "retired"].includes(entry.deliveryState) ? "typed" : null);
+        if (saved && saved !== selected) throw new DeliveryGuardError("delivery_identity_conflict",
+          `This delivery ID selects ${saved} input; use a new request ID to select ${selected} input.`);
+      }
+    };
     const guard = this.tmuxAdapter.deliveryGuard;
-    const admission: AdmissionInput = { source: opts?.openrigNotice ? "openrig" : "agent", urgent: !!opts?.urgent, override: opts?.dangerouslyInteract === true };
+    const targetNode = guard?.maybeTarget(sessionName)?.nodeId;
+    if (opts?.nativeWake && (!targetNode || inputRoute(targetNode) !== "native"))
+      return { ok: false, sessionName, sent: false, reason: "native_route_required", error: "A live native wake requires this seat's native input route." };
+    if (!guard && this.getSessionMeta(sessionName).nodeId && inputRoute(this.getSessionMeta(sessionName).nodeId!) === "native")
+      return { ok: false, sessionName, sent: false, reason: "guard_unavailable", error: "Native admission requires the delivery guard." };
+    const saved = opts?.hookBridgeFallback?.admission;
+    const admission: AdmissionInput = saved ? { source: saved.source, urgent: saved.urgent, override: false }
+      : { source: opts?.openrigNotice ? "openrig" : "agent", urgent: !!opts?.urgent, override: opts?.dangerouslyInteract === true };
     if (!guard) {
+      try {
+        const nodeId = this.getSessionMeta(sessionName).nodeId;
+        checkRetainedRoutes(nodeId ? inputRoute(nodeId) : "typed", opts?.committedOutboxIds ?? (opts?.deliveryId ? [opts.deliveryId] : []));
+      } catch (error) {
+        return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message };
+      }
       // No guard, so no recorded delivery to read back: a caller already gone ends the send here.
       if (callerSignal(opts)?.aborted) return callerCancelled(sessionName);
       const result = await this.sendUnguarded(sessionName, text, opts);
@@ -2732,7 +3199,7 @@ export class SessionTransport {
       // write. A null return means go through guard.operation exactly as on
       // main (guard held, target unresolvable, or a quick refusal).
       let sendOpts = opts;
-      if (opts?.waitForIdleMs !== undefined && !opts.submitOnly && !opts.preWaitedIdle) {
+      if (opts?.waitForIdleMs !== undefined && !opts.submitOnly && !opts.preWaitedIdle && inputRoute(guard.target(sessionName).nodeId) !== "native") {
         const pre = await this.preWaitForIdle(sessionName, opts, guard);
         if (pre === null) {
           // Fall through with today's path (in-lease wait / retain / throw).
@@ -2759,10 +3226,74 @@ export class SessionTransport {
           sendOpts = { ...opts, preWaitedIdle: pre.evidence, preWaitBound: pre.bound };
         }
       }
+      let bridgeWarning: string | undefined;
       const result = await guard.operation(sessionName, async () => {
+        const taken = this.takeFromHookBridge(sessionName, ids, opts);
+        if (taken) return taken;
         const members = recheck(false);
         const memberText = members?.text ?? text;
         const memberOpts = members ? { ...sendOpts, committedOutboxIds: members.outboxIds } : sendOpts;
+        const currentIds = memberOpts?.committedOutboxIds ?? ids;
+        const route = inputRoute(guard.target(sessionName).nodeId);
+        if (memberOpts?.nativeWake && route !== "native")
+          return { ok: false, sessionName, sent: false, reason: "native_route_required", error: "A live native wake requires this seat's native input route." };
+        checkRetainedRoutes(route, currentIds);
+        if (route === "native") {
+          if (memberOpts?.expectedIdentity) {
+            const original = await resolveExpectedConversation(memberOpts.expectedIdentity, this.sessionRegistry, this.tmuxAdapter, this.contextUsageStore);
+            original.assertCurrent();
+          }
+          if (callerSignal(memberOpts)?.aborted) return callerCancelled(sessionName);
+          return this.admitNative(sessionName, memberText, memberOpts, currentIds);
+        }
+        // Slice 13: an occupant launched with its hook bridge gets the message at its next turn boundary, nothing typed.
+        // Admission (hold, the levels) has already decided above. With no live arm, it's typed, with a warning; messages
+        // already queued go first, so a send never overtakes them.
+        const bridge = this.hookBridge;
+        // Only a plain message is bridged (see bridgeable): everything else is typed, where its checks run.
+        if (bridge && bridgeable(memberText, memberOpts)) {
+          const target = guard.target(sessionName);
+          const routed = bridge.routes(target);
+          // Messages already queued that a typed send would take now go first: a new one goes behind them even when
+          // the bridge no longer routes (an opt-out after they were queued).
+          const ahead = bridge.queuedForTyping(target.nodeId).length > 0;
+          if (routed || ahead) {
+            // As the typed path checks before typing: a caller gone while it waited for the lease, and an automatic
+            // wake its queue row no longer wants (an explicit notice isn't subject to it), queue nothing.
+            if (callerSignal(memberOpts)?.aborted) return callerCancelled(sessionName);
+            const bridgeIds = memberOpts?.committedOutboxIds ?? ids;
+            if (memberOpts?.queueWake && !memberOpts.drainExempt && this.queueWakeApplicable) {
+              const outbox = new OutboxHandler(this.db);
+              const facts = memberOpts.committedOutboxIds ? bridgeIds.map((id) => outbox.getById(id)).filter((e): e is NonNullable<typeof e> => !!e)
+                : [{ outboxId: bridgeIds[0]!, auditPointer: memberOpts.auditPointer ?? null, destinationSession: sessionName }];
+              let applicable = true;
+              try { applicable = this.queueWakeApplicable(facts); } catch (error) {
+                console.error(`[hook-bridge] ${sessionName}'s queue wake couldn't be read; delivering:`, error);
+              }
+              if (!applicable) return { ok: true, sessionName, outcome: "retained" as const, sent: false, verified: false, inputPhase: "not_reached" as const,
+                reason: "draft_wake_superseded", error: "The queue wake is no longer applicable; nothing was queued or typed.",
+                warning: "Held, not delivered. Retry the current request when the input is free; no saved callback or message is replayed automatically." };
+            }
+            const queueOpts = { ...(memberOpts ?? {}), admission };
+            // A deposit that queued nothing (an id already settled) isn't reported queued: the send goes on as it would
+            // without the bridge.
+            if (routed && bridge.live(target.nodeId)) {
+              const queued = bridge.deposit(target, sessionName, memberText, queueOpts, bridgeIds);
+              if (queued) return queued;
+            } else {
+              const reason = routed ? bridge.unavailable(target.nodeId) : "the seat no longer routes through it";
+              const queued = ahead ? bridge.deposit(target, sessionName, memberText, queueOpts, bridgeIds) : null;
+              if (queued) {
+                setImmediate(() => { void this.sweepHookBridge({ nodeId: target.nodeId }).catch(() => {}); });
+                return { ...queued, warning: `${sessionName}'s hook bridge isn't available (${reason}): this message is typed after the ones already queued for it.` };
+              }
+              if (routed) {
+                bridgeWarning = `${sessionName}'s hook bridge isn't available (${reason}): delivered by typing instead.`;
+                memberOpts?.onHookBridgeUnavailable?.(reason);
+              }
+            }
+          }
+        }
         if (this.guardedDelivery && !memberOpts?.submitOnly && !memberOpts?.dangerouslyInteract && guard.needsInputCheck(sessionName)) {
           if (callerSignal(memberOpts)?.aborted) return callerCancelled(sessionName);
           return this.guardedDelivery.send(sessionName, memberText, memberOpts ?? {},
@@ -2773,8 +3304,14 @@ export class SessionTransport {
         if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
         // Nothing is retained yet: a caller that went away while this send waited for the lease ends it here.
         if (callerSignal(opts)?.aborted) return callerCancelled(sessionName);
+        const taken = this.takeFromHookBridge(sessionName, ids, opts);
+        if (taken) return taken;
         const members = recheck(true);
         if (members) ids = members.outboxIds;
+        const route = inputRoute(target.nodeId);
+        if (opts?.nativeWake && route !== "native")
+          return { ok: false, sessionName, sent: false, reason: "native_route_required", error: "A live native wake requires this seat's native input route." };
+        checkRetainedRoutes(route, ids);
         this.db.transaction(() => {
           for (const id of ids) {
             const prior = opts?.committedOutboxIds ? outbox.getById(id) : null;
@@ -2783,6 +3320,8 @@ export class SessionTransport {
               outboxId: id, senderSession: opts?.actorSession ?? "unknown", destinationSession: sessionName, body: text, auditPointer: opts?.auditPointer,
               identityProvenance: opts?.identityProvenance, identityPrincipal: opts?.identityPrincipal, ...(opts?.urgent ? { urgency: "urgent" } : {}),
             }, target, !!opts?.committedOutboxIds, { sameSend: ids });
+            outbox.bindInputRoute({ outboxId: id, senderSession: prior?.senderSession ?? opts?.actorSession ?? "unknown",
+              destinationSession: sessionName, body: prior?.body ?? text }, inputRoute(target.nodeId), opts?.nativeWake ? "wake" : "input");
           }
         })();
         // P2: observed only after the retention above committed; a submit-only
@@ -2802,6 +3341,7 @@ export class SessionTransport {
         }
         return retainedResult();
       }, admission);
+      if (bridgeWarning) result.warning = [bridgeWarning, result.warning].filter(Boolean).join(" ");
       if (result.ok && result.sent !== false) {
         await this.reconcileStartupReadiness(sessionName).catch(() => {});
       }
@@ -2811,17 +3351,20 @@ export class SessionTransport {
       if ((error as { inputWritten?: boolean }).inputWritten === true) {
         // Only a throw before the Enter key reached the adapter positively means Enter was never sent.
         const enter = (error as { enterAttempted?: boolean }).enterAttempted === true ? "the submission (Enter) outcome is unconfirmed" : "Enter was not sent";
-        return { ok: false, sessionName, sent: true, outcome: "failed", inputPhase: "written", reason: (error as { code?: string }).code ?? "submit_refused",
+        return { ok: false, sessionName, sent: true, outcome: "failed", inputPhase: "written",
+          ...(error instanceof DeliveryGuardError && error.inputReadFailure ? { inputReadFailure: error.inputReadFailure } : {}), reason: (error as { code?: string }).code ?? "submit_refused",
           error: `Text was written to '${sessionName}' but ${enter}: ${(error as Error).message}` };
       }
       // A throw after the text write was issued: whether it landed is unknown, so it is not "nothing sent" either.
       if ((error as { inputAttempted?: boolean }).inputAttempted === true) {
-        return { ok: false, sessionName, outcome: "failed", inputPhase: "attempted", reason: (error as { code?: string }).code ?? "delivery_indeterminate",
+        return { ok: false, sessionName, outcome: "failed", inputPhase: "attempted",
+          ...(error instanceof DeliveryGuardError && error.inputReadFailure ? { inputReadFailure: error.inputReadFailure } : {}), reason: (error as { code?: string }).code ?? "delivery_indeterminate",
           error: `A text write to '${sessionName}' was issued, but its result was lost: ${(error as Error).message}` };
       }
       const noInputCode = error instanceof OutboxHandlerError && error.code === "retained_quota_full" ? "retained_quota_full" as const
         : error instanceof DeliveryGuardError && error.code === "terminal_seat" ? "terminal_seat" as const : undefined;
       return { ok: false, sessionName, sent: false, reason: (error as { code?: string }).code ?? "guard_unavailable", error: (error as Error).message,
+        ...(error instanceof DeliveryGuardError && error.inputReadFailure ? { inputReadFailure: error.inputReadFailure } : {}),
         ...(noInputCode ? { noInputCode, inputPhase: "not_reached" as const } : {}) };
     }
   }
@@ -2870,7 +3413,7 @@ export class SessionTransport {
     // External CLI seats never wait: main refuses them before anything else,
     // and a probe or wait would only delay that refusal (or mistake it for
     // an absent session).
-    if (meta.attachmentType === "external_cli") {
+    if (seatInboundTransport(resolveSeatKind(meta.attachmentType)) === "none") {
       return { ok: false, failure: {
         ok: false,
         sessionName,
@@ -2952,6 +3495,8 @@ export class SessionTransport {
       privateInput: opts.dangerouslyInteract === true,
       readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
       postCompactTurnBoundary: opts.postCompactTurnBoundary === true,
+      allowDraft: opts.allowDraftWhileIdle === true,
+      allowUnknown: opts.allowUnknownWhileIdle === true,
       signal: callerSignal(opts), cancelledBy: "caller",
     });
     if (!preWait.ok) {
@@ -3035,11 +3580,12 @@ export class SessionTransport {
     } : null;
     let existingInput: ExistingInput | undefined;
     let pastedOverInputBox: InputBoxAnnotation["status"] | undefined, heldInputBox: InputBoxAnnotation["status"] | undefined;
+    let heldInputBoxReading: SendResult["heldInputBoxReading"];
     let overrideBeforePaste: (() => Promise<void>) | undefined;
     const observe = (result: SendResult): SendResult => {
       if (checkedIdentity) result = { ...result, checkedIdentity, identityContract: 1 };
       if (pastedOverInputBox) result = { ...result, pastedOverInputBox };
-      if (heldInputBox && !result.ok) result = { ...result, heldInputBox };
+      if (heldInputBox && !result.ok) result = { ...result, heldInputBox, ...(heldInputBoxReading ? { heldInputBoxReading } : {}) };
       if (existingInput) result = { ...result, existingInput };
       if (result.ok && runtimeAdvisory) result = { ...result, warning: [runtimeAdvisory, result.warning].filter(Boolean).join(" ") };
       if (observed && this.captureObserver) {
@@ -3061,7 +3607,7 @@ export class SessionTransport {
     const waitMode = waitForIdleMs !== undefined;
     let waitEvidence: Pick<SendResult, "activity" | "waitedMs" | "attempts"> = {};
 
-    if (sessionMeta.attachmentType === "external_cli") {
+    if (seatInboundTransport(resolveSeatKind(sessionMeta.attachmentType)) === "none") {
       return {
         ok: false,
         sessionName,
@@ -3214,7 +3760,7 @@ export class SessionTransport {
       }
       if (!submitResult.ok && !enterIssued && submitResult.code === CALLER_CANCELLED && cancel?.aborted) return callerCancelled(sessionName);
       if (!submitResult.ok) {
-        return { ok: false, sessionName, inputPhase: enterIssued ? "attempted" : "not_reached", ...(!enterIssued ? { sent: false } : {}), reason: submitResult.code?.startsWith("expected_identity_") ? submitResult.code : "submit_failed", outcome: "failed", error: enterIssued
+        return { ok: false, sessionName, ...(submitResult.inputReadFailure ? { inputReadFailure: submitResult.inputReadFailure } : {}), inputPhase: enterIssued ? "attempted" : "not_reached", ...(!enterIssued ? { sent: false } : {}), reason: submitResult.code?.startsWith("expected_identity_") ? submitResult.code : "submit_failed", outcome: "failed", error: enterIssued
           ? `submitOnly: Enter reported a failure for '${sessionName}'; submission is unconfirmed: ${submitResult.message}`
           : `submitOnly: Enter was not sent to '${sessionName}': ${submitResult.message}` };
       }
@@ -3235,6 +3781,8 @@ export class SessionTransport {
         privateInput: opts?.dangerouslyInteract === true,
         readinessFromPaneOnly: opts?.readinessFromPaneOnly === true,
         postCompactTurnBoundary: opts?.postCompactTurnBoundary === true,
+        allowDraft: opts?.allowDraftWhileIdle === true,
+        allowUnknown: opts?.allowUnknownWhileIdle === true,
         signal: callerSignal(opts), cancelledBy: "caller",
       });
       waitEvidence = {
@@ -3295,6 +3843,8 @@ export class SessionTransport {
           binding: observed?.binding,
           readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
           postCompactTurnBoundary: opts.postCompactTurnBoundary === true,
+          allowDraft: opts.allowDraftWhileIdle === true,
+          allowUnknown: opts.allowUnknownWhileIdle === true,
           signal: callerSignal(opts), cancelledBy: "caller",
         });
         waitEvidence = {
@@ -3322,12 +3872,12 @@ export class SessionTransport {
           readinessFromPaneOnly: opts.readinessFromPaneOnly === true,
           postCompactTurnBoundary: opts.postCompactTurnBoundary === true,
         }, opts.dangerouslyInteract === true);
-        if (recheck.state !== "idle") {
+        if (recheck.state !== "idle" && !(opts.allowUnknownWhileIdle && recheck.state === "unknown") && !(opts.allowDraftWhileIdle && this.deliversOverDraft(recheck))) {
           const late: { reason: string; error: string } =
             recheck.state === "needs_input"
               ? {
                   reason: "target_needs_input",
-                  error: `Refused: '${sessionName}' is at an interactive prompt (${recheck.reason}). A message must not select or approve it. To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>".${clearAttentionHint(sessionName, recheck.reason)} No text was sent.`,
+                  error: `Refused: '${sessionName}' is at an interactive prompt (${recheck.reason}). A message must not select or approve it.${promptRoute(sessionName, recheck)}${clearAttentionHint(sessionName, recheck.reason)} No text was sent.`,
                 }
               : recheck.state === "unknown"
                 ? {
@@ -3374,6 +3924,8 @@ export class SessionTransport {
     let draftAdvised = false;
     // Broadcast can carry wait + override: after waiting, it still uses the same deliberate-input boundary.
     const promptOverride = Boolean(opts?.dangerouslyInteract);
+    // Positive evidence of an interactive prompt: there an Enter after a consumed answer lands in the next prompt.
+    let overrideAtPrompt = false;
     if (waitForIdleMs === undefined || promptOverride) {
       const readiness = await this.classifySendReadiness({
         sessionName,
@@ -3385,6 +3937,7 @@ export class SessionTransport {
       // Explicit interaction selects key input even when readiness cannot recognize the prompt.
       // Only bypassing a positive picker requires a successful audit; other states already sent.
       if (opts?.dangerouslyInteract) {
+        overrideAtPrompt = readiness.state === "needs_input";
         if (readiness.state === "needs_input" && (!opts.reason || opts.reason.trim().length === 0)) {
           return {
             ok: false,
@@ -3408,14 +3961,16 @@ export class SessionTransport {
             existingInput = { target, classification, rows: input?.rows ?? [], suggestionRows: input?.suggestionRows ?? [],
               cursor: input?.cursor ?? null, fullContentsVisible: !!input && input.state !== "unknown" && !input.collapsedPaste,
               ...(input?.unknownReason ? { reason: input.unknownReason } : {}), cleared: false };
-            const stopped = classification === "typed_or_pasted" || classification === "unreadable";
+            // Only seen typed or pasted text stops the override. An input that can't be read is not
+            // evidence of text, so the override delivers and says it couldn't read the input.
+            const stopped = classification === "typed_or_pasted";
             const audit = this.recordPromptOverride({ ...auditInput, input: { classification, visibleRows: existingInput.rows.length,
               suggestionRows: existingInput.suggestionRows.length, choice: unchecked ? "type_without_checking" : "inspect",
               outcome: stopped ? "stopped" : "proceed", clearAttempted: false } });
             if (!audit.ok) sendAdvisory = `prompt-override: audit unavailable (${audit.reason}).`;
-            if (stopped) throw new DeliveryGuardError(classification === "unreadable" ? "override_input_unknown" : "override_input_present",
-              classification === "unreadable" ? "Input could not be read. Nothing was typed. Inspect the native terminal, deliberately clear its prompt with native/tmux controls, then retry; or explicitly choose --type-without-checking (does not clear)."
-                : "Existing typed or pasted input (author unknown). Nothing was typed. Inspect the shown input, deliberately clear the prompt with native/tmux controls, then retry. Manual clearing is outside OpenRig's lease and observation checks and is not recorded.");
+            if (stopped) throw new DeliveryGuardError("override_input_present",
+              "Existing typed or pasted input (author unknown). Nothing was typed. Inspect the shown input, deliberately clear the prompt with native/tmux controls, then retry. Manual clearing is outside OpenRig's lease and observation checks and is not recorded.");
+            if (classification === "unreadable") sendAdvisory = [sendAdvisory, "Input could not be read and was not cleared; this send may join or submit existing text."].filter(Boolean).join(" ");
             if (unchecked) sendAdvisory = [sendAdvisory, "Input was not checked or cleared; this send may join or submit existing text."].filter(Boolean).join(" ");
           };
         }
@@ -3442,7 +3997,7 @@ export class SessionTransport {
             reason: "target_needs_input",
             sent: false, inputPhase: "not_reached",
             activity: readiness,
-            error: `Refused: '${sessionName}' is at an interactive prompt (${readiness.reason}). A message must not select or approve it. To deliberately drive the prompt: rig send ${sessionName} "<text>" --dangerously-interact --reason "<why>".${clearAttentionHint(sessionName, readiness.reason)} No text was sent.`,
+            error: `Refused: '${sessionName}' is at an interactive prompt (${readiness.reason}). A message must not select or approve it.${promptRoute(sessionName, readiness)}${clearAttentionHint(sessionName, readiness.reason)} No text was sent.`,
           };
         }
       } else if (readiness.state === "unknown") {
@@ -3518,6 +4073,9 @@ export class SessionTransport {
       const box = await this.captureInputBox(readTarget, boxRuntime, { remainingMs: INPUT_BOX_READ_DEADLINE_MS });
       if (box.status === "typed" || box.status === "typed-with-suggestion") {
         if (draftChoice === "refuse") {
+          heldInputBox = box.status;
+          const { status, confidence, evidence, cursor } = box;
+          heldInputBoxReading = { status, confidence, evidence, cursor };
           const activity: AgentActivity = { state: "needs_input", reason: "prompt_draft", evidenceSource: "pane_heuristic",
             sampledAt: this.now().toISOString(), evidence: `input box reads ${box.status}`, fallback: true };
           // Wait evidence keeps its waitedMs and attempts; the activity is this draft's, not the idle the wait ended on.
@@ -3547,8 +4105,12 @@ export class SessionTransport {
       const typed = box?.status === "typed" || box?.status === "typed-with-suggestion";
       if (!clear && (opts?.preserveInput !== "typed" || typed)) {
         heldInputBox = box?.status ?? "unknown";
+        if (box) {
+          const { status, confidence, evidence, cursor } = box;
+          heldInputBoxReading = { status, confidence, evidence, cursor };
+        }
         throw new DeliveryGuardError(box?.status === "typed" ? "draft_input_busy" : "draft_input_unknown",
-          `Managed input waits for an empty composer (it reads ${box?.status ?? "unknown"}). Your draft was left untouched; inspect the pane before retrying.`);
+          `Managed input waits for an empty composer (it reads ${box?.status ?? "unknown"}). Your draft was left untouched; inspect the pane before retrying.`, inputReadDiagnostic("composer", box));
       }
       if (!clear) pastedOverInputBox = box?.status ?? "unknown";
     } : undefined;
@@ -3583,6 +4145,7 @@ export class SessionTransport {
         ok: false,
         sessionName,
         reason: policyRefusal ? textResult.code : "send_failed",
+        ...(textResult.inputReadFailure ? { inputReadFailure: textResult.inputReadFailure } : {}),
         outcome: "failed",
         // The adapter's draft checks run before the paste (only file/buffer preparation precedes them), and its
         // after-paste observation cannot fail the write, so a draft_* receipt proves the target input was never reached.
@@ -3591,7 +4154,7 @@ export class SessionTransport {
         ...(waitMode || policyRefusal ? { sent: false, ...waitEvidence } : {}),
       });
     }
-    try { opts?.onInputEffect?.("pasted"); } catch { /* Observation cannot change a completed paste. */ }
+    try { opts?.onInputEffect?.("pasted", { text }); } catch { /* Observation cannot change a completed paste. */ }
 
     // From the successful paste to Enter the text may sit in the seat's input. Any throw in this span is
     // tagged inputWritten, so no caller reports it as unsent; a step added here later stays covered.
@@ -3620,11 +4183,19 @@ export class SessionTransport {
         const pane = await this.runStage("session_transport.prompt_override_pre_submit_capture",
           () => this.tmuxAdapter.capturePaneContent(readTarget, 50)).catch(() => null);
         if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
-        if (!promptAnswerStaged(pane, text, runtime)) {
+        const staged = promptAnswerStaged(pane, text, runtime);
+        // A screen that couldn't be read, or one with no input box the parser recognizes, is not evidence the answer
+        // was consumed or joined: outside a recognized prompt, submit it and say so. Visible evidence, or a
+        // recognized prompt, still withholds Enter.
+        if (staged === "not_staged" || (staged !== "staged" && overrideAtPrompt)) {
           return observe({ ok: true, sessionName, sent: true, verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified",
             warning: [sendAdvisory, "prompt-override: answer sent as unbracketed input; submission unverified. No trailing Enter: the complete answer is not visibly staged (it may have been consumed, the prompt changed, or observation is unavailable)."].filter(Boolean).join(" ") });
         }
-        sendAdvisory = [sendAdvisory, "prompt-override: answer sent as unbracketed input; Enter submitted the complete still-staged answer."].filter(Boolean).join(" ");
+        sendAdvisory = [sendAdvisory, staged === "staged"
+          ? "prompt-override: answer sent as unbracketed input; Enter submitted the complete still-staged answer."
+          : staged === "unreadable"
+            ? "prompt-override: answer sent as unbracketed input; the screen couldn't be read, so Enter was sent without confirming the staged answer."
+            : "prompt-override: answer sent as unbracketed input; no input box was recognized on the screen, so Enter was sent without confirming the staged answer."].filter(Boolean).join(" ");
       }
 
       // 5. Submit (Enter)
@@ -3643,6 +4214,7 @@ export class SessionTransport {
           ok: false,
           sessionName,
           reason: policyRefusal ? submitResult.code : "submit_failed",
+          ...(submitResult.inputReadFailure ? { inputReadFailure: submitResult.inputReadFailure } : {}),
           outcome: "failed",
           inputPhase: "written",
           error: policyRefusal
@@ -3758,11 +4330,13 @@ export class SessionTransport {
 
   /** Wait on the existing classifier without occupying the input/lifecycle lease. With `singleObservation`, one
    *  observation within `timeoutMs` and no wait after it: a busy reading returns at once. */
-  async waitUntilIdle(sessionName: string, timeoutMs: number, signal?: AbortSignal, opts?: { singleObservation?: boolean }) {
+  async waitUntilIdle(sessionName: string, timeoutMs: number, signal?: AbortSignal, opts?: { singleObservation?: boolean; allowDraft?: true; onObservation?: (activity: AgentActivity) => void }) {
     const meta = this.getSessionMeta(sessionName);
     return this.waitForIdle({ sessionName, runtime: meta.runtime, attachmentType: meta.attachmentType, timeoutMs, signal,
       binding: { sessionName, nodeId: meta.nodeId, occupant: meta.occupant, pane: meta.pane },
-      ...(opts?.singleObservation ? { singleObservation: true } : {}) });
+      ...(opts?.allowDraft ? { allowDraft: true } : {}),
+      ...(opts?.singleObservation ? { singleObservation: true } : {}),
+      ...(opts?.onObservation ? { onObservation: opts.onObservation } : {}) });
   }
 
   private async waitForIdle(input: {
@@ -3777,8 +4351,12 @@ export class SessionTransport {
     binding?: ObservedBinding;
     readinessFromPaneOnly?: boolean;
     postCompactTurnBoundary?: boolean;
+    allowDraft?: boolean;
+    allowUnknown?: boolean;
     /** One observation only: a reading that isn't idle ends the wait at once. */
     singleObservation?: boolean;
+    /** Called with each observation that completes in time, so a caller can report the seat's state while it waits. */
+    onObservation?: (activity: AgentActivity) => void;
     // Optional display value for timeout messages. The deadline always comes
     // from timeoutMs; when set, expiry reports this value instead, so a
     // re-wait running on a leftover budget still names the configured wait.
@@ -3787,7 +4365,7 @@ export class SessionTransport {
     | { ok: true; activity: AgentActivity; waitedMs: number; attempts: number }
     | { ok: false; reason: string; error: string; activity: AgentActivity; waitedMs: number; attempts: number }
   > {
-    // ONE deadline. UNKNOWN is retried like busy and never authorizes the send. No observation
+    // ONE deadline. UNKNOWN is retried like busy unless an owed restore explicitly admits it after bounded polls. No observation
     // starts after the deadline (one starting exactly at it races a 0 ms timer), each one is raced
     // against the time left, and one that completes after the deadline is discarded, so a late idle
     // can never lead to input. At expiry the result names the last observation that completed in
@@ -3802,6 +4380,7 @@ export class SessionTransport {
         state: "unknown", reason: "no_observation_in_time", evidenceSource: "pane_heuristic",
         sampledAt: this.now().toISOString(), evidence: null,
       };
+      if (input.allowUnknown && activity.state === "unknown") return { ok: true as const, activity, waitedMs: input.timeoutMs, attempts };
       return activity.state === "unknown"
         ? {
           ok: false as const,
@@ -3842,11 +4421,16 @@ export class SessionTransport {
       // Managed preparation's wait keeps its own behaviour: it doesn't race the read against its signal.
       const activity = await this.observeReadinessWithin(input, deadline - Date.now(), input.cancelledBy === "caller" ? input.signal : undefined);
       if (input.signal?.aborted) return cancelled();
-      if (activity === null || Date.now() > deadline) return expire();
+      if (activity === null || Date.now() > deadline) {
+        // A late positive observation still vetoes the explicit unknown-only restore fallback.
+        if (input.allowUnknown && activity) last = activity;
+        return expire();
+      }
       last = activity;
+      input.onObservation?.(activity);
       const waitedMs = input.timeoutMs - (deadline - Date.now());
 
-      if (activity.state === "idle") {
+      if (activity.state === "idle" || (input.allowUnknown && activity.state === "unknown") || (input.allowDraft && this.deliversOverDraft(activity))) {
         return { ok: true, activity, waitedMs, attempts };
       }
 
@@ -3955,7 +4539,7 @@ export class SessionTransport {
 
   /** transport.draft_delivery = deliver (the default): a person's draft at the prompt is the one needs_input an ordinary send or work
    *  notice goes through. Menus, permission prompts and hook-reported requests still refuse, and so does a send that must
-   *  not join a draft (preserveInput: managed compaction). A send that waits for idle keeps waiting. */
+   *  not join a draft (an explicit preserveInput request). Idle waits opt in to this draft policy separately. */
   private deliversOverDraft(readiness: AgentActivity, opts?: SendOpts): boolean {
     if (readiness.state !== "needs_input" || readiness.reason !== "prompt_draft" || readiness.evidenceSource !== "pane_heuristic") return false;
     if (opts?.preserveInput) return false;
@@ -4017,9 +4601,16 @@ export class SessionTransport {
       hookActivity.reason !== "permission_request_pending" &&
       hookActivity.reason !== "permission_prompt_cleared"
     ) {
-      // Fresh hook (within the 15s send window): authoritative for any state.
+      // Fresh hook (within the 15s send window): authoritative for any state, except a current Claude
+      // dialog. Opening a picker or a permission selector after Stop fires no new hook, so a fresh idle
+      // hook gets the same current-dialog check as a fresh running one.
       if (this.hookFreshForSend(hookActivity, now)) {
-        if (hookActivity.state === "running" && input.runtime === "claude-code") {
+        // These fresh-hook dialog and picker checks run only on a runtime declared to support reading a dialog
+        // (member-connection.v1, observe.dialog); the runtime then says which screen reader it is. The stale-idle veto and
+        // the pane probe below don't read the declaration.
+        const dialogRead = declaredCapabilities("typed", input.runtime).observe.dialog === "supported";
+        // A fresh SessionStart reads unknown, and a picker can open after it just as after Stop.
+        if ((hookActivity.state === "running" || hookActivity.state === "idle" || hookActivity.state === "unknown") && dialogRead && input.runtime === "claude-code") {
           const paneVeto = await probeSessionActivity({
             communityHarness, communityHarnessSendProbe: true,
             composerSnapshot,
@@ -4032,7 +4623,27 @@ export class SessionTransport {
             captureObserver: privateInput ? undefined : this.captureObserver,
             binding,
           });
-          if (paneVeto.state === "needs_input") return paneVeto;
+          // After an idle hook only a dialog refuses: a draft or other input stays the delivery guard's.
+          if (paneVeto.state === "needs_input" && (hookActivity.state === "running"
+            || paneVeto.reason === "selection_prompt" || paneVeto.reason === "permission_prompt")) return paneVeto;
+        }
+        // Codex's /model picker fires no hook either, and Codex opens it during a running turn too. After any fresh
+        // hook short of a permission request, only a current selector recognized in full refuses (the dialogue-only
+        // read skips the numbered-row scan, so history, drafts and a busy pane with no picker still deliver).
+        if ((hookActivity.state === "idle" || hookActivity.state === "running" || hookActivity.state === "unknown") && dialogRead && input.runtime === "codex") {
+          const paneVeto = await probeSessionActivity({
+            communityHarness, communityHarnessSendProbe: true,
+            composerSnapshot,
+            currentClaudeDialogueOnly: true,
+            sessionName: input.sessionName,
+            runtime: input.runtime,
+            attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
+            tmuxAdapter: this.tmuxAdapter,
+            now,
+            captureObserver: privateInput ? undefined : this.captureObserver,
+            binding,
+          });
+          if (paneVeto.state === "needs_input" && paneVeto.reason === "selection_prompt") return paneVeto;
         }
         return hookActivity;
       }
@@ -4295,7 +4906,7 @@ export class SessionTransport {
     readable?: { width: number; height: number }; readableBudget?: ReadableBudget }): Promise<CaptureResult> {
     sessionName = physicalSessionName(this.db, sessionName);
     const sessionMeta = this.getSessionMeta(sessionName);
-    if (sessionMeta.attachmentType === "external_cli") {
+    if (seatInboundTransport(resolveSeatKind(sessionMeta.attachmentType)) === "none") {
       return {
         ok: false,
         sessionName,
@@ -4388,8 +4999,12 @@ export class SessionTransport {
       const pin = await withWindowPin(window, async () => {
         const sizing = await readPinSizing(this.tmuxAdapter, window);
         if (!sizing) return "the window's sizing couldn't be read, so it couldn't be given back";
-        if (sizing.live === "manual" && (sizing.prior === "manual" || sizing.holders.length > 0)) {
-          return "the window's size is pinned (its window-size is manual)";
+        if (sizing.live === "manual" && sizing.holders.length > 0) return "the window's size is pinned (its window-size is manual)";
+        // No OpenRig reader holds it: a deliberate fixed size or a pin something else left. Say how to drop it, for a reader
+        // who wants the window to follow its inherited sizing again; it isn't changed here.
+        if (sizing.live === "manual" && sizing.prior === "manual") {
+          return `the window's size is pinned (its own window-size is manual); to drop that setting so the window follows `
+            + `its inherited window-size again, run ${tmuxUnsetWindowSizeCommand(sizing.window)} on the daemon's host`;
         }
         // Still manual here: a pin whose holders are gone (a capture or a web terminal that ended without giving it back).
         // It's taken over, and given back after this read even when the pane is already big enough.
@@ -4535,6 +5150,8 @@ export class SessionTransport {
     const genUuid = opts?.envelopeSender
       ? (this.sessionRegistry.currentOccupantGenerationForSession(opts.envelopeSender) ?? undefined)
       : undefined;
+    // #2895 (a): once per fan-out too: a sender `rig send` can't reach gets no `rig send` reply line.
+    const unreachable = opts?.envelopeSender ? !this.sessionRegistry.senderIsSendable(opts.envelopeSender) : false;
 
     const results: SendResult[] = [];
     for (const session of resolved.sessions) {
@@ -4544,7 +5161,7 @@ export class SessionTransport {
       // Sent stamp, so a recipient tells DM from broadcast header-alone (anti-storm). Raw paths
       // (--raw / --dangerously-interact, absent envelopeSender) still deliver unwrapped.
       const perRecipientText = opts?.envelopeSender
-        ? wrapPaneEnvelope(opts.envelopeSender, session.sessionName, text, { scope, stampISO, genUuid })
+        ? wrapPaneEnvelope(opts.envelopeSender, session.sessionName, text, { scope, stampISO, genUuid, ...(unreachable ? { senderReachable: false } : {}) })
         : text;
       // (h) thread the resolved stampISO so send()'s delivered-latency calc measures from the SAME
       // compose stamp the envelope carries (opts may not have carried one; the local stampISO is truth).
@@ -4554,9 +5171,13 @@ export class SessionTransport {
       results.push(result);
     }
 
+    const indeterminateNative = results.filter(r => r.runnerReceipt && (r.runnerReceipt.reconciliation || r.runnerReceipt.erasedAt || r.runnerReceipt.result?.submissionUnknown)).length;
+    const pendingNative = results.filter(r => r.runnerReceipt && !r.runnerReceipt.reconciliation && !r.runnerReceipt.erasedAt
+      && ["pending", "offered", "accepted"].includes(r.runnerReceipt.stage)).length;
     return {
+      ...(pendingNative ? { pendingNative } : {}), ...(indeterminateNative ? { indeterminateNative } : {}),
       total: results.length,
-      sent: results.filter((r) => r.ok && r.outcome !== "retained").length,
+      sent: results.filter((r) => r.ok && (r.runnerReceipt ? r.sent === true : r.outcome !== "retained")).length,
       retained: results.filter(r => r.outcome === "retained").length,
       failed: results.filter((r) => !r.ok).length,
       results,

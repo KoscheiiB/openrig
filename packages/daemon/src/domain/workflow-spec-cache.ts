@@ -17,7 +17,7 @@ import type Database from "better-sqlite3";
 import { ulid } from "ulid";
 import { parse as parseYaml } from "yaml";
 import type { StartedWorkflowSpec, WorkflowSpec, WorkflowSpecRow } from "./workflow-types.js";
-import { WORKFLOW_AGENT_HARNESSES, WORKFLOW_EXIT_KINDS } from "./workflow-types.js";
+import { WORKFLOW_AGENT_HARNESSES, WORKFLOW_EXIT_KINDS, WORKFLOW_NEXT_OWNER_MODES } from "./workflow-types.js";
 import { bindSpecToRig } from "./workflow-rig-placeholder.js";
 
 interface SpecRow {
@@ -76,6 +76,20 @@ export class WorkflowSpecError extends Error {
   }
 }
 
+interface FailedSpecRead {
+  sourceHash: string;
+  cachedAt: string;
+}
+
+// Keep capture evidence out of the original exception and out of process-global path state. The scanner can retrieve it
+// while handling this exact parse error, then persist it in the diagnostic row; WeakMap lifetime follows the exception.
+const failedSpecReads = new WeakMap<object, FailedSpecRead>();
+
+export function getFailedSpecRead(error: unknown): FailedSpecRead | null {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") return null;
+  return failedSpecReads.get(error as object) ?? null;
+}
+
 /**
  * OPR.0.4.6.WF1 FR-7 — THE closed keysets, EXPORTED as named
  * constants: parseWorkflowSpec is the ONLY seam that sees raw keys
@@ -99,9 +113,11 @@ export const WORKFLOW_TOP_LEVEL_KEYS = [
   "exception_routing",
   "coordination_terminal_turn_rule",
   "context_refs",
+  "next_owner",
 ] as const;
 export const WORKFLOW_STEP_KEYS = [
   "id",
+  "label",
   "actor_role",
   "objective",
   "allowed_exits",
@@ -117,10 +133,11 @@ export const WORKFLOW_STEP_KEYS = [
   "gate",
   "depends_on",
   "acceptance",
+  "next_owner",
 ] as const;
 /** A spec row with `{rig}` targets resolved against `boundRig`. */
-export function bindRowToRig(row: WorkflowSpecRow, boundRig: string | null): WorkflowSpecRow {
-  const spec = bindSpecToRig(row.spec, boundRig);
+export function bindRowToRig(row: WorkflowSpecRow, boundRig: string | null, boundPod: string | null = null): WorkflowSpecRow {
+  const spec = bindSpecToRig(row.spec, boundRig, boundPod);
   return spec === row.spec ? row : { ...row, spec };
 }
 
@@ -242,6 +259,7 @@ export function parseWorkflowSpec(rawYaml: string, sourcePath: string): Workflow
   // at the YAML root; a stray root sibling was silently ignored.
   rejectUnknownKeys(root, ["workflow"], "(document root)", sourcePath);
   rejectUnknownKeys(wf, WORKFLOW_TOP_LEVEL_KEYS, "workflow", sourcePath);
+  assertNextOwnerMode(wf.next_owner, "workflow.next_owner", sourcePath);
 
   // FR-6/FR-7 (guard blocker 2): loop_guards SHAPE validation at the
   // raw seam. A nonnumeric max_hops would sanction a cycle at
@@ -462,6 +480,15 @@ export function parseWorkflowSpec(rawYaml: string, sourcePath: string): Workflow
           );
         }
       }
+      assertNextOwnerMode(s.next_owner, `workflow.steps[${idx}].next_owner`, sourcePath);
+      // A display name for the step; `id` stays its identity and `objective` its instruction.
+      if (s.label !== undefined && (typeof s.label !== "string" || s.label.trim().length === 0)) {
+        throw new WorkflowSpecError(
+          "spec_field_invalid",
+          `workflow spec at ${sourcePath}: workflow.steps[${idx}].label must be a non-empty string when present (got ${JSON.stringify(s.label)}). Remove it to show the step by its id.`,
+          { sourcePath, path: `workflow.steps[${idx}].label` },
+        );
+      }
       // OPR.0.4.6.WF2 FR-3: host pin shape — non-empty string. Registry
       // membership is the validator's check (it sees the registry);
       // the parser only pins the shape.
@@ -561,7 +588,21 @@ export function parseWorkflowSpec(rawYaml: string, sourcePath: string): Workflow
       typeof wf.coordination_terminal_turn_rule === "string"
         ? wf.coordination_terminal_turn_rule
         : undefined,
+    // Validated above and copied here: a validated top-level key dropped at assembly is silently inert.
+    ...(wf.next_owner !== undefined ? { next_owner: wf.next_owner as WorkflowSpec["next_owner"] } : {}),
   };
+}
+
+/** `next_owner` (spec or step level): absent, or one of WORKFLOW_NEXT_OWNER_MODES. */
+function assertNextOwnerMode(value: unknown, path: string, sourcePath: string): void {
+  if (value === undefined) return;
+  if (typeof value !== "string" || !(WORKFLOW_NEXT_OWNER_MODES as readonly string[]).includes(value)) {
+    throw new WorkflowSpecError(
+      "spec_field_invalid",
+      `workflow spec at ${sourcePath}: ${path} must be one of [${WORKFLOW_NEXT_OWNER_MODES.join(", ")}] (got ${JSON.stringify(value)}). Remove the key to keep the default owner resolution.`,
+      { sourcePath, field: path, value, allowed: [...WORKFLOW_NEXT_OWNER_MODES] },
+    );
+  }
 }
 
 /**
@@ -619,21 +660,34 @@ export class WorkflowSpecCache {
   }
 
   /**
+   * #2726: read and parse a workflow spec file without touching the cache.
+   * Same file checks and parse errors as readThrough (spec_file_missing,
+   * the parser's spec_* errors), but no workflow_specs row is inserted,
+   * updated or cleared. `rig workflow validate` reads specs this way, so
+   * validating a draft never registers it or replaces a registered
+   * name@version; instantiate/run and the workflows-folder scan still go
+   * through readThrough and register as before.
+   */
+  readFromDisk(sourcePath: string): { spec: WorkflowSpec; sourcePath: string; sourceHash: string } {
+    const { spec, sourceHash } = readSpecFile(sourcePath);
+    return {
+      // Same default readThrough stores in the row's column and returns.
+      spec: { ...spec, coordination_terminal_turn_rule: spec.coordination_terminal_turn_rule ?? "hot_potato" },
+      sourcePath,
+      sourceHash,
+    };
+  }
+
+  /**
    * Read a workflow spec from disk through the cache. Returns the
    * cached row (re-caching if source_hash differs OR if the spec was
    * not previously cached).
    */
   readThrough(sourcePath: string): WorkflowSpecRow {
-    if (!existsSync(sourcePath)) {
-      throw new WorkflowSpecError(
-        "spec_file_missing",
-        `workflow spec file not found at ${sourcePath}`,
-        { sourcePath },
-      );
-    }
-    const raw = readFileSync(sourcePath, "utf-8");
-    const sourceHash = createHash("sha256").update(raw).digest("hex");
-    const spec = parseWorkflowSpec(raw, sourcePath);
+    // Stamp before opening the file. If an edit races the read, a later stat must not be hidden by a timestamp
+    // assigned after that edit and after parse-error handling.
+    const capturedAt = this.now().toISOString();
+    const { spec, sourceHash } = readSpecFile(sourcePath, capturedAt);
     const named = this.db
       .prepare(
         `SELECT * FROM workflow_specs WHERE name = ? AND version = ?`,
@@ -661,11 +715,18 @@ export class WorkflowSpecCache {
         .run(sourcePath, existing?.spec_id ?? "").changes
       : 0;
     if (existing && existing.status !== "error" && existing.status !== RETAINED_STATUS && !moved && existing.source_hash === sourceHash) {
-      // A repair back to the cached bytes records this scan, so the next scan skips the file.
-      if (cleared > 0) {
-        const repairedAt = this.now().toISOString();
-        this.db.prepare(`UPDATE workflow_specs SET cached_at = ? WHERE spec_id = ?`).run(repairedAt, existing.spec_id);
-        existing.cached_at = repairedAt;
+      // A read verifies the timestamp only for its own source path, even when another copy has matching bytes. Advance only forward:
+      // this pre-read stamp is safe for stat-only skips, while a backwards clock must not replace a newer observation.
+      const existingCachedAtMs = Date.parse(existing.cached_at);
+      const capturedAtMs = Date.parse(capturedAt);
+      const shouldAdvanceObservation = existing.source_path === sourcePath && Number.isFinite(capturedAtMs) && (
+        Number.isFinite(existingCachedAtMs)
+          ? existingCachedAtMs < capturedAtMs
+          : cleared > 0
+      );
+      if (shouldAdvanceObservation) {
+        this.db.prepare(`UPDATE workflow_specs SET cached_at = ? WHERE spec_id = ?`).run(capturedAt, existing.spec_id);
+        existing.cached_at = capturedAt;
       }
       // readThrough is file-authoritative: return the freshly parsed
       // file spec so validation sees non-column metadata such as
@@ -681,7 +742,7 @@ export class WorkflowSpecCache {
       }
       return rowToWorkflowSpec(existing, spec);
     }
-    const cachedAt = this.now().toISOString();
+    const cachedAt = capturedAt;
     const purpose = spec.objective ?? null;
     const targetRig = spec.target?.rig ?? null;
     const rolesJson = JSON.stringify(spec.roles);
@@ -854,7 +915,7 @@ export class WorkflowSpecCache {
    *  The cache row is the instance's spec while it still comes from the file the instance started from, so an edit to
    *  that file reaches the run (a resume re-resolves its owner from it). Once another file with the same id and version
    *  has replaced the row, the instance runs the spec it started with instead (#2607). */
-  getForInstance(instance: { workflowName: string; workflowVersion: string; boundRig: string | null; startedSpec?: StartedWorkflowSpec | null }): WorkflowSpecRow | null {
+  getForInstance(instance: { workflowName: string; workflowVersion: string; boundRig: string | null; boundPod?: string | null; startedSpec?: StartedWorkflowSpec | null }): WorkflowSpecRow | null {
     const row = this.getByNameVersion(instance.workflowName, instance.workflowVersion);
     const started = instance.startedSpec;
     if (started && (!row || !sameSourceFile(row.sourcePath, started.sourcePath))) {
@@ -864,9 +925,9 @@ export class WorkflowSpecCache {
         purpose: spec.objective ?? null, targetRig: spec.target?.rig ?? null, spec,
         coordinationTerminalTurnRule: spec.coordination_terminal_turn_rule ?? "hot_potato",
         sourcePath: started.sourcePath, sourceHash: "", cachedAt: "",
-      }, instance.boundRig);
+      }, instance.boundRig, instance.boundPod ?? null);
     }
-    return row ? bindRowToRig(row, instance.boundRig) : null;
+    return row ? bindRowToRig(row, instance.boundRig, instance.boundPod ?? null) : null;
   }
 
   /**
@@ -930,8 +991,10 @@ export class WorkflowSpecCache {
     sourcePath: string;
     sourceHash: string;
     errorMessage: string;
+    /** Capture time from the read that failed, when available. */
+    cachedAt?: string;
   }): void {
-    const cachedAt = this.now().toISOString();
+    const cachedAt = opts.cachedAt ?? this.now().toISOString();
     const existing = this.db
       .prepare(`SELECT spec_id FROM workflow_specs WHERE source_path = ? AND status = 'error'`)
       .get(opts.sourcePath) as { spec_id: string } | undefined;
@@ -1102,8 +1165,28 @@ function warnLegacyRehydrationOnce(name: string, version: string): void {
   if (warnedLegacyRehydrations.has(key)) return;
   warnedLegacyRehydrations.add(key);
   console.warn(
-    `workflow spec ${key} rehydrated WITHOUT full fidelity (pre-050 cache row: loop_guards/invariants/closure/entry unavailable at projection). Re-validate the spec file (rig workflow validate <path>) to heal the cache row.`,
+    `workflow spec ${key} rehydrated WITHOUT full fidelity (pre-050 cache row: loop_guards/invariants/closure/entry unavailable at projection). Re-register the spec file to heal the cache row: touch it in the workflows folder so the next scan re-reads it, or instantiate it by path (rig workflow validate is read-only and does not heal it).`,
   );
+}
+
+function readSpecFile(sourcePath: string, cachedAt?: string): { spec: WorkflowSpec; sourceHash: string } {
+  if (!existsSync(sourcePath)) {
+    throw new WorkflowSpecError(
+      "spec_file_missing",
+      `workflow spec file not found at ${sourcePath}`,
+      { sourcePath },
+    );
+  }
+  const raw = readFileSync(sourcePath, "utf-8");
+  const sourceHash = createHash("sha256").update(raw).digest("hex");
+  try {
+    return { spec: parseWorkflowSpec(raw, sourcePath), sourceHash };
+  } catch (error) {
+    if (cachedAt && ((typeof error === "object" && error !== null) || typeof error === "function")) {
+      failedSpecReads.set(error as object, { sourceHash, cachedAt });
+    }
+    throw error;
+  }
 }
 
 function rowToWorkflowSpec(row: SpecRow, parsedSpec?: WorkflowSpec): WorkflowSpecRow {

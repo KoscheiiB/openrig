@@ -25,6 +25,10 @@ describe("seat-stop.v1 checked stop", () => {
   let onDetach: (() => void) | undefined;
   let onKill: (() => void) | undefined;
   let killError: Error | undefined;
+  let named: string | undefined;
+  // A stop's effect, held inside tmux to the session id and server it read.
+  const held = (inner: string) => "tmux if-shell -F -t '$7' '#{&&:#{==:#{session_id},$7},#{&&:#{==:#{pid},4242},#{==:#{start_time},1700000000}}}' "
+    + `'${inner.replace(/'/g, "'\"'\"'")}' 'display-message -p openrig-stop-target-changed'`;
 
   beforeEach(() => {
     db = createFullTestDb();
@@ -34,13 +38,19 @@ describe("seat-stop.v1 checked stop", () => {
     registry = new SessionRegistry(db);
     bus = new EventBus(db);
     commands = [];
+    named = undefined;
     onProbe = onPanes = onDetach = onKill = undefined;
     killError = undefined;
     adapter = new TmuxAdapter(async command => {
       commands.push(command);
       if (command.includes("has-session")) { onProbe?.(); return ""; }
-      if (command.includes("list-panes")) { onPanes?.(); return "%1|0|/project|120|40|1"; }
-      if (command.includes("display-message")) return "$7";
+      if (command.includes("list-panes")) { onPanes?.(); named = /=([^:']+):/.exec(command)?.[1] ?? named; return "%1|0|/project|120|40|1"; }
+      // The named session carries its own seat's OpenRig marker.
+      if (command.startsWith("tmux show-environment")) {
+        const bound = db.prepare("SELECT node_id FROM bindings WHERE tmux_session = ?").get(named) as { node_id: string } | undefined;
+        return `OPENRIG_NODE_ID=${bound?.node_id ?? ""}`;
+      }
+      if (command.startsWith("tmux display-message")) return "$7|4242|1700000000";
       if (command.includes("detach-client")) { onDetach?.(); return ""; }
       if (command.includes("kill-session")) { onKill?.(); if (killError) throw killError; return ""; }
       throw new Error(`unexpected tmux command: ${command}`);
@@ -50,9 +60,9 @@ describe("seat-stop.v1 checked stop", () => {
   });
   afterEach(() => db.close());
 
-  function seat(logicalId: string) {
+  function seat(logicalId: string, opts?: { keepAlive?: boolean }) {
     const rig = repo.findRigsByName("checked")[0] ?? repo.createRig("checked");
-    const node = repo.addNode(rig.id, logicalId, { runtime: "claude-code", cwd: "/project" });
+    const node = repo.addNode(rig.id, logicalId, { runtime: "claude-code", cwd: "/project", ...(opts?.keepAlive ? { keepAlive: true } : {}) });
     const name = `${logicalId.replaceAll(".", "-")}@checked`;
     const session = registry.registerSession(node.id, name);
     registry.updateStatus(session.id, "running");
@@ -129,7 +139,7 @@ describe("seat-stop.v1 checked stop", () => {
     const result = await stop(a.name, expected(a.name));
     expect(result).toMatchObject({ ok: true, sessionName: a.name, sessionId: a.session.id });
     expect(commands.filter(command => command.includes("detach-client") || command.includes("kill-session"))).toEqual([
-      "tmux detach-client -s '$7'", "tmux kill-session -t '$7'",
+      held("detach-client -s '$7'"), held("kill-session -t '$7'"),
     ]);
     expect(status(a.session.id)).toBe("exited");
     expect(registry.getBindingForNode(a.node.id)).toBeNull();
@@ -192,6 +202,29 @@ describe("seat-stop.v1 checked stop", () => {
     expect(await stop(a.name, selected)).toMatchObject({ ok: false, code: "selection_changed", partialEffect: true });
     expect(registry.getBindingForNode(a.node.id)?.tmuxPane).toBe("%2");
     expect(status(a.session.id)).toBe("running");
+  });
+
+  // #2940: `rig seat stop` means stay down; a keep_alive seat that is already gone is held down on the checked path too.
+  it("holds down a keep_alive seat whose session is already gone; a seat without keep_alive is still refused", async () => {
+    const kept = seat("dev.kept", { keepAlive: true }); const plain = seat("dev.plain");
+    const flags = (id: string) => db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE id = ?").get(id);
+    registry.markDetached(kept.session.id); registry.markDetached(plain.session.id);
+    onProbe = () => { throw new Error("can't find session: gone"); };
+    expect(await stop(kept.name, expected(kept.name))).toMatchObject({ ok: true, alreadyDown: true, sessionId: kept.session.id });
+    expect(flags(kept.session.id)).toEqual({ status: "exited", intentionally_stopped: 1 });
+    expect(registry.getBindingForNode(kept.node.id)).toBeNull();
+    expect(await stop(plain.name, expected(plain.name))).toMatchObject({ ok: false, code: "session_not_live" });
+    expect(flags(plain.session.id)).toEqual({ status: "detached", intentionally_stopped: 0 });
+    expect(commands.some(command => command.includes("kill-session"))).toBe(false);
+  });
+
+  it("confirms a keep_alive seat's stop when its session is gone by the kill", async () => {
+    const kept = seat("dev.kept", { keepAlive: true });
+    killError = new Error(`can't find session: ${kept.name}`);
+    expect(await stop(kept.name, expected(kept.name))).toMatchObject({ ok: true, sessionId: kept.session.id });
+    expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE id = ?").get(kept.session.id))
+      .toEqual({ status: "exited", intentionally_stopped: 1 });
+    expect(registry.getBindingForNode(kept.node.id)).toBeNull();
   });
 
   it("reports kill and persistence failures as uncertain after external effects", async () => {

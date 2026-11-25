@@ -18,8 +18,8 @@ import os from "node:os";
 import nodePath from "node:path";
 import { execFileSync } from "node:child_process";
 import { codexEnvelopeArgs } from "../src/domain/codex-rebuild-permissions.js";
-import { clearCodexMemberPermissions, codexMemberEnvelope, readCodexMemberPermissions, readProfileFingerprint, validateCodexMemberPermissions,
-  type CodexMemberPermissions, type CodexProfileObservation } from "../src/domain/codex-member-permissions.js";
+import { clearCodexMemberPermissions, codexMemberEnvelope, codexRigReach, codexRigReachWarning, readCodexMemberPermissions, readProfileFingerprint,
+  validateCodexMemberPermissions, type CodexMemberPermissions, type CodexProfileObservation, type CodexRigReachGap } from "../src/domain/codex-member-permissions.js";
 import { CodexRuntimeAdapter, type CodexAdapterFsOps } from "../src/adapters/codex-runtime-adapter.js";
 import { seatRoutes } from "../src/routes/seat.js";
 import { createTestApp } from "./helpers/test-app.js";
@@ -79,6 +79,71 @@ describe("the typed Codex envelope", () => {
     [{ sandbox: "workspace-write", approval: "never", profile: "x" }, /unsupported key/],
   ])("names invalid input: %j", (value, message) => {
     expect(() => validateCodexMemberPermissions(value)).toThrow(message);
+  });
+});
+
+describe("a seat's explicit filesystem policy", () => {
+  it("accepts the native project_roots alias without changing its authored spelling", () => {
+    expect(validateCodexMemberPermissions({ approval: "never", filesystem: { ":project_roots": "write" } }))
+      .toEqual({ approval: "never", filesystem: { ":project_roots": "write" }, network_access: false });
+  });
+  const policy = { approval: "never", filesystem: {
+    ":minimal": "read", ":workspace_roots": "read", "/lease/a": "write", "/lease/a/private": "deny",
+  }, network_access: false };
+
+  it("accepts native read, write and deny entries without a legacy sandbox selection", () => {
+    expect(validateCodexMemberPermissions(policy)).toEqual(policy);
+    expect(validateCodexMemberPermissions({ approval: "on-request", filesystem: { ":minimal": "read" } }))
+      .toEqual({ approval: "on-request", filesystem: { ":minimal": "read" }, network_access: false });
+  });
+
+  it("keeps two seats' filesystem choices separate and clears only the selected seat", async () => {
+    const f = fixture();
+    const other = { approval: "on-request", filesystem: { ":minimal": "read", "/lease/b": "write" }, network_access: false };
+    expect(await f.service.setPermissions(set(policy))).toMatchObject({ ok: true, to: policy });
+    expect(await f.service.setPermissions({ ...set(other), seatRef: "dev-b@codex-team" })).toMatchObject({ ok: true, to: other });
+    const store = new NativePermissionStore(f.db);
+    expect(store.launchOverride(f.a.id, "codex").codexPermissions).toEqual(policy);
+    expect(store.launchOverride(f.b.id, "codex").codexPermissions).toEqual(other);
+    expect(await f.service.setPermissions({ seatRef: "dev-a@codex-team", mode: "inherit", actor: "operator@codex-team", reason: "Clear only A" }))
+      .toMatchObject({ ok: true });
+    expect(readCodexMemberPermissions(f.db, f.a.id)).toBeUndefined();
+    expect(store.launchOverride(f.b.id, "codex").codexPermissions).toEqual(other);
+  });
+
+  it("allows named-profile combinations in either setter direction and keeps the authored policy", async () => {
+    const f = fixture();
+    await f.service.setPermissions(set(reader));
+    expect(await f.service.setPermissions({ seatRef: "dev-a@codex-team", codexProfile: "named", actor: "operator@codex-team", reason: "Select" }))
+      .toMatchObject({ ok: true });
+    expect(await f.service.setPermissions(set(policy))).toMatchObject({ ok: true });
+    expect(readCodexMemberPermissions(f.db, f.a.id)).toEqual(policy);
+    expect(await f.service.setPermissions({ seatRef: "dev-a@codex-team", codexProfile: "inherit", actor: "operator@codex-team", reason: "Clear" }))
+      .toMatchObject({ ok: true });
+    expect(await f.service.setPermissions(set(policy))).toMatchObject({ ok: true });
+    expect(await f.service.setPermissions({ seatRef: "dev-a@codex-team", codexProfile: "named", actor: "operator@codex-team", reason: "Conflict" }))
+      .toMatchObject({ ok: true });
+    expect(readCodexMemberPermissions(f.db, f.a.id)).toEqual(policy);
+  });
+
+  it.each([
+    { ...policy, approval: "untrusted" },
+    { ...policy, sandbox: "workspace-write" },
+    { ...policy, writable_roots: ["/another/root"] },
+    { ...policy, exclude_slash_tmp: true },
+    { ...policy, filesystem: {} },
+    { ...policy, filesystem: { "relative/path": "deny" } },
+    { ...policy, filesystem: { ":unknown": "write" } },
+    { ...policy, filesystem: { "/a\nb": "deny" } },
+    { ...policy, filesystem: { "/private": "none" } },
+    { ...policy, filesystem: { "/private": true } },
+    { ...policy, network_access: "yes" },
+  ])("rejects incomplete or mixed policy without replacing a saved choice: %j", async (invalid) => {
+    expect(() => validateCodexMemberPermissions(invalid)).toThrow();
+    const f = fixture();
+    expect(await f.service.setPermissions(set(reader))).toMatchObject({ ok: true });
+    expect(await f.service.setPermissions(set(invalid))).toMatchObject({ ok: false });
+    expect(readCodexMemberPermissions(f.db, f.a.id)).toEqual(reader);
   });
 });
 
@@ -204,6 +269,112 @@ describe("a Codex seat's current envelope (offline, no native enforcement claim)
   });
 });
 
+describe("whether a Codex seat's declared sandbox lets it run rig (a launch warning, never a refusal)", () => {
+  // nvm-style: rig and node both under the home folder, which :minimal never covers.
+  const paths = { openrigHome: "/home/u/.openrig", rigInstall: "/home/u/.nvm/versions/node/v22/lib/node_modules/@openrig/cli",
+    node: "/home/u/.nvm/versions/node/v22/bin", home: "/home/u", cwd: "/work/app" };
+  const HOME = { what: "the OpenRig home", path: "/home/u/.openrig" } as const;
+  const INSTALL = { what: "the rig install", path: paths.rigInstall } as const;
+  const NODE = { what: "node", path: paths.node } as const;
+  const list = (filesystem: Record<string, string>, network_access = true) =>
+    validateCodexMemberPermissions({ approval: "never", filesystem, network_access });
+
+  it.each<[string, CodexMemberPermissions, Partial<typeof paths>, CodexRigReachGap | null]>([
+    ["~/ and literal grants with network on", list({ "~/.openrig": "read", "/home/u/.nvm": "read", ":workspace_roots": "write" }), {}, null],
+    ["the OpenRig home left out", list({ "/home/u/.nvm": "read", ":workspace_roots": "write" }), {}, { unreadable: [HOME], network: "on" }],
+    ["the rig install and node left out", list({ "~/.openrig": "write", ":workspace_roots": "write" }), {}, { unreadable: [INSTALL], network: "on", unverified: [NODE] }],
+    ["network off with every folder readable", list({ ":root": "read" }, false), {}, { unreadable: [], network: "off" }],
+    [":root read", list({ ":root": "read" }), {}, null],
+    [":root write", list({ ":root": "write" }), {}, null],
+    ["a literal / grant", list({ "/": "read" }), {}, null],
+    ["a deny under a granted ancestor", list({ ":root": "read", "~/.openrig": "deny" }), {}, { unreadable: [HOME], network: "on" }],
+    ["a closer read under a denied ancestor stays unverified", list({ "/home/u": "deny", "/home/u/.openrig": "read", "~/.nvm": "read" }), {},
+      { unreadable: [], network: "on", unverified: [HOME, INSTALL, NODE] }],
+    [":root deny", list({ ":root": "deny", ":workspace_roots": "write" }), {}, { unreadable: [HOME, INSTALL], network: "on", unverified: [NODE] }],
+    ["a sibling path that only shares a prefix", list({ "/home/u/.open": "read", "~/.nvm": "read" }), {}, { unreadable: [HOME], network: "on" }],
+    [":workspace_roots with the folders inside the seat's cwd", list({ ":workspace_roots": "write" }), { cwd: "/home/u" }, null],
+    [":project_roots, the same selector", list({ ":project_roots": "read" }), { cwd: "/home/u" }, null],
+    [":workspace_roots with the folders outside the seat's cwd", list({ ":workspace_roots": "write" }), {}, { unreadable: [HOME, INSTALL], network: "on", unverified: [NODE] }],
+    [":workspace_roots with no known cwd", list({ ":workspace_roots": "write" }), { cwd: undefined }, { unreadable: [], network: "on", unverified: [HOME, INSTALL, NODE] }],
+    [":minimal, which doesn't cover /home", list({ ":minimal": "read", ":workspace_roots": "write" }), {}, { unreadable: [HOME, INSTALL], network: "on", unverified: [NODE] }],
+    [":minimal with rig and node in system folders", list({ ":minimal": "read" }),
+      { rigInstall: "/usr/lib/node_modules/@openrig/cli", node: "/usr/bin" }, { unreadable: [HOME], network: "on",
+        unverified: [{ what: "the rig install", path: "/usr/lib/node_modules/@openrig/cli" }, { what: "node", path: "/usr/bin" }] }],
+    [":minimal and a home outside /home", list({ ":minimal": "read" }),
+      { openrigHome: "/root/.openrig", home: "/root", rigInstall: "/usr/lib/node_modules/@openrig/cli", node: "/usr/bin" },
+      { unreadable: [{ what: "the OpenRig home", path: "/root/.openrig" }], network: "on",
+        unverified: [{ what: "the rig install", path: "/usr/lib/node_modules/@openrig/cli" }, { what: "node", path: "/usr/bin" }] }],
+    [":minimal and /Users", list({ ":minimal": "read" }, false),
+      { openrigHome: "/Users/u/.openrig", home: "/Users/u", rigInstall: "/opt/homebrew/lib/node_modules/@openrig/cli", node: "/opt/homebrew/bin" },
+      { unreadable: [{ what: "the OpenRig home", path: "/Users/u/.openrig" }], network: "off",
+        unverified: [{ what: "the rig install", path: "/opt/homebrew/lib/node_modules/@openrig/cli" }, { what: "node", path: "/opt/homebrew/bin" }] }],
+    [":minimal and an OpenRig home under /tmp", list({ ":minimal": "read", "~/.nvm": "read" }), { openrigHome: "/tmp/rig-home" },
+      { unreadable: [{ what: "the OpenRig home", path: "/tmp/rig-home" }], network: "on" }],
+    [":slash_tmp with the OpenRig home under /tmp", list({ ":slash_tmp": "read", "~/.nvm": "read" }), { openrigHome: "/tmp/rig-home" }, null],
+    ["an unknown install folder", list({ "~/.openrig": "read" }), { rigInstall: undefined, node: undefined }, null],
+    ["workspace-write with network on", validateCodexMemberPermissions({ sandbox: "workspace-write", approval: "never", network_access: true }), {}, null],
+    ["workspace-write with network off", validateCodexMemberPermissions({ sandbox: "workspace-write", approval: "never" }), {}, { unreadable: [], network: "off" }],
+    ["read-only, which never has network", reader, {}, { unreadable: [], network: "read-only" }],
+  ])("%s", (_case, permissions, over, expected) => {
+    expect(codexRigReach(permissions, { ...paths, ...over })).toEqual(expected);
+  });
+
+  it("names only what's missing, with the fix, and says the launch continues", () => {
+    const breaks = "can't read or close its queued tasks, ask a question or send a message through rig; messages typed into its terminal still arrive.";
+    expect(codexRigReachWarning("dev.impl", { unreadable: [HOME, INSTALL], network: "off" }, "linux")).toBe(
+      "dev.impl: this seat's codex_permissions don't let it read the OpenRig home (/home/u/.openrig) or the rig install"
+      + " (/home/u/.nvm/versions/node/v22/lib/node_modules/@openrig/cli), and network is off. Inside its sandbox the agent"
+      + ` can't run rig or reach the OpenRig daemon, so it ${breaks} The launch continues`
+      + " with the permissions as written. To fix it: add those paths with read access and turn network on"
+      + " (network_access: true), then run rig whoami inside the seat.");
+    expect(codexRigReachWarning("dev.impl", { unreadable: [HOME, INSTALL], network: "on", unverified: [NODE] }, "linux")).toBe(
+      "dev.impl: this seat's codex_permissions don't let it read the OpenRig home (/home/u/.openrig) or the rig install"
+      + " (/home/u/.nvm/versions/node/v22/lib/node_modules/@openrig/cli)."
+      + ` Inside its sandbox the agent can't run rig, so it ${breaks} The launch`
+      + " continues with the permissions as written. To fix it: add those paths with read access, then run rig whoami"
+      + " inside the seat. The permissions don't show that the seat can read node (/home/u/.nvm/versions/node/v22/bin), the"
+      + " one this daemon runs on. In the seat, rig runs on the first node on the seat's PATH, which may be another one; if"
+      + " it's this one, the seat needs to read it too."
+      + " Run rig whoami inside the seat to check; do not change a working policy just for this advisory.");
+    expect(codexRigReachWarning("dev.review", { unreadable: [], network: "read-only" }, "linux")).toBe(
+      "dev.review: this seat's codex_permissions use the read-only sandbox, where network is always off. The rig command"
+      + ` talks to the OpenRig daemon over 127.0.0.1, which a Codex sandbox with network off can't reach, so the agent ${breaks}`
+      + " The launch continues with the permissions as written. To fix it: use sandbox:"
+      + " workspace-write with network_access: true, or keep it read-only with a filesystem list of \":root\": read and"
+      + " network_access: true, then run rig whoami inside the seat.");
+  });
+
+  it("says may, not can't, for network off where it wasn't measured (macOS)", () => {
+    const breaks = "can't read or close its queued tasks, ask a question or send a message through rig; messages typed into its terminal still arrive.";
+    expect(codexRigReachWarning("dev.impl", { unreadable: [], network: "off" }, "darwin")).toBe(
+      "dev.impl: network is off in this seat's codex_permissions. The rig command talks to the OpenRig daemon over 127.0.0.1, which a"
+      + ` Codex sandbox with network off may not reach (seen on Linux). If it doesn't, the agent ${breaks}`
+      + " The launch continues with the permissions as written. To fix it: turn network on (network_access: true),"
+      + " then run rig whoami inside the seat.");
+    expect(codexRigReachWarning("dev.impl", { unreadable: [HOME], network: "off" }, "darwin")).toContain(
+      `Inside its sandbox the agent can't run rig, and with network off it may not reach the OpenRig daemon either, so it ${breaks}`);
+  });
+
+  it("tells the setter too, and records the permissions as given", async () => {
+    const f = fixture();
+    const narrowed = await f.service.setPermissions(set(lease));
+    expect(narrowed).toMatchObject({ ok: true, to: lease, advisories: [expect.stringMatching(/^dev\.a: network is off in this seat's codex_permissions\. .* The launch continues with the permissions as written\./)] });
+    expect(readCodexMemberPermissions(f.db, f.a.id)).toEqual(lease);
+    const reaching = await f.service.setPermissions(set({ ...lease, network_access: true }));
+    expect(reaching).toMatchObject({ ok: true });
+    expect(reaching).not.toHaveProperty("advisories");
+  });
+
+  it("keeps a saved selection successful if the advisory's environment metadata cannot be read", async () => {
+    const f = fixture();
+    vi.spyOn(f.rigRepo, "getEffectiveSeatEnv").mockImplementation(() => { throw new Error("metadata unavailable"); });
+    const result = await f.service.setPermissions(set(lease));
+    expect(result).toMatchObject({ ok: true, to: lease, advisories: [expect.stringContaining("could not be checked")] });
+    expect(readCodexMemberPermissions(f.db, f.a.id)).toEqual(lease);
+    expect(events(f.db, "node.codex_permissions_changed")).toHaveLength(1);
+  });
+});
+
 describe("a Codex seat's current profile", () => {
   it("records a profile with what the setter saw in the seat's config home, and inherit clears it", async () => {
     const observe = vi.fn(async () => observation());
@@ -249,7 +420,7 @@ describe("a Codex seat's current profile", () => {
 });
 
 describe("both writers: the spec at creation, the setter afterwards, every launch reading the seat's record", () => {
-  const authored = (profile: string, permissions?: CodexMemberPermissions) => ({ version: "0.2", name: "authored", pods: [{ id: "dev", label: "Dev", members: [
+  const authored = (profile: string | undefined, permissions?: CodexMemberPermissions) => ({ version: "0.2", name: "authored", pods: [{ id: "dev", label: "Dev", members: [
     { id: "impl", agent_ref: "local:impl.agent.yaml", profile: "default", runtime: "codex", cwd: "/same/project", codex_config_profile: profile,
       ...(permissions ? { codex_permissions: permissions } : {}) },
   ], edges: [] }], edges: [] });
@@ -292,6 +463,27 @@ describe("both writers: the spec at creation, the setter afterwards, every launc
     expect(RigSpecSchema.validate(wrongRuntime).errors.join(" ")).toContain("codex_permissions");
   });
 
+  it("materializes and exports the filesystem choice with a named profile", async () => {
+    const f = fixture();
+    const policy: CodexMemberPermissions = { approval: "never", filesystem: { ":minimal": "read", "/lease/a": "write", "/lease/a/private": "deny" }, network_access: false };
+    const raw = authored("model-only", policy);
+    expect(RigSpecSchema.validate(raw).valid).toBe(true);
+    const { setup, node, rigId } = await materialize(f.db, raw);
+    expect(readCodexMemberPermissions(f.db, node.id)).toEqual(policy);
+    const exported = new RigSpecExporter({ rigRepo: setup.rigRepo, sessionRegistry: setup.sessionRegistry, podRepo: new PodRepository(f.db) }).exportRig(rigId);
+    const decoded = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(exported as import("../src/domain/types.js").RigSpec)));
+    expect(decoded.pods[0]!.members[0]!.codexPermissions).toEqual(policy);
+    expect(decoded.pods[0]!.members[0]!.codexConfigProfile).toBe("model-only");
+    setup.sessionRegistry.registerSession(node.id, "dev-impl@authored");
+    const service = new SeatLifecycleService({ db: f.db, rigRepo: setup.rigRepo, sessionRegistry: setup.sessionRegistry, eventBus: setup.eventBus,
+      tmuxAdapter: {} as TmuxAdapter });
+    expect(await service.setPermissions({ seatRef: "dev-impl@authored", codexProfile: "other-model", actor: "operator@authored", reason: "Model selection" }))
+      .toMatchObject({ ok: true });
+    expect(await service.setPermissions({ seatRef: "dev-impl@authored", codexPermissions: policy, actor: "operator@authored", reason: "Keep policy" }))
+      .toMatchObject({ ok: true });
+    expect(readCodexMemberPermissions(f.db, node.id)).toEqual(policy);
+  });
+
   it("restores with the seat's current profile, so an older snapshot can't bring back a replaced one", async () => {
     const f = fixture();
     const setup = createTestApp(f.db);
@@ -322,6 +514,8 @@ describe("legacy flat specs carry the envelope too", () => {
     const exported = new RigSpecExporter({ rigRepo: f.rigRepo, sessionRegistry: new SessionRegistry(f.db) }).exportRig(f.a.rigId);
     const parsed = LegacyRigSpecCodec.parse(LegacyRigSpecCodec.serialize(exported as import("../src/domain/types.js").LegacyRigSpec));
     expect(LegacyRigSpecSchema.normalize(parsed).nodes.find(n => n.codexPermissions)!.codexPermissions).toEqual(lease);
+    expect(LegacyRigSpecSchema.validate({ ...raw, nodes: [{ ...raw.nodes[0], codex_config_profile: "model-only",
+      codex_permissions: { approval: "never", filesystem: { ":project_roots": "write" } } }] }).errors).toEqual([]);
   });
 });
 

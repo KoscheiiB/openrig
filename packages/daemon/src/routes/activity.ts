@@ -1,10 +1,15 @@
+import { reportNativeContinuation } from "../domain/native-continuation-notice.js";
+import type { RunnerReceipt } from "../domain/outbox-handler.js";
+import { RunnerChannel, RunnerChannelError } from "../domain/runner-channel.js";
 import { runtimeSwitchActivityRole } from "./runtime-switch-custody.js";
-import { SessionRegistry, physicalSessionName, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
+import { constantTimeEqual } from "../middleware/auth-bearer-token.js";
+import { AGENT_RUNNER_HOSTED_PI_RPC, SessionRegistry, physicalSessionName, recordedRunner, sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "../domain/session-registry.js";
 import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { AgentActivityStore } from "../domain/agent-activity-store.js";
 import { hookEventState, isRunnerExit } from "../domain/agent-activity-store.js";
+import { RemoteControlObservationStore, parseRemoteControlReport } from "../domain/remote-control-observations.js";
 import { WorkingLivenessGate, isWorkingLivenessBeat, workingLivenessSeconds, type WorkingLivenessIgnored } from "../domain/working-liveness.js";
 import type { EventBus } from "../domain/event-bus.js";
 import type { StreamStore } from "../domain/stream-store.js";
@@ -18,9 +23,11 @@ import type { AgentActivity } from "../domain/types.js";
 import * as parkedQuery from "../domain/parked-query.js";
 import { nodeExecutorConfirmedStopped } from "../domain/node-inventory.js";
 import { runtimeRungInventory } from "../domain/activity-taxonomy.js";
-import { validateResumeToken } from "../domain/resume-token-validation.js";
+import { validateResumeToken, validateSessionFileFormat } from "../domain/resume-token-validation.js";
+import { loadCommunityHarnessPreset } from "../domain/community-harness-presets.js";
 import { claudeHookFromLaunchedProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { transportSenderSession } from "./require-sender-identity.js";
+import { isClaudeRateLimitHook } from "../domain/provider/claude-interruption.js";
 import {
   PiUsageEntriesStore, hasPiUsageChargesTable, hasPiUsageEntriesTable, validPiProviderCharge, validPiUsageFact,
 } from "../domain/pi-usage-entries-store.js";
@@ -31,7 +38,7 @@ import {
 // ALREADY-NORMALIZED state is the input (one event-name parser, no twin).
 
 /** Translate a recorded hook activity into oracle evidence. Returns null for states the
- *  oracle should not consume (unknown = noise, never evidence). needs_input becomes
+ *  oracle should not consume (unknown = noise, never evidence), except a typed usage limit. needs_input becomes
  *  COUNT+reason on the hooks rung — never an activity value (the taxonomy's binding
  *  exclusion); the turn's working/idle stays whatever other evidence says. */
 export function evidenceFromHookActivity(input: {
@@ -71,6 +78,12 @@ export function evidenceFromHookActivity(input: {
   if (input.activity.rawEvent === "Stop" && isRunnerExit(input.activity.rawSubtype, input.runtime, input.activity.communityRunner === true)) {
     return { ...base, activity: "unknown", needsInput: { count: 0, reason: null } };
   }
+  // A typed usage limit (#2917, #99) is evidence, not noise: it ends the turn, and it never counts as waiting on a person.
+  // The oracle holds it until a newer turn starts, so an older working report can't outlast it.
+  if (isClaudeRateLimitHook(input.runtime, input.activity.rawEvent, input.activity.rawSubtype)) {
+    return { ...base, activity: "unknown", needsInput: { count: 0, reason: null },
+      usageLimit: { resetsAt: input.activity.resetsAt ?? null } };
+  }
   switch (input.activity.state) {
     case "running":
       return { ...base, activity: "working", needsInput: { count: 0, reason: null },
@@ -96,12 +109,30 @@ export function restoredRunnerHookEvidence(
   if (!latest || latest.evidenceSource !== "runtime_hook" || latest.generationProvenance !== "resolved") return null;
   const state = !latest.stale ? latest.state
     : latest.reason === "stale_runtime_hook"
-      ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime, latest.communityRunner === true) : "unknown";
+      ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime, latest.communityRunner === true, latest.piRpc === true) : "unknown";
   // A working beat keeps the lifetime it was admitted with, as when it was posted.
   return evidenceFromHookActivity({ seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime,
     ...(isWorkingLivenessBeat(latest.rawEvent, latest.rawSubtype)
       ? { workingLivenessSeconds: workingLivenessSeconds(latest.livenessSeconds) } : {}),
     activity: { ...latest, state }, seq: 0 });
+}
+
+/** The typed usage limit a seat still held when the daemon stopped, as the oracle evidence its live report was, for
+ *  restoring after a restart: Claude's is its hook evidence again, and Codex's banner is held on the sampling rung that
+ *  read it from the pane. Null when none is in force; the store's own read throws when it can't be read, or when a limit
+ *  may be in force but its occupant can't be shown. */
+export function restoredUsageLimitEvidence(
+  store: Pick<AgentActivityStore, "latestHeldUsageLimit">,
+  seat: { seatNodeId: string; sessionName: string },
+  runtime: string,
+): ActivityEvidence | null {
+  const held = store.latestHeldUsageLimit({ nodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime });
+  if (!held) return null;
+  if (runtime === "codex") {
+    return { seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, rung: "window-sampling", sourceId: "codex:limit-banner",
+      seq: 0, observedAt: held.eventAt ?? held.sampledAt, usageLimit: { resetsAt: null } };
+  }
+  return evidenceFromHookActivity({ seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime, activity: held, seq: 0 });
 }
 
 /** The relay route a hook post names: "plugin" or "managed". An untagged post (an older relay) stays untagged; any
@@ -115,6 +146,16 @@ export function hookRelayRoute(value: unknown): EvidenceRoute | undefined {
 const hookEvidenceSeq = new Map<string, number>();
 // What each seat's runner has said about its turns, for deciding whether a working beat counts (the runner contract §4).
 const workingLiveness = new WorkingLivenessGate();
+/** #99: the reset instant the relay read from a Claude usage limit, as a canonical ISO timestamp, or null. The store
+ *  keeps it only on the typed StopFailure/rate_limit row; the provider lane decides whether it is still ahead. */
+function limitResetsAt(body: Record<string, unknown>): string | null {
+  if (typeof body.resetsAt !== "string" || body.resetsAt.length > 40) return null;
+  const ms = Date.parse(body.resetsAt);
+  // The relay's eight-day horizon, enforced at ingress too: no sender can park a pool for longer than the relay could.
+  return Number.isFinite(ms) && ms <= Date.now() + LIMIT_RESET_MAX_MS ? new Date(ms).toISOString() : null;
+}
+const LIMIT_RESET_MAX_MS = 8 * 24 * 3600 * 1000;
+
 function sourceSequence(body: Record<string, unknown>): number | null {
   return typeof body.sequence === "number" && Number.isSafeInteger(body.sequence) && body.sequence > 0 ? body.sequence : null;
 }
@@ -127,6 +168,19 @@ function liveOccupantGeneration(c: Context, store: AgentActivityStore, nodeId: s
     return null;
   }
 }
+/** #3513: whether `generation` is still the seat's occupant: the current one, or one followed only by no-launch
+ *  adoptions (reconcile, bind, self-attach), whose hooks keep their launch generation. The identity gate's own rule
+ *  (SessionRegistry.isOccupantContinuedByAdoption); an unreadable ledger is no evidence, so nothing is recorded. */
+function continuesCurrentOccupant(c: Context, store: AgentActivityStore, nodeId: string): (generation: string) => boolean {
+  const registry = (c.get("sessionRegistry" as never) as SessionRegistry | undefined) ?? new SessionRegistry(store.db);
+  return (generation) => {
+    try {
+      return registry.isOccupantContinuedByAdoption(nodeId, generation);
+    } catch {
+      return false;
+    }
+  };
+}
 function nextHookSeq(key: string): number {
   const next = (hookEvidenceSeq.get(key) ?? 0) + 1;
   hookEvidenceSeq.set(key, next);
@@ -135,10 +189,85 @@ function nextHookSeq(key: string): number {
 
 export const activityRoutes = new Hono();
 
+function channelService(c: Context): RunnerChannel {
+  const channel = c.get("runnerChannel" as never) as RunnerChannel | undefined;
+  if (!channel) throw new RunnerChannelError("runner_channel_unavailable", "Runner channel unavailable.", 503);
+  return channel;
+}
+function channelToken(c: Context): string | undefined {
+  const auth = c.req.header("Authorization");
+  return auth?.startsWith("Bearer ") ? auth.slice(7) : c.req.header("x-openrig-activity-token");
+}
+function channelFailure(c: Context, error: unknown): Response {
+  return error instanceof RunnerChannelError ? c.json({ error: error.message, code: error.code,
+    ...(error.retryable || error.code === "runner_grant_unverified" ? { retryable: true } : {}) }, error.status)
+    : c.json({ error: "Runner channel unavailable.", code: "runner_channel_unavailable" }, 503);
+}
+activityRoutes.post("/runner-channel", async c => {
+  try {
+    const channel = channelService(c), token = channelToken(c);
+    channel.authenticate(token);
+    const body = await c.req.json().catch(() => null);
+    if (body && typeof body === "object" && (body as Record<string, unknown>).type === "cancel-prepare") {
+      const ctx = permissionContext(c, false);
+      if ("refused" in ctx) return ctx.refused;
+      return c.json(channel.prepareCancellation(token, body as Record<string, unknown>, (grant, target) => ctx.permissions.withdrawTurn(
+        { nodeId: grant.nodeId, sessionName: ctx.store.resolveSession({ nodeId: grant.nodeId })?.sessionName ?? "", generation: grant.generation }, target)));
+    }
+    const result = channel.post(token, body);
+    const receipt = result.receipt as RunnerReceipt | undefined;
+    const continuation = receipt?.kind === "cancel" && (body as Record<string, unknown>)?.type === "result"
+      ? await reportNativeContinuation(channel.outbox, c.get("queueRepo" as never) as QueueRepository | undefined, receipt) : undefined;
+    return c.json({ ...result, ...(continuation ? { continuation } : {}) });
+  } catch (error) { return channelFailure(c, error); }
+});
+activityRoutes.get("/runner-channel", c => {
+  try {
+    const channel = channelService(c), token = channelToken(c);
+    channel.authenticate(token);
+    const raw = c.req.header("Last-Event-ID");
+    if (raw !== undefined && !/^(0|[1-9][0-9]*)$/.test(raw)) throw new RunnerChannelError("invalid_runner_cursor", "Invalid run-local cursor.", 400);
+    const cursor = raw === undefined ? 0 : Number(raw);
+    channel.frames(token, cursor); // Validate before sending HTTP headers; offered custody is retained if writing fails.
+    return streamSSE(c, async stream => {
+      const disconnect = channel.connect(token);
+      const written = new Set<number>();
+      let finish!: () => void, closed = false, draining = false, again = false;
+      const ended = new Promise<void>(resolve => { finish = resolve; });
+      const close = () => { if (!closed) { closed = true; finish(); } };
+      const drain = async () => {
+        if (draining) { again = true; return; }
+        draining = true;
+        try {
+          do {
+            again = false;
+            for (const frame of channel.frames(token, cursor)) {
+              if (written.has(frame.sequence)) continue;
+              const data = JSON.stringify(frame);
+              channel.authenticate(token); // Recheck immediately before each run-local write.
+              await stream.write(`: runner-frame-chars=${data.length}\n`);
+              channel.authenticate(token); // The comment write yielded; recheck before exposing the receipt.
+              await stream.writeSSE({ id: String(frame.sequence), event: "request", data });
+              written.add(frame.sequence);
+            }
+          } while (again && !closed);
+        } catch { close(); }
+        finally { draining = false; }
+      };
+      // Subscribe before the retained read. Notifications are hints; the outbox is authority.
+      const unsubscribe = channel.subscribe(() => { void drain(); });
+      const timer = setInterval(() => { void drain(); }, 250);
+      stream.onAbort(close);
+      try { await drain(); await ended; }
+      finally { clearInterval(timer); unsubscribe(); disconnect(); await stream.close(); }
+    });
+  } catch (error) { return channelFailure(c, error); }
+});
+
 /** A seat activity grant's post, bound to the grant. A post that names another seat, or claims a generation the grant
  *  wasn't issued for, is refused; so is a grant whose occupant was replaced (stale) or hasn't registered yet (pending).
  *  A refusal records nothing, so a missing event stays unknown. Otherwise the seat and generation come from the grant. */
-function bindToGrant(c: Context, store: AgentActivityStore, grant: ActivityGrant, body: Record<string, unknown>, permissionRoute = false):
+export function bindToGrant(c: Context, store: AgentActivityStore, grant: ActivityGrant, body: Record<string, unknown>, permissionRoute = false):
   { body: Record<string, unknown> } | { refused: Response } {
   const refuse = (status: 401 | 403 | 409 | 503, code: string, error: string) => ({ refused: c.json({ ok: false, code, error }, status) });
   // Read the grant again: it may have been revoked or reissued while the body arrived. Nothing is awaited from here to the
@@ -146,6 +275,14 @@ function bindToGrant(c: Context, store: AgentActivityStore, grant: ActivityGrant
   const revoked = new ActivityGrantStore(store.db).get(grant.grantId)?.revokedAt !== null;
   if (revoked && !permissionRoute) {
     return refuse(401, "activity_grant_revoked", "This activity grant was revoked; nothing was recorded.");
+  }
+  if (grant.runId && body.runId !== undefined && body.runId !== grant.runId) {
+    return refuse(409, "activity_grant_stale", "This post names another run; nothing was recorded.");
+  }
+  const claimedRuntime = stringOrNull(body.runtime);
+  if (grant.binding && ((claimedRuntime && claimedRuntime !== grant.binding.runtime)
+    || (body.eventFamily === "session_identity" && !claimedRuntime))) {
+    return refuse(403, "activity_grant_runtime_mismatch", "This runner grant speaks only for its bound runtime; nothing was recorded.");
   }
   const claimedNode = stringOrNull(body.nodeId);
   const claimedSession = stringOrNull(body.sessionName);
@@ -167,6 +304,16 @@ function bindToGrant(c: Context, store: AgentActivityStore, grant: ActivityGrant
  *  hasn't registered yet (pending). A `revoked` grant whose occupant wasn't replaced reads revoked: it was reissued for
  *  the same launch. `outcome` says what the refusal left undone. */
 function grantStandingRefusal(c: Context, store: AgentActivityStore, grant: ActivityGrant, outcome: string, revoked = false): Response | null {
+  if (grant.runId) {
+    let standing: ReturnType<ActivityGrantStore["standing"]> = "unverified";
+    try { standing = new ActivityGrantStore(store.db).standing(grant.grantId); } catch { /* Unreadable authority is not a revoked run. */ }
+    if (standing === "current") return null;
+    if (standing === "unverified") {
+      return c.json({ ok: false, code: "activity_grant_unverified", retryable: true,
+        error: `This runner grant couldn't be verified now; retry verification; ${outcome}` }, 409);
+    }
+    return c.json({ ok: false, code: `activity_grant_${standing}`, error: `This runner grant is ${standing}; ${outcome}` }, standing === "revoked" ? 401 : 409);
+  }
   const registry = (c.get("sessionRegistry" as never) as SessionRegistry | undefined) ?? new SessionRegistry(store.db);
   let standing: ReturnType<typeof grantGeneration>;
   try {
@@ -200,7 +347,10 @@ async function piUsageRequest(c: Context, what: string, needs: (db: SessionRegis
   }
   const authHeader = c.req.header("authorization");
   const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : null;
-  if (bearerToken !== expectedToken && (c.req.header("x-openrig-activity-token") ?? null) !== expectedToken) {
+  const headerToken = c.req.header("x-openrig-activity-token") ?? null;
+  const grantStore = new ActivityGrantStore(sessionRegistry.db);
+  const grant = grantStore.authenticate(bearerToken) ?? grantStore.authenticate(headerToken);
+  if (!constantTimeEqual(bearerToken ?? "", expectedToken) && !constantTimeEqual(headerToken ?? "", expectedToken) && !grant?.runId) {
     return { error: c.json({ ok: false, code: "activity_hook_unauthorized", error: `${what} require the configured local hook token.` }, 401) };
   }
   let body: Record<string, unknown>;
@@ -211,6 +361,12 @@ async function piUsageRequest(c: Context, what: string, needs: (db: SessionRegis
   }
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return { error: c.json({ ok: false, code: "invalid_pi_usage", error: `${what} require a JSON object` }, 400) };
+  }
+  if (grant?.runId) {
+    const bound = bindToGrant(c, store, grant, body);
+    if ("refused" in bound) return { error: bound.refused };
+    if (grant.binding?.runtime !== "pi") return { error: c.json({ ok: false, code: "activity_grant_wrong_seat", error: "Pi usage requires a Pi run." }, 403) };
+    body = bound.body;
   }
   const sessionName = stringOrNull(body.sessionName);
   const piSessionId = stringOrNull(body.piSessionId);
@@ -265,11 +421,11 @@ activityRoutes.post("/pi-usage-charges", async (c) => {
 /** Who is posting, before anything the request claims is read. The install-wide token speaks for every seat (`grant`
  *  null); a seat activity grant speaks only for its own seat and launch generation, which bindToGrant checks once the
  *  body has arrived. Without `expectedToken` (the guest router), only a grant is accepted. */
-function activityPrincipal(c: Context, store: AgentActivityStore, expectedToken: string | undefined, permissionRoute = false): { grant: ActivityGrant | null } | { refused: Response } {
+export function activityPrincipal(c: Context, store: AgentActivityStore, expectedToken: string | undefined, permissionRoute = false): { grant: ActivityGrant | null } | { refused: Response } {
   const authHeader = c.req.header("authorization");
   const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : null;
   const headerToken = c.req.header("x-openrig-activity-token") ?? null;
-  if (expectedToken && (bearerToken === expectedToken || headerToken === expectedToken)) return { grant: null };
+  if (expectedToken && (constantTimeEqual(bearerToken ?? "", expectedToken) || constantTimeEqual(headerToken ?? "", expectedToken))) return { grant: null };
   const grants = new ActivityGrantStore(store.db);
   const grant = grants.authenticate(bearerToken) ?? grants.authenticate(headerToken);
   if (!grant) {
@@ -315,11 +471,22 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
     return c.json({ ok: false, code: "invalid_json", error: "Request body must be a JSON object." }, 400);
   }
 
+  if (Object.hasOwn(body, "runId") && !grant?.runId) {
+    return c.json({ ok: false, code: "run_grant_required", error: "Actual-run reports require their run-bound credential." }, 403);
+  }
   if (typeof body.sessionName === "string") body = { ...body, sessionName: physicalSessionName(store.db, body.sessionName) };
   if (grant) {
     const bound = bindToGrant(c, store, grant, body);
     if ("refused" in bound) return bound.refused;
     body = bound.body;
+  }
+
+  if (Object.hasOwn(body, "observations")) {
+    if (!grant?.runId) return c.json({ ok: false, code: "run_grant_required", error: "Observation reports require their run-bound credential." }, 403);
+    const result = store.recordRunnerObservation(grant, body);
+    if (!result.ok) return c.json(result, result.code === "runner_observation_conflict" ? 409
+      : result.code === "runner_observation_unavailable" || result.code === "runner_observation_unverified" ? 409 : 400);
+    return c.json(result);
   }
 
   const permissionDiagnostic = ["permissionStopDescriptor", "permissionRuleSuggestions", "permission_suggestions"]
@@ -415,11 +582,36 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
       return c.json({ ok: true, sessionId, provenance: "rpc", tokenPersisted });
     }
 
+/** The seat speaks Pi's RPC protocol through OpenRig's hosted runner: its launch recorded the protocol (agent_runner 2),
+ *  or, only while no launch record exists (an identity post can arrive first), its installed preset declares
+ *  `protocol: pi-rpc`. Any other recorded value never qualifies: a plain launch (0) or a preset's own runner (`runner: true`,
+ *  1) keeps its own identity path, so a later preset edit can't move a launched seat onto this one. */
+function isPiRpcHarness(db: import("better-sqlite3").Database, sessionId: string, runtime: string): boolean {
+  if (runtime === "pi" || runtime === "omp" || runtime === "claude-code" || runtime === "codex" || runtime === "terminal") {
+    return false;
+  }
+  if (sessionCommunityRunnerSelect(db) !== "NULL") {
+    const row = db.prepare(`SELECT ${sessionCommunityRunnerSelect(db, "s")} AS runner FROM sessions s WHERE s.id = ?`).get(sessionId) as { runner?: number | null } | undefined;
+    if (row?.runner !== null && row?.runner !== undefined) return row.runner === AGENT_RUNNER_HOSTED_PI_RPC;
+  }
+  const found = loadCommunityHarnessPreset(runtime);
+  return found.ok && found.preset.protocol === "pi-rpc";
+}
+
     // OPR.0.4.6.PI1 FR-5 — Pi session identity arrives from the pi-runner's
     // RPC get_state (provenance "rpc" on the bus, never scrape). The resume
     // TOKEN for Pi is the session FILE (body.sessionFile), not the session id;
     // it is format-validated before the persist and never echoed on failure.
-    if (runtime === "pi") {
+    // Pi-RPC community harnesses share this protocol, but persist community:<name>.
+    const isPi = runtime === "pi" && resolved.runtime === "pi";
+    const isCommunityPi = !isPi && (resolved.runtime !== null && resolved.runtime !== "omp" && isPiRpcHarness(store.db, resolved.sessionId, resolved.runtime));
+    // A current generation isn't a runtime binding: a process started inside the seat (a Pi helper, say) carries the
+    // seat's generation. Only the seat's own runtime reports its identity; any other keeps the saved token and publishes
+    // nothing for the seat, as OMP's runtime check does above.
+    if (isCommunityPi && runtime !== resolved.runtime) {
+      return c.json({ ok: true, ignored: "runtime_mismatch", tokenPersisted: false });
+    }
+    if (isPi || isCommunityPi) {
       // A delayed get_state from a retired runner must not replace the successor's
       // resume token or publish a current identity. Keep resolution, this check
       // and both effects synchronous so renewal cannot interleave at an await.
@@ -430,30 +622,31 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
         if (!generation) reason = "generation_unverifiable";
         else if (!current || !sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation)) {
           reason = "generation_unresolvable";
-        } else if (current.generationUuid !== generation) reason = "generation_mismatch";
+        } else if (current.generationUuid !== generation && !(grant?.runId && grant.generation === generation)) reason = "generation_mismatch";
       } catch {
         return c.json({
           ok: false, code: "generation_resolver_error", tokenPersisted: false,
-          error: "Pi session identity ignored: occupant generation is unavailable.",
+          error: `${isPi ? "Pi" : resolved.runtime} session identity ignored: occupant generation is unavailable.`,
         }, 503);
       }
       if (reason) {
         return c.json({
           ok: false, code: reason, tokenPersisted: false,
-          error: "Pi session identity ignored: emitter is not the registered current occupant.",
+          error: `${isPi ? "Pi" : resolved.runtime} session identity ignored: emitter is not the registered current occupant.`,
         }, 409);
       }
       const sessionFile = stringOrNull(body.sessionFile);
-      const validation = validateResumeToken("pi", sessionFile);
+      const validation = isPi ? validateResumeToken("pi", sessionFile) : validateSessionFileFormat(sessionFile, resolved.runtime ?? "community");
+      const resumeType = isPi ? "pi_session_file" : `community:${resolved.runtime}`;
       if (validation.ok) {
-        sessionRegistry.updateResumeToken(resolved.sessionId, "pi_session_file", validation.token, "hook");
+        sessionRegistry.updateResumeToken(resolved.sessionId, resumeType, validation.token, "hook");
       }
       eventBus.emit({
         type: "agent.session_identity",
         rigId: resolved.rigId,
         nodeId: resolved.nodeId,
         sessionName: resolved.sessionName,
-        runtime: "pi",
+        runtime: resolved.runtime ?? "pi",
         sessionId,
         provenance: "rpc",
       });
@@ -498,26 +691,30 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
       const still = bindToGrant(c, store, grant, body);
       if ("refused" in still) return still.refused;
     }
-    // #1524 (a), Codex only, synchronous with the write below (no await between them):
-    // - a known earlier occupant's hook (its generation is registered for this node and isn't the current one)
-    //   neither writes nor publishes. An absent or unregistered generation, no current tenure, or an unreadable
-    //   ledger keep today's write.
-    // - Codex sends an explicit transcript_path null for a thread it never persists (an internal thread), and also
-    //   when it can't read a persisted conversation's rollout. Either way the saved pointer is kept, so an internal
-    //   thread can't replace it. An absent key, an empty string or a malformed value keep today's write.
-    if (runtime === "codex") {
+    // #1524 (a) for Codex, #2768 for Claude, synchronous with the write below (no await between them): a known earlier
+    // occupant's hook (its generation is registered for this node and isn't the current one) neither writes nor
+    // publishes. An absent or unregistered generation, no current tenure, or an unreadable ledger keep today's write.
+    // A no-launch adoption (reconcile, bind, self-attach) registers the live process again without replacing it, so
+    // an occupant followed only by adoptions is still current; a launch after it is what makes it earlier.
+    if (runtime === "codex" || runtime === "claude-code") {
       let generationMismatch = false;
       try {
         const current = sessionRegistry.currentOccupantTenure(resolved.nodeId);
         generationMismatch = !!generation && !!current && current.generationUuid !== generation
-          && sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation);
+          && sessionRegistry.isOccupantGenerationRegistered(resolved.nodeId, generation)
+          && !sessionRegistry.isOccupantContinuedByAdoption(resolved.nodeId, generation);
       } catch { /* an unreadable ledger is no evidence of a mismatch */ }
       if (generationMismatch) {
         return c.json({
           ok: false, code: "generation_mismatch", tokenPersisted: false,
-          error: "Codex session identity ignored: emitter is an earlier occupant of this seat.",
+          error: `${runtime === "codex" ? "Codex" : "Claude"} session identity ignored: emitter is an earlier occupant of this seat.`,
         }, 409);
       }
+    }
+    // Codex sends an explicit transcript_path null for a thread it never persists (an internal thread), and also when it
+    // can't read a persisted conversation's rollout. Either way the saved pointer is kept, so an internal thread can't
+    // replace it. An absent key, an empty string or a malformed value keep today's write.
+    if (runtime === "codex") {
       if (body.transcriptPathPresent === true && body.transcriptPath === null) {
         return c.json({
           ok: true, sessionId, provenance: "hook", tokenPersisted: false, code: "transcript_absent",
@@ -557,6 +754,8 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
     const tokenPersisted = validation.ok
       && (persistHook(validation.resumeType, validation.token)
         || sessionRegistry.resumeTokenMatches(resolved.sessionId, validation.resumeType, validation.token));
+    // SessionStart posts activity first. The accepted identity can be the first record of this conversation.
+    if (tokenPersisted) observeRemoteControl(c, store, body);
     eventBus.emit({
       type: "agent.session_identity",
       rigId: resolved.rigId,
@@ -598,13 +797,20 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
 
   // #2702: a turn, stop or notification from another runtime started inside the seat is that harness's, not the seat's.
   if (reportedByAnotherRuntime(body)) return c.json({ ok: true, ignored: "transcript_not_this_session" });
+  // #3513: take reports before the permission and PostToolBatch branches return. The fixed PermissionRequest
+  // diagnostic carries no conversation or Remote Control fields.
+  observeRemoteControl(c, store, body);
 
   // All tools in this actor's batch have resolved. An individual PostToolUse can belong to a parallel tool,
   // and a subagent's batch says nothing about the main session's permission. Only the current occupant can
   // settle a matching, older episode. Do not record an unrelated batch as an unknown hook that hides attention.
   const permissionObservation = permissionDiagnostic;
   const claudePermission = body.runtime === "claude-code" && body.hookEvent === "Notification" && body.subtype === "permission_prompt";
-  if (body.hookEvent === "PostToolBatch" || claudePermission || permissionObservation) {
+  // An MCP elicitation and its result are observation and settlement inputs only: a hook can answer one with nothing
+  // displayed, so neither changes activity or attention, and no form field or response is kept.
+  const claudeElicitation = body.runtime === "claude-code"
+    && (body.hookEvent === "Elicitation" || body.hookEvent === "ElicitationResult");
+  if (body.hookEvent === "PostToolBatch" || claudePermission || permissionObservation || claudeElicitation) {
     const oracle = c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined;
     const registry = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
     const sessionName = stringOrNull(body.sessionName);
@@ -634,9 +840,14 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
           completed: body.hookEvent === "PostToolBatch" });
       } catch { /* Optional observation never suppresses the existing completion behavior. */ }
     }
+    if ((claudeElicitation || body.hookEvent === "PostToolBatch") && attributable
+      && (body.nodeId == null || body.nodeId === seat!.nodeId)) {
+      store.observeElicitation({ nodeId: seat!.nodeId, sessionName: seat!.sessionName, generation: generation!,
+        actor: hookAgentId, at: occurredAt, completed: body.hookEvent !== "Elicitation" });
+    }
     // This event adds a diagnostic only. It must not create/clear attention, change activity,
     // write raw provider fields to events, or produce a permission decision.
-    if (permissionObservation) return c.json({ ok: true });
+    if (permissionObservation || claudeElicitation) return c.json({ ok: true });
     if (body.hookEvent === "PostToolBatch") {
       if (attributable && oracle && !oracle.hasRungInventory(seat!.nodeId, seat!.sessionName)) {
         // The completion may be this occupant's first hook to reach the daemon.
@@ -655,6 +866,27 @@ async function postHook(c: Context, installTokenAccepted: boolean): Promise<Resp
   const recorded = recordHookActivity(c, store, body);
   if ("ignored" in recorded) return c.json({ ok: true, ignored: recorded.ignored });
   return "refused" in recorded ? recorded.refused : c.json({ ok: true, activity: recorded.activity });
+}
+
+/** #3513: keep what the seat's own Claude hooks say about its Remote Control session, for the node read. Only the
+ *  current occupant's hook in the seat's own conversation counts (the store checks the conversation); a delayed event
+ *  from an earlier occupant is not recorded. This optional observation never changes how the event itself is recorded. */
+function observeRemoteControl(c: Context, store: AgentActivityStore, body: Record<string, unknown>): void {
+  if (body.runtime !== "claude-code") return;
+  const report = parseRemoteControlReport(body);
+  if (!report) return;
+  const generation = stringOrNull(body.generation);
+  const conversationId = stringOrNull(body.sessionId);
+  const occurredAt = stringOrNull(body.occurredAt);
+  if (!generation || !conversationId || !occurredAt || !Number.isFinite(Date.parse(occurredAt))) return;
+  try {
+    const sessionName = stringOrNull(body.sessionName);
+    const seat = store.resolveSession({ sessionName, nodeId: stringOrNull(body.nodeId) });
+    if (!seat || seat.runtime !== "claude-code" || (sessionName && sessionName !== seat.sessionName)
+      || (body.nodeId != null && body.nodeId !== seat.nodeId)) return;
+    new RemoteControlObservationStore(store.db).record({ nodeId: seat.nodeId, generation, conversationId, report,
+      observedAt: new Date(occurredAt).toISOString(), isCurrentOccupant: continuesCurrentOccupant(c, store, seat.nodeId) });
+  } catch { /* An optional observation never affects the event's own recording. */ }
 }
 
 /** Record one hook event for its seat and feed it to the activity oracle: the tail of the hook ingress, also used when a
@@ -696,12 +928,15 @@ function recordHookActivity(c: Context, store: AgentActivityStore, body: Record<
     livenessSeconds: beat ? workingLivenessSeconds(body.livenessSeconds)
       : typeof body.livenessSeconds === "number" && Number.isSafeInteger(body.livenessSeconds)
         && body.livenessSeconds > 0 && body.livenessSeconds <= 3600 ? body.livenessSeconds : null,
+    resetsAt: limitResetsAt(body),
+    sessionId: stringOrNull(body.sessionId),
   });
 
   if (!result.ok) {
     const status = result.code === "missing_session_identity" ? 400 : 404;
     return { refused: c.json({ ok: false, code: result.code, error: result.error }, status) };
   }
+  recordPromptObservation(c, body, (result.event as { sessionName?: string } | undefined)?.sessionName ?? stringOrNull(body.sessionName));
 
   // S19 A4 — feed the ONE oracle through the adapter seam: the recorded (store-
   // normalized) event becomes ladder evidence on the lifecycle-hooks rung. The store
@@ -736,7 +971,7 @@ function recordHookActivity(c: Context, store: AgentActivityStore, body: Record<
       oracle.declareRungInventory(
         { seatNodeId: emitted.nodeId, sessionName: emitted.sessionName },
         // The same recorded launch facts the reconcile pass reads, so a community seat's first hook gets its own inventory.
-        runtimeRungInventory(runtime, currentSession?.community_harness ?? null, currentSession?.community_runner === 1),
+        runtimeRungInventory(runtime, currentSession?.community_harness ?? null, recordedRunner(currentSession?.community_runner)),
       );
     }
     if (beat) {
@@ -783,6 +1018,33 @@ for (const [router, installTokenAccepted] of [[activityRoutes, true], [guestActi
   router.get("/permission-requests/:askId", (c) => readPermission(c, installTokenAccepted));
   router.post("/permission-requests/:askId/withdraw", (c) => withdrawPermission(c, installTokenAccepted));
 }
+
+// The receiving agent's decision on a request its person answered (`rig seat decide-permission`): on this host's main
+// routes only. The record names the deciding seat (X-OpenRig-Session), which is attribution, not authentication.
+activityRoutes.post("/permission-requests/:askId/decide", async (c) => {
+  const store = c.get("agentActivityStore" as never) as AgentActivityStore | undefined;
+  const queueRepo = c.get("queueRepo" as never) as QueueRepository | undefined;
+  const eventBus = c.get("eventBus" as never) as EventBus | undefined;
+  if (!store || !queueRepo || !eventBus) {
+    return c.json({ ok: false, code: "permission_requests_unconfigured", error: "This daemon doesn't take runner permission requests." }, 503);
+  }
+  let body: Record<string, unknown>;
+  try { body = await c.req.json() as Record<string, unknown>; } catch {
+    return c.json({ ok: false, code: "invalid_json", error: "Request body must be JSON." }, 400);
+  }
+  const optionId = typeof body.optionId === "string" ? body.optionId.trim() : "";
+  if (!optionId) return c.json({ ok: false, code: "invalid_option", error: "Name the option to decide: optionId." }, 400);
+  const registry = (c.get("sessionRegistry" as never) as SessionRegistry | undefined) ?? new SessionRegistry(store.db);
+  const rigRepo = (c.get("rigRepo" as never) as RigRepository | undefined) ?? new RigRepository(store.db);
+  const permissions = new RunnerPermissions({ db: store.db, queueRepo, eventBus, humanRegistry: () => queueRepo.humanRegistry(),
+    ownerOf: (nodeId) => rigRepo.getNodePermissionsTo(nodeId),
+    currentGeneration: (nodeId) => registry.currentOccupantTenure(nodeId)?.generationUuid ?? null,
+    stream: c.get("streamStore" as never) as StreamStore | undefined });
+  const decider = transportSenderSession(c) ?? "someone outside a seat";
+  const result = permissions.decide(c.req.param("askId") ?? "", optionId, decider, typeof body.reason === "string" ? body.reason.trim() : "");
+  if (!result.ok) return c.json({ ok: false, code: result.code, error: result.message }, result.code === "not_found" ? 404 : result.code === "not_recorded" ? 409 : 400);
+  return c.json(result);
+});
 
 type PermissionContext = { store: AgentActivityStore; grant: ActivityGrant | null; registry: SessionRegistry; permissions: RunnerPermissions };
 
@@ -847,17 +1109,35 @@ async function submitPermission(c: Context, installTokenAccepted: boolean): Prom
   }
   const parsed = parseRunnerPermissionRequest(body);
   if (!parsed.ok) return c.json({ ok: false, code: "invalid_permission_request", error: parsed.message }, 400);
+  let correlationUnverified = false;
+  if (parsed.request.runId) {
+    let current: ReturnType<RunnerChannel["currentTurn"]> = null;
+    if (ctx.grant?.runId && ctx.grant.runId === parsed.request.runId) {
+      const refused = grantStandingRefusal(c, ctx.store, ctx.grant, "nothing was asked.");
+      if (refused) return refused;
+      try { current = (c.get("runnerChannel" as never) as RunnerChannel | undefined)?.currentTurn(seat.nodeId, true) ?? null; }
+      catch (error) {
+        if (!(error instanceof RunnerChannelError) || error.code !== "runner_unavailable") return channelFailure(c, error);
+      }
+    }
+    if (!ctx.grant?.runId || ctx.grant.runId !== parsed.request.runId)
+      return c.json({ ok: false, code: "runner_turn_unbound", error: "Permission metadata names another run." }, 409);
+    correlationUnverified = current?.runId !== parsed.request.runId || current.nativeTurnId !== parsed.request.nativeTurnId
+      || !current.acceptedTurnIds.includes(parsed.request.turnId);
+  }
+  // Claimed tags remain deny-only withdrawal hints, never positive native-turn authority.
+  const correlation = correlationUnverified ? { correlation: "unverified", warning: "Native turn correlation is unavailable; this ask is uncorrelated." } : {};
   const result = await ctx.permissions.submit(seat, parsed.request);
   if (!result.ok) return c.json({ ok: false, code: result.code, error: result.message }, PERMISSION_REFUSAL_STATUS[result.code] ?? 409);
   // No one to ask: permitted at once with the agent's own allow. Nothing waits on a person, so nothing reads needs input.
-  if ("state" in result) return c.json(result);
+  if ("state" in result) return c.json({ ...result, ...correlation });
   // The seat now waits on a person, as when a runner refuses and holds attention. A grant revoked meanwhile records nothing more.
   if (result.created && (!ctx.grant || !("refused" in bindToGrant(c, ctx.store, ctx.grant, body, true)))) {
     recordHookActivity(c, ctx.store, { runtime: ctx.store.resolveSession({ nodeId: seat.nodeId })?.runtime ?? stringOrNull(body.runtime),
       sessionName: seat.sessionName, nodeId: seat.nodeId, generation: seat.generation, hookEvent: "Notification",
       subtype: "permission_prompt", turnId: parsed.request.turnId, occurredAt: stringOrNull(body.occurredAt) ?? new Date().toISOString() });
   }
-  return c.json({ ok: true, askId: result.askId, created: result.created });
+  return c.json({ ok: true, askId: result.askId, created: result.created, ...correlation });
 }
 
 /** Read the one answer for this seat's own request, waiting up to 25 seconds for it to change. A grant reads only its
@@ -946,7 +1226,7 @@ activityRoutes.get("/parked", (c) => {
     | undefined;
   const queueRepo = c.get("queueRepo" as never) as
     | {
-        list: (opts: { destinationSession?: string; state?: string[]; limit?: number }) => Array<{ qitemId: string; state: string; summary?: string | null }>;
+        listOpenObligations: (destinationSession: string, limit: number) => Array<{ qitemId: string; state: "pending" | "in-progress" | "blocked"; summary: string | null; blockedOn?: string | null; updatedAt?: string | null }>;
         getParkWakeStatus: (qitemId: string) => import("../domain/queue-wake-repository.js").ParkWakeStatus | null;
         parkWakeServedByOwnReminder?: (qitemId: string) => boolean;
       }
@@ -963,10 +1243,11 @@ activityRoutes.get("/parked", (c) => {
   const { diagnoseSeatParked, diagnoseRigParked, PARKED_OBLIGATION_LIMIT } = parkedQuery;
   const deps = {
     getSeatState: (id: string) => nodeExecutorConfirmedStopped(rigRepo.db, id) ? null : oracle.getSeatState(id),
+    // The obligation face only: the same order and limit as a full list() of this destination's open states, and the same
+    // rows less an unheld wake escalation about the seat's own prompt (listOpenObligations), without the per-row
+    // projections (pickup, waiting view, delivery ledger) the diagnosis never reads.
     listOpenObligations: (destination: string, limit: number) => ({
-      rows: queueRepo
-        .list({ destinationSession: destination, state: ["pending", "in-progress", "blocked"], limit })
-        .map((r) => ({ qitemId: r.qitemId, state: r.state as "pending" | "in-progress" | "blocked", summary: r.summary ?? null })),
+      rows: queueRepo.listOpenObligations(destination, limit),
       limit,
     }),
     getParkWake: (qitemId: string) => queueRepo.getParkWakeStatus(qitemId),
@@ -1041,6 +1322,28 @@ activityRoutes.get("/parked", (c) => {
     },
   });
 });
+
+/** A prompt hook's own observation, recorded as it was reported: a fingerprint and byte length of the prompt the harness
+ *  received, its native session and prompt or turn id, and the generation the hook ran as. It's raw evidence only: neither
+ *  harness reports where a prompt came from (a message OpenRig wrote, a person's own text, a background turn), so it's never
+ *  joined to a message here. A missing or malformed fingerprint records nothing; a bad id or time is left out. The hook
+ *  itself is recorded and answered either way. */
+function recordPromptObservation(c: Context, body: Record<string, unknown>, sessionName: string | null): void {
+  if (body.hookEvent !== "UserPromptSubmit") return;
+  const eventBus = c.get("eventBus" as never) as EventBus | undefined;
+  const promptSha256 = typeof body.promptSha256 === "string" && /^[0-9a-f]{64}$/.test(body.promptSha256) ? body.promptSha256 : null;
+  const promptBytes = typeof body.promptBytes === "number" && Number.isSafeInteger(body.promptBytes) && body.promptBytes >= 0 ? body.promptBytes : null;
+  if (!eventBus || !sessionName || !promptSha256 || promptBytes === null) return;
+  const nativeId = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) ? value : null;
+  // An instant, not a string to compare: a time that doesn't parse is left out.
+  const at = typeof body.occurredAt === "string" ? Date.parse(body.occurredAt) : Number.NaN;
+  try {
+    eventBus.emit({ type: "transport.prompt_observation", sessionName, occupantGeneration: stringOrNull(body.generation),
+      runtime: stringOrNull(body.runtime), source: "UserPromptSubmit", nativeSessionId: nativeId(body.sessionId),
+      nativePromptId: nativeId(body.nativePromptId), nativeTurnId: nativeId(body.turnId), promptSha256, promptBytes,
+      observedAt: Number.isFinite(at) ? new Date(at).toISOString() : null });
+  } catch { /* Best effort: the hook is recorded either way. */ }
+}
 
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;

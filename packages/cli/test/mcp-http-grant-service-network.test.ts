@@ -50,6 +50,8 @@ describe("agent network increment A: OAuth-connected assistants work with each o
   let serviceUrl: string;
   /** What each connection's grant names, by key; a key set to "revoked" is answered revoked. */
   let grants: Map<string, Record<string, string[]> | "revoked">;
+  /** The keys whose active answer carries the grant service's fair-use throttle on new work. */
+  let throttled: Set<string>;
   const closers: Array<() => Promise<void>> = [];
   const saved = { home: process.env.OPENRIG_HOME, session: process.env.OPENRIG_SESSION_NAME };
 
@@ -65,6 +67,7 @@ describe("agent network increment A: OAuth-connected assistants work with each o
     daemonUrl = `http://127.0.0.1:${(daemon.address() as AddressInfo).port}`;
     setSelfHostId(INSTANCE);
     grants = new Map([[A.key, NETWORK], [B.key, NETWORK]]);
+    throttled = new Set();
     service = http.createServer((req, res) => {
       req.resume();
       req.on("end", () => {
@@ -72,7 +75,8 @@ describe("agent network increment A: OAuth-connected assistants work with each o
         const who = key === A.key ? A : key === B.key ? B : null;
         const objects = who ? grants.get(who.key) : undefined;
         const body = !who || !objects ? { schema: SCHEMA, status: "unknown" }
-          : objects === "revoked" ? { schema: SCHEMA, status: "revoked" } : active(who, objects);
+          : objects === "revoked" ? { schema: SCHEMA, status: "revoked" }
+          : { ...active(who, objects), ...(throttled.has(who.key) ? { throttle: { new_work: true, retry_after_seconds: 20 } } : {}) };
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(body));
       });
     });
@@ -113,7 +117,7 @@ describe("agent network increment A: OAuth-connected assistants work with each o
       const result = await client.callTool({ name, arguments: args });
       return { isError: result.isError === true, structured: result.structuredContent as Record<string, any>, text: (result.content as Array<{ text: string }>)[0]?.text ?? "" };
     };
-    return Object.assign(call, { tools: async () => (await client.listTools()).tools.map((tool) => tool.name).sort() });
+    return Object.assign(call, { tools: async () => (await client.listTools()).tools.map((tool) => tool.name).sort(), instructions: () => client.getInstructions() });
   }
 
   const rows = () => (db.prepare("SELECT COUNT(*) AS n FROM queue_items").get() as { n: number }).n;
@@ -132,10 +136,12 @@ describe("agent network increment A: OAuth-connected assistants work with each o
     const served = await listen();
     const a = await connect(served.url, A);
     const b = await connect(served.url, B);
-    const team = await a("rig_team", { rigId: RIG });
+    const team = await a("rig_team");
     expect(team.isError).toBe(false);
     expect(team.text).toContain(B.seat);
     expect(team.text).toContain(LEAD);
+    expect(team.structured.rig.name).toBe(RIG);
+    expect((await b("rig_team")).structured.rig.name).toBe(RIG);
 
     const sent = await a("rig_queue_create", { destination: B.seat, body: "Critique this plan.", tags: ["review"] });
     expect(sent.isError).toBe(false);
@@ -159,6 +165,46 @@ describe("agent network increment A: OAuth-connected assistants work with each o
     expect(followUp.text).toContain(B.seat);
   });
 
+  it("a short name gets the one seat's full address and writes nothing; the create to that address is answered on the same id", async () => {
+    const served = await listen();
+    const a = await connect(served.url, A);
+    const b = await connect(served.url, B);
+    // The name a person reads off B's label is its connection, not its seat.
+    const corrected = await a("rig_queue_create", { destination: "claude", body: "Critique this plan." });
+    expect(corrected).toMatchObject({ isError: true, structured: { code: "destination_not_found", candidates: [B.seat] } });
+    expect(corrected.text).toContain(`No seat here is named 'claude', so nothing was written. Use ${B.seat}: its member name is 'claude'.`);
+    // A name no seat has is said plainly, as before.
+    const none = await a("rig_queue_create", { destination: "nobody", body: "No one" });
+    expect(none.structured).toMatchObject({ code: "destination_not_found" });
+    expect(none.structured).not.toHaveProperty("candidates");
+    expect(none.text).toContain("rig_team lists the seats you can reach and their names.");
+    expect(rows()).toBe(0);
+
+    const qitemId = "qitem-exact-address";
+    expect((await a("rig_queue_create", { qitemId, destination: B.seat, body: "Critique this plan." })).isError).toBe(false);
+    expect((await b("rig_queue_claim", { qitemId })).isError).toBe(false);
+    expect((await b("rig_queue_update", { qitemId, state: "done", resolution: "One risk.", closureReason: "no-follow-on" })).isError).toBe(false);
+    expect((await a("rig_queue_show", { qitemId })).structured.item).toMatchObject({ qitemId, destinationSession: B.seat, state: "done", resolution: "One risk." });
+    expect(rows()).toBe(1);
+  });
+
+  it("names every seat with that member name as ambiguous, and never one this connection can't address", async () => {
+    seat(RIG, "cus-vvmaexample02-claude");
+    const served = await listen();
+    const a = await connect(served.url, A);
+    const ambiguous = await a("rig_queue_create", { destination: "claude", body: "Which one?" });
+    expect(ambiguous.structured).toMatchObject({ code: "destination_not_found" });
+    expect([...ambiguous.structured.candidates].sort()).toEqual([B.seat, `cus-vvmaexample02-claude@${RIG}`]);
+    expect(ambiguous.text).toContain("Several seats here have that member name, so it's ambiguous:");
+    // Without team/list another caller's seat isn't one A may address, so the refusal doesn't name it.
+    grants.set(A.key, V1);
+    const hidden = await (await connect(served.url, A))("rig_queue_create", { destination: "claude", body: "Hidden" });
+    expect(hidden.structured).toMatchObject({ code: "destination_not_found" });
+    expect(hidden.structured).not.toHaveProperty("candidates");
+    expect(hidden.text).not.toContain("cus-vvmaexample");
+    expect(rows()).toBe(0);
+  });
+
   it("a message is an item the receiver reads and closes, and the reply is an item back, read by the first assistant", async () => {
     const served = await listen();
     const a = await connect(served.url, A);
@@ -170,6 +216,42 @@ describe("agent network increment A: OAuth-connected assistants work with each o
     expect(row(reply)).toMatchObject({ sourceSession: B.seat, destinationSession: A.seat });
     expect((await a("rig_queue_list", { owned: true })).text).toContain(reply);
     expect((await a("rig_queue_show", { qitemId: reply })).text).toContain("Agreed; I'll review the fix.");
+  });
+
+  it("under a fair-use throttle, B answers A's message on the same item and A reads that answer through its own grant; B's separate new message waits", async () => {
+    const served = await listen();
+    const a = await connect(served.url, A);
+    const b = await connect(served.url, B);
+    expect(b.instructions()).toContain("with your reply in resolution when it needs one; its sender reads that reply on the same item");
+    expect(b.instructions()).not.toContain("with a new item to its sender");
+    const message = createdId(await a("rig_queue_create", { destination: B.seat, summary: "Which fix first?", body: "Smaller fix or the full one?", tags: ["message"] }));
+    throttled.add(B.key);
+    const before = rows();
+    expect((await b("rig_queue_list", { owned: true })).text).toContain(message);
+    expect((await b("rig_queue_claim", { qitemId: message })).isError).toBe(false);
+    expect((await b("rig_queue_update", { qitemId: message, state: "done", closureReason: "no-follow-on", resolution: "The smaller fix first." })).isError).toBe(false);
+    const separate = await b("rig_queue_create", { destination: A.seat, summary: "Also", body: "One more thing.", tags: ["message"] });
+    expect(separate).toMatchObject({ isError: true, structured: { code: "fair_use_retry_later", retryAfterSeconds: 20, outcome: "not_written" } });
+    expect(rows()).toBe(before);
+    // A, the sender, isn't throttled, and reads B's answer on its own item through its own grant's ordinary show and list.
+    const answered = await a("rig_queue_show", { qitemId: message });
+    expect(answered.structured.item).toMatchObject({ state: "done", resolution: "The smaller fix first.", destinationSession: B.seat });
+    expect((await a("rig_queue_list", { mine: true, all: true })).text).toContain("The smaller fix first.");
+  });
+
+  it("under a fair-use throttle, A answers the lead's message on the same item and the lead reads it on its ordinary read; A's new item to the lead waits", async () => {
+    const served = await listen();
+    const a = await connect(served.url, A);
+    const message = (await repo.create({ sourceSession: LEAD, destinationSession: A.seat, body: "Can you take the review?", nudge: false } as never)).qitemId;
+    throttled.add(A.key);
+    const before = rows();
+    expect((await a("rig_queue_claim", { qitemId: message })).isError).toBe(false);
+    expect((await a("rig_queue_update", { qitemId: message, state: "done", closureReason: "no-follow-on", resolution: "Yes, after lunch." })).isError).toBe(false);
+    expect((await a("rig_queue_create", { destination: LEAD, body: "Starting the review." })).structured).toMatchObject({ code: "fair_use_retry_later", outcome: "not_written" });
+    expect(rows()).toBe(before);
+    const read = await fetch(`${daemonUrl}/api/queue/${encodeURIComponent(message)}`, { headers: { "X-OpenRig-Session": LEAD } });
+    expect(read.status).toBe(200);
+    expect(await read.json()).toMatchObject({ sourceSession: LEAD, state: "done", resolution: "Yes, after lunch." });
   });
 
   it("B hands work on to the team and reads the team's result; A's task and B's task are separate items, each with its own result", async () => {
@@ -273,6 +355,50 @@ describe("agent network increment A: OAuth-connected assistants work with each o
     }
   });
 
+  it("an assistant reads, picks up and answers a person's request addressed to its own seat, and nothing else a person sent", async () => {
+    // Without team/list, so another caller's item to it stays out of reach.
+    grants.set(B.key, { queue: ["create", "show", "list", "claim", "update"], artifact: ["read"] });
+    const served = await listen();
+    const b = await connect(served.url, B);
+    const refused = { isError: true, structured: { code: "out_of_scope" } };
+    const PERSON = "ana@external";
+    const make = async (sourceSession: string, destinationSession: string, body: string) =>
+      (await repo.create({ sourceSession, destinationSession, body, nudge: false } as never)).qitemId;
+    const fromPerson = await make(PERSON, B.seat, "Please draft the welcome note.");
+    const fromLead = await make(LEAD, B.seat, "for B");
+    const personToLead = await make(PERSON, LEAD, "for the lead");
+    const internal = await make(LEAD, `worker@${RIG}`, "team-internal");
+    const fromCaller = await make(`cus-vvmaexample02-caller@${RIG}`, B.seat, "from another caller");
+
+    // The person's request to B is in B's inbox, B reads it with its asker, picks it up and answers it on the same item.
+    const inbox = await b("rig_queue_list", { owned: true });
+    expect.soft(inbox.text).toContain(fromPerson);
+    const shown = await b("rig_queue_show", { qitemId: fromPerson });
+    expect.soft(shown.isError).toBe(false);
+    expect.soft(shown.structured?.item).toMatchObject({ sourceSession: PERSON, destinationSession: B.seat });
+    expect.soft(shown.text).toContain("Please draft the welcome note.");
+    expect.soft((await b("rig_queue_claim", { qitemId: fromPerson })).isError).toBe(false);
+    expect.soft((await b("rig_queue_update", { qitemId: fromPerson, state: "done", closureReason: "no-follow-on", resolution: "Drafted; see the notes." })).isError).toBe(false);
+    expect.soft(row(fromPerson)).toMatchObject({ state: "done", resolution: "Drafted; see the notes." });
+
+    // The team's request to B, as before.
+    expect(inbox.text).toContain(fromLead);
+    expect((await b("rig_queue_show", { qitemId: fromLead })).isError).toBe(false);
+    expect((await b("rig_queue_claim", { qitemId: fromLead })).isError).toBe(false);
+    // A person's request to another seat, the team's own item and another caller's item to B stay out of reach.
+    for (const qitemId of [personToLead, internal, fromCaller]) {
+      expect(inbox.text).not.toContain(qitemId);
+      expect(await b("rig_queue_show", { qitemId })).toMatchObject(refused);
+      expect(await b("rig_queue_claim", { qitemId })).toMatchObject(refused);
+      expect(await b("rig_queue_update", { qitemId, note: "mine?" })).toMatchObject(refused);
+      expect(row(qitemId).state).toBe("pending");
+    }
+    // B still can't send a person work.
+    const before = rows();
+    expect(await b("rig_queue_create", { destination: PERSON, body: "a task for a person" })).toMatchObject(refused);
+    expect(rows()).toBe(before);
+  });
+
   it("an assistant's park names a blocker it can read: a bare re-park after a claim is refused, whether the team's blocker is open or closed", async () => {
     const served = await listen();
     const b = await connect(served.url, B);
@@ -311,6 +437,42 @@ describe("agent network increment A: OAuth-connected assistants work with each o
       expect(team.isError).toBe(false);
       expect(team.structured.hostedMembers).toMatchObject([{ session: `grok@${RIG}`, presence: { lastWake: { qitemId: fromA, at: "2026-11-02T11:00:00.000Z" } } }]);
       expect(team.text).not.toContain(internal);
+    } finally {
+      if (savedWorkspace === undefined) delete process.env.OPENRIG_WORKSPACE_ROOT; else process.env.OPENRIG_WORKSPACE_ROOT = savedWorkspace;
+    }
+  });
+
+  it("team discovery shows a bound participant as remote with its check-in, never as its hub terminal's state", async () => {
+    const workspace = path.join(home, "workspace");
+    const savedWorkspace = process.env.OPENRIG_WORKSPACE_ROOT;
+    process.env.OPENRIG_WORKSPACE_ROOT = workspace;
+    try {
+      fs.mkdirSync(path.join(workspace, "rosters"), { recursive: true });
+      fs.writeFileSync(path.join(workspace, "rosters", "team.json"), JSON.stringify({
+        version: 1, id: "team", name: "Team", purpose: "Ship the release", curator: { seat: LEAD, host: INSTANCE }, updated_at: "2026-11-21",
+        members: [{ seat: B.seat, host: INSTANCE, capabilities: ["critique"], engagement: ["delegate"], use_when: "A second opinion", why: "Reads plans",
+          hosted: true, app: "claude", kind: "persistent", check_in_minutes: 15 }],
+      }));
+      // The hub's terminal for B's seat has no agent in it, and reads detached.
+      const terminal = db.prepare("SELECT id FROM sessions WHERE session_name = ?").get(B.seat) as { id: string };
+      setup.sessionRegistry.updateStatus(terminal.id, "detached");
+      const served = await listen();
+      const a = await connect(served.url, A);
+      const b = await connect(served.url, B);
+      expect(a.instructions()).toContain("A network participant's status is its presence.checkIn, not sessionStatus.");
+      const seatOf = async (session: string) =>
+        ((await a("rig_team")).structured.seats as Array<Record<string, any>>).find((entry) => entry.session === session)!;
+      // No check-in yet is said as it is: it doesn't make B stopped.
+      expect(await seatOf(B.seat)).toMatchObject({ sessionStatus: "remote", activity: "unknown", participant: { app: "claude", kind: "persistent" },
+        presence: { checkIn: { status: "no-check-in-yet", lastCheckInAt: null, expectedMinutes: 15 } } });
+      // B reads its own inbox: that's its check-in. A pickup would be a claim on a row, and nothing here claims one.
+      expect((await b("rig_queue_list", { owned: true })).isError).toBe(false);
+      expect(await seatOf(B.seat)).toMatchObject({ sessionStatus: "remote", activity: "unknown",
+        presence: { checkIn: { status: "checking-in", lastCheckInAt: expect.any(String), expectedMinutes: 15 } } });
+      // The lead, on no roster, is as the daemon reports it.
+      const lead = await seatOf(LEAD);
+      expect(lead.sessionStatus).not.toBe("remote");
+      expect(lead).not.toHaveProperty("presence");
     } finally {
       if (savedWorkspace === undefined) delete process.env.OPENRIG_WORKSPACE_ROOT; else process.env.OPENRIG_WORKSPACE_ROOT = savedWorkspace;
     }

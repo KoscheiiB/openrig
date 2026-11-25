@@ -1,11 +1,11 @@
-import { stripVTControlCharacters } from "node:util";
+import { terminalSafeText } from "../terminal-safe-text.js";
 import type { HostNode } from "../types.js";
 
 export function sanitizeHostDisplayName(value: string): string {
-  // Node 22's VT stripper does not consume every OSC payload (for example a
-  // window title with spaces). Remove the entire string before stripping CSI.
-  const plain = value.replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "");
-  return stripVTControlCharacters(plain).replace(/[\x00-\x1f\x7f-\x9f\p{Bidi_Control}]/gu, "").trim();
+  // A configured display name is a label, so it is trimmed, keeps no bidi marks, and closes the gap a
+  // removed control byte leaves: a name that never meant to contain one should read as the name it was.
+  // The bidi removal is asked for here because the shared helper keeps them by default.
+  return terminalSafeText(value, { trim: true, control: "remove", keepBidi: false });
 }
 
 function displayName(host: HostNode): string | undefined {
@@ -19,9 +19,17 @@ export function hostLabel(host: HostNode): string {
   return name ? `${name} (${host.name})` : host.name;
 }
 
+export function hostReachabilityLabel(host: HostNode): "reachable" | "unreachable" | "unknown" {
+  return host.reachable === true ? "reachable" : host.reachable === false ? "unreachable" : "unknown";
+}
+
+export function hostReachabilitySuffix(host: HostNode): string {
+  return host.reachable === true ? "" : ` (${hostReachabilityLabel(host)})`;
+}
+
 /** Keep the command identity first, with room for the existing reachability suffix. */
 export function hostExplorerLabel(host: HostNode, width: number): string {
-  const suffix = host.reachable ? "" : " (unreachable)";
+  const suffix = hostReachabilitySuffix(host);
   const name = displayName(host);
   const room = width - host.name.length - suffix.length - 3; // " · "
   if (!name || room < 1) return host.name + suffix;

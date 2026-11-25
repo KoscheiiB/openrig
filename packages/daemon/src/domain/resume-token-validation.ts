@@ -64,8 +64,11 @@ function validateIdShapedToken(resumeType: ResumeType, token: string): ResumeTok
   return { ok: true, resumeType, token };
 }
 
-function validateSessionFileToken(resumeType: "pi_session_file" | "omp_session_file", token: string): ResumeTokenValidationOk | ResumeTokenValidationErr {
-  const label = resumeType === "pi_session_file" ? "Pi" : "OMP";
+export function validateSessionFileFormat(rawToken: unknown, label = "Pi", options: { allowFormatCharacters?: boolean } = {}): { ok: true; token: string } | { ok: false; error: string } {
+  if (typeof rawToken !== "string") {
+    return { ok: false, error: `${label} session file must be a string.` };
+  }
+  const token = rawToken.trim();
   if (token.length > MAX_SESSION_FILE_LEN) {
     return { ok: false, error: `${label} session-file token is too long (max ${MAX_SESSION_FILE_LEN} characters).` };
   }
@@ -75,16 +78,26 @@ function validateSessionFileToken(resumeType: "pi_session_file" | "omp_session_f
   if (token.split("/").includes("..")) {
     return { ok: false, error: `${label} session-file token must not contain a '..' path segment.` };
   }
-  if (!SESSION_FILE_CHARSET_RE.test(token)) {
+  // Observation-only reports retain the original spelling; ordinary launch/resume callers keep their existing floor.
+  const charset = options.allowFormatCharacters ? /^[A-Za-z0-9._/@\p{Cf}-]+$/u : SESSION_FILE_CHARSET_RE;
+  if (!charset.test(token)) {
     return {
       ok: false,
-      error: `${label} session-file token contains disallowed characters (allowed: letters, digits, '.', '_', '/', '@', '-').`,
+      error: options.allowFormatCharacters ? `${label} observation session-file token contains disallowed characters.`
+        : `${label} session-file token contains disallowed characters (allowed: letters, digits, '.', '_', '/', '@', '-').`,
     };
   }
   if (!token.endsWith(SESSION_FILE_SUFFIX)) {
     return { ok: false, error: `${label} session-file token must end with '${SESSION_FILE_SUFFIX}'.` };
   }
-  return { ok: true, resumeType, token };
+  return { ok: true, token };
+}
+
+function validateSessionFileToken(resumeType: "pi_session_file" | "omp_session_file", token: string): ResumeTokenValidationOk | ResumeTokenValidationErr {
+  const label = resumeType === "pi_session_file" ? "Pi" : "OMP";
+  const res = validateSessionFileFormat(token, label);
+  if (!res.ok) return res;
+  return { ok: true, resumeType, token: res.token };
 }
 
 export function validateResumeToken(

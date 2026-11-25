@@ -26,6 +26,7 @@ const DEFAULT_EXTRA_INSTRUCTION_FILE_SUFFIX = "compaction/post-compact-extra.md"
 function clearEnv(): () => void {
   const keys = [
     "OPENRIG_PORT", "OPENRIG_HOST", "OPENRIG_DB", "OPENRIG_TMUX_SERVER", "OPENRIG_TERMINAL_FIXED_GEOMETRY", "OPENRIG_DAEMON_DB_CONFLICT",
+    "OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS",
     "OPENRIG_TRANSCRIPTS_ENABLED", "OPENRIG_TRANSCRIPTS_PATH",
     "OPENRIG_TRANSCRIPTS_LINES", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS",
     "OPENRIG_WORKSPACE_ROOT", "OPENRIG_WORKSPACE_SLICES_ROOT",
@@ -110,7 +111,9 @@ describe("SettingsStore (User Settings v0)", () => {
 
   it("SETTINGS_VALID_KEYS matches the documented settings key set", () => {
     expect([...SETTINGS_VALID_KEYS]).toEqual([
-      "daemon.port", "daemon.host", "daemon.db_conflict", "daemon.seat_poll_interval_ms",
+      "daemon.port", "daemon.host", "daemon.db_conflict", "daemon.seat_poll_interval_ms", "daemon.identity_poll_interval_ms",
+      // #3637 — how long a start waits for its child's readiness.
+      "daemon.start_readiness_wait_seconds",
       // OPR.0.4.6.MH1 FR-1/FR-4 — host-selection pointer + own-host name.
       "host.selected",
       "host.name",
@@ -138,6 +141,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "files.allowlist", "progress.scan_roots",
       "ui.preview.refresh_interval_seconds", "ui.preview.max_pins", "ui.preview.default_lines", "ui.timezone",
       "ui.enabled",
+      "ui.topology_remote_seats",
       // OPR.0.4.0.1 — global live-terminal cap.
       "ui.terminal.max_live_terminals",
       "recovery.auto_drive_provider_prompts",
@@ -185,6 +189,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "output.compact",
       // Slice 15 P5 — the whoami peer bound under output.compact.
       "output.whoami_peers",
+      "output.rebuild_recaps",
       // Slice 01 (OPR.0.7.0.1) — Codex usage windows switch.
       "provider.usage_windows",
       // The providers chosen at rig setup --providers, which kernel boot honours.
@@ -206,6 +211,9 @@ describe("SettingsStore (User Settings v0)", () => {
       "retention.watchdog_days",
       "retention.usage_samples_days", // 51-08 A2 (plan-lock rev-1): the PM-ruled 14d telemetry window
       "retention.events_days", // the history-only event types of events
+      "retention.closed_content_days", // closed-work erasure: content
+      "retention.closed_metadata_days", // closed-work erasure: the row, keeping its id
+      "retention.erasure_ledger", // queue erasure's replay ledger file
       "retention.watchdog_keep_per_job",
       "retention.stream_days", // slice 22 outcome 9: stream retention
       "retention.stream_max_items",
@@ -278,6 +286,24 @@ describe("SettingsStore (User Settings v0)", () => {
     }
   });
 
+  it.each([
+    ["retention.closed_content_days", "closedContentDays", "OPENRIG_RETENTION_CLOSED_CONTENT_DAYS"],
+    ["retention.closed_metadata_days", "closedMetadataDays", "OPENRIG_RETENTION_CLOSED_METADATA_DAYS"],
+  ] as const)("%s defaults to 0 (keep), resolves file then env, and refuses negative or non-integer values", (key, fileKey, envKey) => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne(key)).toMatchObject({ value: 0, source: "default" });
+    store.set(key, "30");
+    expect(store.resolveOne(key)).toMatchObject({ value: 30, source: "file" });
+    expect(JSON.parse(readFileSync(configPath, "utf-8")).retention[fileKey]).toBe(30);
+    process.env[envKey] = "7";
+    try {
+      expect(store.resolveOne(key)).toMatchObject({ value: 7, source: "env" });
+    } finally {
+      delete process.env[envKey];
+    }
+    for (const raw of ["-1", "2.5", "30days"]) expect(() => store.set(key, raw)).toThrow(new RegExp(key.replace(".", "\\.")));
+  });
+
   it("retention.events_days defaults to 0 (keep), resolves file then env, accepts 0 and refuses negative or non-integer values", () => {
     const store = new SettingsStore(configPath);
     expect(store.resolveOne("retention.events_days")).toMatchObject({ value: 0, source: "default" });
@@ -304,6 +330,19 @@ describe("SettingsStore (User Settings v0)", () => {
     expect(store.resolveOne("output.whoami_peers")).toMatchObject({ value: 12, source: "file" });
     for (const raw of ["0", "-3", "2.5", "8junk", "many"]) {
       expect(() => store.set("output.whoami_peers", raw)).toThrow(/output\.whoami_peers/);
+    }
+  });
+
+  it("configures the optional rebuild recap preview without limiting retained history", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("output.rebuild_recaps")).toMatchObject({ value: 3, source: "default" });
+    store.set("output.rebuild_recaps", "0");
+    expect(store.resolveOne("output.rebuild_recaps")).toMatchObject({ value: 0, source: "file" });
+    vi.stubEnv("OPENRIG_OUTPUT_REBUILD_RECAPS", "2");
+    expect(store.resolveOne("output.rebuild_recaps")).toMatchObject({ value: 2, source: "env" });
+    vi.unstubAllEnvs();
+    for (const raw of ["-1", "2.5", "2recaps", "9007199254740992"]) {
+      expect(() => store.set("output.rebuild_recaps", raw)).toThrow(/output\.rebuild_recaps/);
     }
   });
 
@@ -357,6 +396,29 @@ describe("SettingsStore (User Settings v0)", () => {
       .toMatchObject({ value: 60, source: "default", defaultValue: 60 });
     expect(store.resolveOne("policies.idle_gate_qitem.active_wake_interval_seconds"))
       .toMatchObject({ value: 900, source: "default", defaultValue: 900 });
+  });
+
+  it("resolves the daemon start wait like the CLI and drops an out-of-range env value with a warning", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 180, source: "default" });
+    store.set("daemon.start_readiness_wait_seconds", "240");
+    expect(store.resolveOne("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 240, source: "file" });
+    process.env["OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS"] = "30";
+    expect(store.resolveOne("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 30, source: "env" });
+    // Above 600 (a 15-minute start), up to the Node timer bound on the TUI's budget.
+    for (const value of ["900", "2147464"]) expect(() => store.set("daemon.start_readiness_wait_seconds", value)).not.toThrow();
+    store.set("daemon.start_readiness_wait_seconds", "240");
+    for (const value of ["0", "2147465", "1.5", "45junk", "abc"]) {
+      expect(() => store.set("daemon.start_readiness_wait_seconds", value)).toThrow(/Invalid value for daemon\.start_readiness_wait_seconds/);
+    }
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      process.env["OPENRIG_DAEMON_START_READINESS_WAIT_SECONDS"] = "2147465";
+      expect(store.resolveOne("daemon.start_readiness_wait_seconds")).toMatchObject({ value: 240, source: "file" });
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("env override for daemon.start_readiness_wait_seconds rejected"));
+    } finally {
+      stderr.mockRestore();
+    }
   });
 
   it("resolves the launch readiness window from default, file, and env", () => {
@@ -585,6 +647,19 @@ describe("SettingsStore (User Settings v0)", () => {
       expect(store.resolveOne("daemon.port").source).toBe("default");
       const warns = stderrSpy.mock.calls.map((c) => String(c[0]));
       expect(warns.some((w) => w.includes("file value for daemon.port rejected"))).toBe(true);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("a non-string provider.selected in config.json falls back to the default with a warning", () => {
+    writeFileSync(configPath, JSON.stringify({ provider: { selected: ["claude"] } }));
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const store = new SettingsStore(configPath);
+      expect(store.resolveOne("provider.selected")).toMatchObject({ value: "", source: "default" });
+      const warns = stderrSpy.mock.calls.map((c) => String(c[0]));
+      expect(warns.some((w) => w.includes("file value for provider.selected rejected"))).toBe(true);
     } finally {
       stderrSpy.mockRestore();
     }

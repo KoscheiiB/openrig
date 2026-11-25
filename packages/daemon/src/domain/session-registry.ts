@@ -1,10 +1,11 @@
+import { ActivityGrantStore } from "./activity-grants.js";
 import type Database from "better-sqlite3";
 import { monotonicFactory } from "ulid";
 import { randomUUID } from "node:crypto";
 
 const ulid = monotonicFactory();
 import type { Session, Binding } from "./types.js";
-import { validateSessionName } from "./session-name.js";
+import { boundSessionNameProblem, validateSessionName } from "./session-name.js";
 import { formatWatchdogRegistrationError } from "./watchdog-auto-registration.js";
 import type { ClaudeLaunchedProcess, ClaudeResumeRotation } from "./native-process-lineage.js";
 
@@ -106,6 +107,8 @@ export interface LatestLiveSession {
   cwd: string | null;
   /** The community harness this session was launched for, when it was. */
   communityHarness?: string | null;
+  /** `claimed` for a session OpenRig didn't launch (adopted, bound, or joined with `rig attach --self`). */
+  origin?: string | null;
 }
 
 export interface WatchdogRegistrationObserver {
@@ -124,14 +127,25 @@ export interface CurrentSessionAddress {
  * Physical names win over derived names. Archived/historical bindings cannot
  * advertise a new alias, and two current matches never pick an arbitrary seat. */
 export function resolveCurrentSessionAddress(db: Database.Database, address: string): CurrentSessionAddress | null {
-  const rows = db.prepare(`SELECT r.*, n.id AS nodeId, n.logical_id AS logicalId,
+  const current = `SELECT r.name, r.archived_at, n.id AS nodeId, n.logical_id AS logicalId,
       s.id AS sessionId, s.session_name AS sessionName, s.status,
       replace(n.logical_id, '.', '-') || '@' || r.name AS senderAddress
     FROM nodes n JOIN rigs r ON r.id=n.rig_id
     JOIN bindings b ON b.node_id=n.id AND b.tmux_session IS NOT NULL
-    JOIN sessions s ON s.node_id=n.id AND s.session_name=b.tmux_session
-      AND s.id=(SELECT id FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1)
-    WHERE s.session_name=? OR replace(n.logical_id, '.', '-') || '@' || r.name=?`)
+    CROSS JOIN sessions s ON s.node_id=n.id AND s.session_name=b.tmux_session
+      AND s.id=(SELECT id FROM sessions WHERE node_id=n.id ORDER BY id DESC LIMIT 1)`;
+  // Inventory passes physical names for every seat. The OR with a derived alias
+  // made each lookup walk all nodes (or all historical sessions). Seek the exact
+  // name first; only an absent active exact match needs the alias walk. Keep this
+  // in one statement so both alternatives observe the same database snapshot.
+  const rows = db.prepare(`WITH exact AS MATERIALIZED (
+      ${current} WHERE b.tmux_session=? AND r.archived_at IS NULL
+        AND COALESCE(s.status, '') NOT IN ('superseded', 'detached', 'exited')
+    ) SELECT * FROM exact
+    UNION ALL
+    ${current}
+    WHERE replace(n.logical_id, '.', '-') || '@' || r.name=?
+      AND NOT EXISTS (SELECT 1 FROM exact)`)
     .all(address, address) as Array<CurrentSessionAddress & { name: string; archived_at?: string | null; status: string }>;
   const active = rows.filter(row => row.archived_at == null && !['superseded', 'detached', 'exited'].includes(row.status));
   const exact = active.filter(row => row.sessionName === address);
@@ -192,6 +206,9 @@ export class SessionAddressConflict extends Error {
 
 export class SessionRegistry {
   readonly db: Database.Database;
+  /** #3634: fired after a session of a node is recorded as running, so a daemon-owned per-rig job that archive
+   *  retired comes back when a seat of that rig runs again (restore or launch without unarchive). */
+  onSessionRunning?: (nodeId: string) => void;
   private watchdogRegistrationObserver?: WatchdogRegistrationObserver;
   constructor(db: Database.Database, watchdogRegistrationObserver?: WatchdogRegistrationObserver) {
     this.db = db;
@@ -200,6 +217,21 @@ export class SessionRegistry {
 
   resolveAddress(address: string): CurrentSessionAddress | null {
     return resolveCurrentSessionAddress(this.db, address);
+  }
+
+  /** #2895 (a): whether `rig send <sender>` can find this sender, by the transport's own resolution (a current
+   *  address, or a session row on a node of a rig). A three-part `member@rig@host` label is a cross-host origin that
+   *  `rig send` forwards, so it counts. A stopped seat still has its rows, so it counts too. Any lookup error ⇒ true,
+   *  which keeps today's reply line. */
+  senderIsSendable(sender: string): boolean {
+    if (sender.split("@").length === 3) return true;
+    try {
+      if (this.resolveAddress(sender)) return true;
+      return this.db.prepare(`SELECT 1 FROM sessions s JOIN nodes n ON n.id = s.node_id JOIN rigs r ON r.id = n.rig_id
+        WHERE s.session_name = ? LIMIT 1`).get(sender) !== undefined;
+    } catch {
+      return true;
+    }
   }
 
   /** Current queue equivalence, not a rewrite of recorded identity. A raw name
@@ -264,8 +296,11 @@ export class SessionRegistry {
     sessionName: string,
     kind: OccupantKind = "initial",
     reservedGeneration?: string | null,
+    /** The launch keeps the name the seat was bound to (an adopted seat's own name): accepted when boundSessionNameProblem finds none.
+     *  launchedCwd: the folder this launch starts the seat in, which rig down also cleans. */
+    opts?: { keptBoundName?: boolean; launchedCwd?: string },
   ): Session {
-    if (!validateSessionName(sessionName)) {
+    if (!validateSessionName(sessionName) && !(opts?.keptBoundName === true && boundSessionNameProblem(sessionName) === null)) {
       throw new Error(
         `Invalid session name "${sessionName}": must match legacy r{NN}-{suffix} or canonical {pod}-{member}@{rig} format with allowed characters (a-z, A-Z, 0-9, -, _, ., @)`
       );
@@ -278,11 +313,18 @@ export class SessionRegistry {
         "INSERT INTO sessions (id, node_id, session_name) VALUES (?, ?, ?)"
       )
       .run(id, nodeId, sessionName);
+    this.recordLaunchedCwd(id, opts?.launchedCwd);
     this.mintOccupantTenureBestEffort(nodeId, kind, reservedGeneration); // atom-B: mint this occupant generation
     this.observeWatchdogRegistration(nodeId, sessionName, kind);
     return this.rowToSession(
       this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as SessionRow
     );
+  }
+
+  /** The folder a launch started this session in, which rig down also cleans. A database without the column records none. */
+  recordLaunchedCwd(sessionId: string, cwd: string | null | undefined): void {
+    if (!cwd) return;
+    try { this.db.prepare("UPDATE sessions SET launched_cwd = ? WHERE id = ?").run(cwd, sessionId); } catch { /* no column */ }
   }
 
   /** Register a claimed session — skips naming validation, sets origin='claimed', startup_status='ready'. */
@@ -301,6 +343,9 @@ export class SessionRegistry {
       .run(id, nodeId, sessionName);
     this.mintOccupantTenureBestEffort(nodeId, kind, reservedGeneration); // atom-B: mint this occupant generation
     this.observeWatchdogRegistration(nodeId, sessionName, kind);
+    try { new ActivityGrantStore(this.db).reconcileBinding(nodeId); }
+    catch { /* Optional run attribution must not fail an already registered claimed session. */ }
+    this.onSessionRunning?.(nodeId);
 
     return this.rowToSession(
       this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as SessionRow
@@ -398,6 +443,18 @@ export class SessionRegistry {
     ).get(nodeId, generationUuid));
   }
 
+  /** True when this generation is registered for this node and only no-launch adoptions ('adopt': reconcile, bind,
+   * self-attach) were registered after it. Adoption registers the same live process again without replacing it, so
+   * that occupant is still the seat's; a launch kind after it (initial, fresh, handover) replaced it. Throws on ledger
+   * faults, like isOccupantGenerationRegistered. */
+  isOccupantContinuedByAdoption(nodeId: string, generationUuid: string): boolean {
+    return Boolean(this.db.prepare(
+      `SELECT 1 FROM occupant_tenures e WHERE e.node_id = ? AND e.generation_uuid = ? AND NOT EXISTS (
+         SELECT 1 FROM occupant_tenures l WHERE l.node_id = e.node_id AND l.generation_ordinal > e.generation_ordinal
+           AND l.kind <> 'adopt') LIMIT 1`,
+    ).get(nodeId, generationUuid));
+  }
+
   mintOccupantTenure(
     nodeId: string,
     kind: OccupantKind,
@@ -454,6 +511,15 @@ export class SessionRegistry {
     }
   }
 
+  /** Name existence is independent of best-effort tenure recording. */
+  carriesSessionName(sessionName: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM nodes n JOIN rigs r ON r.id = n.rig_id
+      WHERE r.archived_at IS NULL AND (
+        EXISTS (SELECT 1 FROM sessions s WHERE s.node_id = n.id AND s.session_name = ?)
+        OR EXISTS (SELECT 1 FROM bindings b WHERE b.node_id = n.id AND (b.tmux_session = ? OR b.external_session_name = ?))
+      ) LIMIT 1`).get(sessionName, sessionName, sessionName);
+  }
+
   private rowToTenure(row: OccupantTenureRow): OccupantTenure {
     return {
       id: row.id,
@@ -466,24 +532,55 @@ export class SessionRegistry {
     };
   }
 
+  /** An observed or recorded status. It leaves a requested stop in place (#2940): an observation, the startup
+   *  reconcile or a compensation must not undo a person's stop. A later start or resume writes a new session row,
+   *  which starts without a request. */
   updateStatus(sessionId: string, status: string): void {
+    if (["exited", "detached", "superseded"].includes(status)) new ActivityGrantStore(this.db).revokeForSession(sessionId, status);
     this.db
-      .prepare("UPDATE sessions SET status = ?, intentionally_stopped = 0, last_seen_at = datetime('now') WHERE id = ?")
+      .prepare("UPDATE sessions SET status = ?, last_seen_at = datetime('now') WHERE id = ?")
       .run(status, sessionId);
+    if (status === "running" && this.onSessionRunning) {
+      const row = this.db.prepare("SELECT node_id FROM sessions WHERE id = ?").get(sessionId) as { node_id: string } | undefined;
+      if (row) this.onSessionRunning(row.node_id);
+    }
   }
 
-  /** A supported stop is distinct from an observed exit. Any later status write
-   * clears the intent, including a resume of this same session row. */
+  /** #2940: record a stop request durably before the first step that stops anything, without changing the status.
+   *  Returns this row's earlier request, which only a stop proven to have had no effect puts back. */
+  requestStop(sessionId: string, attemptId: string): { flag: number; attempt: string | null } | null {
+    const prev = this.db.prepare("SELECT intentionally_stopped AS flag, stop_attempt AS attempt FROM sessions WHERE id = ?")
+      .get(sessionId) as { flag: number; attempt: string | null } | undefined;
+    if (!prev) return null;
+    this.db.prepare("UPDATE sessions SET intentionally_stopped = 1, stop_attempt = ? WHERE id = ?").run(attemptId, sessionId);
+    return prev;
+  }
+
+  /** #2940: put back the request this attempt replaced, only while the row still carries this attempt and is still
+   *  live or detached (running, idle, unknown or detached: a detached row tmux shows again can be stopped too). An older
+   *  or concurrent stop recorded its own attempt and is left alone, a confirmed stop (exited) is kept, and a replacement
+   *  session is another row. Returns whether the row changed. */
+  revertStopRequest(sessionId: string, attemptId: string, prev: { flag: number; attempt: string | null }): boolean {
+    return this.db.prepare(
+      "UPDATE sessions SET intentionally_stopped = ?, stop_attempt = ? WHERE id = ? AND stop_attempt = ? AND status IN ('running', 'idle', 'unknown', 'detached')",
+    ).run(prev.flag, prev.attempt, sessionId, attemptId).changes > 0;
+  }
+
+  /** A supported stop is distinct from an observed exit: this confirms one (status exited, request kept). Only a new
+   *  session row (a later start or resume) is without it. #2940: confirming clears the attempt that recorded the
+   *  request; a request whose attempt is still set is pending, whatever the row's status. */
   markIntentionallyStopped(sessionId: string): void {
+    new ActivityGrantStore(this.db).revokeForSession(sessionId, "stopped");
     this.db.prepare(
-      "UPDATE sessions SET status = 'exited', intentionally_stopped = 1, last_seen_at = datetime('now') WHERE id = ?",
+      `UPDATE sessions SET status = 'exited', intentionally_stopped = 1${stopAttemptCleared(this.db)}, last_seen_at = datetime('now') WHERE id = ?`,
     ).run(sessionId);
   }
 
   /** Record a supported stop on a row that keeps its status: a rolled-back launch's superseded session is
-   * occupant history, and turning it into an exit would make it a restore candidate. */
+   * occupant history, and turning it into an exit would make it a restore candidate. Confirmed, like
+   * markIntentionallyStopped: the attempt is cleared. */
   recordStopIntent(sessionId: string): void {
-    this.db.prepare("UPDATE sessions SET intentionally_stopped = 1 WHERE id = ?").run(sessionId);
+    this.db.prepare(`UPDATE sessions SET intentionally_stopped = 1${stopAttemptCleared(this.db)} WHERE id = ?`).run(sessionId);
   }
 
   updateStartupStatus(sessionId: string, status: "pending" | "ready" | "attention_required" | "failed", completedAt?: string): void {
@@ -514,11 +611,13 @@ export class SessionRegistry {
   // ignore it; the adoption-capture path uses it so its audit event never
   // falsely claims a captured write when the provenance guard refused it.
   /** Record that this session was launched for a community harness, selected through its preset. With `runner`, also
-   *  record what that launch's preset declared (`runner: true` or not), so activity reads the launched occupant's
-   *  declaration, never a later preset edit. Without it (a restore carrying only the selection) the field is left as is. */
-  recordCommunityHarnessSelection(sessionId: string, app: string, runner?: boolean): void {
+   *  record what that launch's preset declared: `runner: true` (1), OpenRig's hosted Pi-protocol runner for
+   *  `protocol: pi-rpc` ("pi-rpc", 2), or neither (0), so activity reads the launched occupant's declaration, never a
+   *  later preset edit. Without it (a restore carrying only the selection) the field is left as is. */
+  recordCommunityHarnessSelection(sessionId: string, app: string, runner?: boolean | "pi-rpc"): void {
     if (runner !== undefined && sessionCommunityRunnerSelect(this.db, "sessions") !== "NULL") {
-      this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?").run(app, runner ? 1 : 0, sessionId);
+      this.db.prepare("UPDATE sessions SET agent_app = ?, agent_runner = ? WHERE id = ?")
+        .run(app, runner === "pi-rpc" ? AGENT_RUNNER_HOSTED_PI_RPC : runner ? AGENT_RUNNER_PRESET : 0, sessionId);
       return;
     }
     this.db.prepare("UPDATE sessions SET agent_app = ? WHERE id = ?").run(app, sessionId);
@@ -754,7 +853,7 @@ export class SessionRegistry {
         `SELECT s.* FROM sessions s
          JOIN nodes n ON s.node_id = n.id
          WHERE n.rig_id = ?
-         ORDER BY s.created_at`
+         ORDER BY s.created_at, s.rowid`
       )
       .all(rigId) as SessionRow[];
 
@@ -768,13 +867,13 @@ export class SessionRegistry {
   getLatestLiveSessions(rigId: string): LatestLiveSession[] {
     const rows = this.db.prepare(`
       SELECT n.id as node_id, s.id as session_id, s.session_name, s.status, n.runtime, n.cwd, s.resume_type, s.resume_token,
-        ${sessionCommunityHarnessSelect(this.db)} as community_harness
+        s.origin, ${sessionCommunityHarnessSelect(this.db)} as community_harness
       FROM nodes n
       JOIN sessions s ON s.node_id = n.id
       WHERE n.rig_id = ?
         AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1)
         AND s.status IN ('running', 'idle', 'unknown')
-    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null; community_harness: string | null }>;
+    `).all(rigId) as Array<{ node_id: string; session_id: string; session_name: string; status: string; runtime: string | null; cwd: string | null; resume_type: string | null; resume_token: string | null; origin: string | null; community_harness: string | null }>;
 
     return rows.map((r) => ({
       nodeId: r.node_id,
@@ -786,6 +885,7 @@ export class SessionRegistry {
       resumeToken: r.resume_token,
       cwd: r.cwd,
       communityHarness: r.community_harness,
+      origin: r.origin,
     }));
   }
 
@@ -936,6 +1036,17 @@ interface BindingRow {
 }
 
 const sessionsHaveCommunityHarness = new WeakMap<Database.Database, boolean>();
+const sessionsHaveStopAttempt = new WeakMap<Database.Database, boolean>();
+
+/** #2940: the assignment that clears a confirmed stop's attempt, on a database that has the column (none before it). */
+function stopAttemptCleared(db: Database.Database): string {
+  let has = sessionsHaveStopAttempt.get(db);
+  if (has === undefined) {
+    has = (db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name?: string }>).some(row => row.name === "stop_attempt");
+    sessionsHaveStopAttempt.set(db, has);
+  }
+  return has ? ", stop_attempt = NULL" : "";
+}
 
 /** The SQL that reads a session's recorded community harness: the retained storage column, or NULL on a schema without that column
  *  (as other optional columns are read), so a partial schema reads every seat as before. The schema check is made
@@ -953,6 +1064,15 @@ const sessionsHaveCommunityRunner = new WeakMap<Database.Database, boolean>();
 
 /** The SQL that reads whether a session's community app was launched as a runner: 1, 0, or NULL. NULL also on a schema
  *  without the column, so a legacy database reads every seat as before (never a runner opt-in). */
+/** `sessions.agent_runner`: 1, a preset's own runner (`runner: true`); 2, OpenRig's hosted Pi-protocol runner for a
+ *  `protocol: pi-rpc` preset. Both are runners; only the second speaks Pi's RPC protocol. */
+export const AGENT_RUNNER_PRESET = 1;
+export const AGENT_RUNNER_HOSTED_PI_RPC = 2;
+/** The session was launched for a runner of either kind. */
+export function recordedRunner(value: number | null | undefined): boolean {
+  return value === AGENT_RUNNER_PRESET || value === AGENT_RUNNER_HOSTED_PI_RPC;
+}
+
 export function sessionCommunityRunnerSelect(db: Database.Database, alias = "s"): string {
   let has = sessionsHaveCommunityRunner.get(db);
   if (has === undefined) {

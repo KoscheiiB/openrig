@@ -1,7 +1,49 @@
+import { networkBindingProvidersSchema } from "./migrations/191_network_binding_providers.js";
+import { nodeKeepAliveSchema } from "./migrations/181_node_keep_alive.js";
+import { sessionStopAttemptSchema } from "./migrations/180_session_stop_attempt.js";
+import { nodeProcessLimitsSchema } from "./migrations/173_node_process_limits.js";
+import { nodeStatuslineThrottleSchema } from "./migrations/176_node_statusline_throttle.js";
+import { seatPoolSchema } from "./migrations/178_seat_pool.js";
+import { remoteControlObservationsSchema } from "./migrations/179_remote_control_observations.js";
+import { queueRelayedAnswersSchema } from "./migrations/186_queue_relayed_answers.js";
+import { queueTransferStagingSchema } from "./migrations/190_queue_transfer_staging.js";
+import { workflowRunTitleSchema } from "./migrations/194_workflow_run_title.js";
+import { workflowStartOperationsSchema } from "./migrations/195_workflow_start_operations.js";
+import { queueItemEvidenceRefRootsSchema } from "./migrations/196_queue_item_evidence_ref_roots.js";
+import { queueItemsBlockedOnIndexSchema } from "./migrations/182_queue_items_blocked_on_index.js";
+import { queueItemsScanIndexesSchema } from "./migrations/183_queue_items_scan_indexes.js";
+import { rigSeatSliceSchema } from "./migrations/189_rig_seat_slice.js";
+import { communityHarnessRuntimeSwitchesSchema } from "./migrations/179_community_harness_runtime_switches.js";
+import { networkRequestsSchema } from "./migrations/184_network_requests.js";
+
+import { sessionLaunchedCwdSchema } from "./migrations/174_session_launched_cwd.js";
+import { rigDeliveryDrainsSchema } from "./migrations/170_rig_delivery_drains.js";
+import { queueReturnRouteSchema } from "./migrations/172_queue_return_route.js";
+import { runBoundActivityGrantsSchema } from "./migrations/165_run_bound_activity_grants.js";
+import { nodeInputRouteSchema } from "./migrations/171_node_input_route.js";
+import { coreAppAccessSchema } from "./migrations/175_core_app_access.js";
 import { piAccountSwitchesSchema } from "./migrations/151_pi_account_switches.js";
 import { workflowInstanceSpecSchema } from "./migrations/152_workflow_instance_spec.js";
 import { eventsRetentionMarksSchema } from "./migrations/153_events_retention_marks.js";
 import { workflowInstanceRootObjectiveSchema } from "./migrations/154_workflow_instance_root_objective.js";
+import { queueErasureSchema } from "./migrations/155_queue_erasure.js";
+import { queueErasureLinkIndexesSchema } from "./migrations/156_queue_erasure_link_indexes.js";
+import { queueErasureBatchesSchema } from "./migrations/157_queue_erasure_batches.js";
+import { workflowBoundPodSchema } from "./migrations/177_workflow_bound_pod.js";
+import { queueInboxCheckinsSchema } from "./migrations/158_queue_inbox_checkins.js";
+import { queueItemsHandedOffFromIndexSchema } from "./migrations/159_queue_items_handed_off_from_index.js";
+import { networkBindingsSchema } from "./migrations/160_network_bindings.js";
+import { networkReceiptsSchema } from "./migrations/161_network_receipts.js";
+import { sessionAddressReadIndexesSchema } from "./migrations/162_session_address_read_indexes.js";
+import { networkInstallationsSchema } from "./migrations/163_network_installations.js";
+import { queueItemsReplyToIndexSchema } from "./migrations/164_queue_items_reply_to_index.js";
+import { queueListReadIndexesSchema } from "./migrations/166_queue_list_read_indexes.js";
+import { seatHandoverAttemptsSchema } from "./migrations/167_seat_handover_attempts.js";
+import { contextUsageOccupantGenerationSchema } from "./migrations/168_context_usage_occupant_generation.js";
+import { seatRuntimeHomeRecordsSchema } from "./migrations/169_seat_runtime_home_records.js";
+import { claudeAutoModeSchema } from "./migrations/171_claude_auto_mode.js";
+import { seatHookBridgeSchema } from "./migrations/171_seat_hook_bridge.js";
+import { seatColdStartsSchema } from "./migrations/185_seat_cold_starts.js";
 import { activityGrantsSchema } from "./migrations/143_activity_grants.js";
 import { environmentBindingsSchema } from "./migrations/144_environment_bindings.js";
 import { nodePermissionsToSchema } from "./migrations/145_node_permissions_to.js";
@@ -311,4 +353,45 @@ export const ALL_MIGRATIONS: Migration[] = [
   workflowInstanceSpecSchema,
   eventsRetentionMarksSchema,
   workflowInstanceRootObjectiveSchema,
+  queueErasureSchema,
+  queueErasureLinkIndexesSchema,
+  queueErasureBatchesSchema,
+  queueInboxCheckinsSchema,
+  queueItemsHandedOffFromIndexSchema,
+  networkBindingsSchema,
+  networkReceiptsSchema,
+  sessionAddressReadIndexesSchema,
+  networkInstallationsSchema,
+  queueItemsReplyToIndexSchema,
+  runBoundActivityGrantsSchema,
+  queueListReadIndexesSchema,
+  seatHandoverAttemptsSchema,
+  contextUsageOccupantGenerationSchema,
+  seatRuntimeHomeRecordsSchema,
+  rigDeliveryDrainsSchema,
+  claudeAutoModeSchema,
+  nodeInputRouteSchema,
+  queueReturnRouteSchema,
+  nodeProcessLimitsSchema,
+  seatHookBridgeSchema,
+  sessionLaunchedCwdSchema,
+  coreAppAccessSchema,
+  nodeStatuslineThrottleSchema,
+  workflowBoundPodSchema,
+  seatPoolSchema,
+  queueTransferStagingSchema,
+  remoteControlObservationsSchema,
+  seatColdStartsSchema,
+  sessionStopAttemptSchema,
+  nodeKeepAliveSchema,
+  queueItemsBlockedOnIndexSchema,
+  queueRelayedAnswersSchema,
+  queueItemsScanIndexesSchema,
+  rigSeatSliceSchema,
+  communityHarnessRuntimeSwitchesSchema,
+  networkBindingProvidersSchema,
+  workflowRunTitleSchema,
+  workflowStartOperationsSchema,
+  networkRequestsSchema,
+  queueItemEvidenceRefRootsSchema,
 ];

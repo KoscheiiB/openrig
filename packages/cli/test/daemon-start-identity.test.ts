@@ -5,7 +5,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startDaemon, getDaemonStatus, STATE_FILE, type LifecycleDeps } from "../src/daemon-lifecycle.js";
-import { acquireDaemonStartLock } from "../src/daemon-start-lock.js";
+import { acquireDaemonStartLock, archiveSpentReservation, currentBootId, markReservationRetained } from "../src/daemon-start-lock.js";
+// Resolve the startup import before a fake clock can finish with no timer yet scheduled.
+import "@openrig/daemon/instance-initialization";
+import { createProcessLiveness, readProcessState } from "../src/commands/daemon.js";
 
 afterEach(() => vi.useRealTimers());
 function fixture() {
@@ -116,13 +119,117 @@ describe("child-bound startup", () => {
       expect((outcome as Error).message).toMatch(/identity mismatch.*observed 888/);
       expect(f.files.has(STATE_FILE)).toBe(false);
     });
+    it("keeps waiting for the same child after 20 seconds and publishes its verified readiness at 45 seconds", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const fetch = f.deps.fetch; const began = Date.now();
+        f.deps.fetch = async (url) => {
+          const response = await fetch(url);
+          if (Date.now() - began < 45_000) throw Object.assign(new Error("still initializing"), { code: "ECONNREFUSED" });
+          return response;
+        };
+        const pending = startDaemon(opts, f.deps).catch((error: Error) => error);
+        await vi.advanceTimersByTimeAsync(25_000);
+        expect(f.files.has(STATE_FILE)).toBe(false);
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.lock.recordChild).toHaveBeenCalledWith(f.child.pid, expect.objectContaining({ host: "127.0.0.1", port: expect.any(Number) }));
+        expect(f.lock.release).not.toHaveBeenCalled();
+        expect(progress).toHaveBeenCalledWith(expect.stringContaining("Waiting for daemon child 12345 readiness"));
+        await vi.runAllTimersAsync();
+        const outcome = await pending;
+        expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+        expect(Date.now() - began).toBe(45_000);
+        expect(JSON.parse(f.files.get(STATE_FILE)!)).toMatchObject({ pid: f.child.pid, port: opts.port, host: opts.host });
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.lock.release).toHaveBeenCalledWith(false);
+        expect(f.deps.kill).not.toHaveBeenCalled();
+        expect(progress.mock.calls.length).toBeLessThanOrEqual(3);
+      } finally { progress.mockRestore(); }
+    });
+    it("stops on a child exit after the old deadline instead of waiting out the new cap", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const fetch = f.deps.fetch;
+        f.deps.fetch = async (url) => (await fetch(url), new Promise(() => {}));
+        setTimeout(() => { f.child.exitCode = 1; f.child.emit("exit", 1, null); }, 35_000);
+        const { outcome, elapsed } = await settle(f);
+        expect((outcome as Error).message).toMatch(/exited/);
+        expect(elapsed).toBe(35_000);
+        expect(f.files.has(STATE_FILE)).toBe(false);
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.deps.kill).not.toHaveBeenCalled();
+        expect(f.lock.release).toHaveBeenCalledWith(false);
+      } finally { progress.mockRestore(); }
+    });
+    it("returns pending at a configured 30-second readiness wait, naming that limit, without stopping the child or releasing the reservation", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const fetch = f.deps.fetch;
+        f.deps.fetch = async (url) => (await fetch(url), new Promise(() => {}));
+        const started = Date.now();
+        const result = startDaemon({ ...opts, readinessWaitSeconds: 30 }, f.deps).catch((e: Error) => e);
+        await vi.runAllTimersAsync();
+        const outcome = await result;
+        expect(Date.now() - started).toBe(30_000);
+        expect((outcome as Error).message).toMatch(/pending after the readiness deadline \(child PID 12345\)/);
+        expect(progress).toHaveBeenCalledWith(expect.stringContaining("30s limit"));
+        expect(f.files.has(STATE_FILE)).toBe(false);
+        expect(f.deps.kill).not.toHaveBeenCalled();
+        expect(f.lock.release).toHaveBeenCalledWith(true);
+      } finally { progress.mockRestore(); }
+    });
+    it("keeps waiting past 180 seconds at a configured 240-second wait and publishes the same child verified at 200 seconds", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const fetch = f.deps.fetch; const began = Date.now();
+        f.deps.fetch = async (url) => {
+          const response = await fetch(url);
+          if (Date.now() - began < 200_000) throw Object.assign(new Error("still initializing"), { code: "ECONNREFUSED" });
+          return response;
+        };
+        const pending = startDaemon({ ...opts, readinessWaitSeconds: 240 }, f.deps).catch((error: Error) => error);
+        await vi.runAllTimersAsync();
+        const outcome = await pending;
+        expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+        expect(Date.now() - began).toBe(200_000);
+        expect(progress).toHaveBeenCalledWith(expect.stringContaining("240s limit"));
+        expect(JSON.parse(f.files.get(STATE_FILE)!)).toMatchObject({ pid: f.child.pid });
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(f.lock.release).toHaveBeenCalledWith(false);
+      } finally { progress.mockRestore(); }
+    });
+    it("keeps a quick verified start immediate without a waiting progress line", async () => {
+      vi.useFakeTimers();
+      const progress = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const f = fixture(); const { outcome, elapsed } = await settle(f);
+        expect(outcome instanceof Error ? outcome.message : outcome.pid).toBe(f.child.pid);
+        expect(elapsed).toBe(0);
+        expect(f.deps.spawn).toHaveBeenCalledTimes(1);
+        expect(progress).not.toHaveBeenCalled();
+      } finally { progress.mockRestore(); }
+    });
     it("returns pending within one readiness deadline without stopping its still-starting child", async () => {
       vi.useFakeTimers();
       const f = fixture(); const fetch = f.deps.fetch;
-      f.deps.fetch = async (url) => (await fetch(url), new Promise(() => {}));
+      const probeStarts: number[] = [];
+      const began = Date.now();
+      f.deps.fetch = async (url) => {
+        await fetch(url);
+        probeStarts.push(Date.now());
+        return new Promise(() => {});
+      };
       const { outcome, elapsed } = await settle(f);
+      expect(elapsed).toBe(180_000);
+      expect(probeStarts.length).toBeGreaterThan(60);
+      expect(probeStarts.every(at => at < began + 180_000)).toBe(true);
+      expect(probeStarts.slice(1).every((at, i) => at - probeStarts[i]! <= 2_250)).toBe(true);
       expect((outcome as Error).message).toMatch(/Last probe: .*timed out|Last probe: .*healthz/);
-      expect(elapsed).toBeLessThanOrEqual(20_000);
+      expect(elapsed).toBeLessThanOrEqual(180_000);
       expect(f.files.has(STATE_FILE)).toBe(false);
       expect(f.deps.kill).not.toHaveBeenCalled();
       expect(f.lock.release).toHaveBeenCalledWith(true);
@@ -136,7 +243,7 @@ describe("child-bound startup", () => {
       const fetch = f.deps.fetch; const urls: string[] = [];
       f.deps.fetch = async (url) => {
         const res = await fetch(url);
-        if (urls.push(url) - 1 === at) vi.setSystemTime(Date.now() + 21_000);
+        if (urls.push(url) - 1 === at) vi.setSystemTime(Date.now() + 181_000);
         if (secondary && url.includes("127.0.0.2")) throw new Error("timeout");
         return res;
       };
@@ -182,7 +289,7 @@ describe("child-bound startup", () => {
       f.deps.fetch = async (url) => (await fetch(url), calls++ % 2 === 0 ? { ok: true, json: async () => f.body } : new Promise(() => {}));
       const { outcome, elapsed } = await settle(f);
       expect((outcome as Error).message).toMatch(/listener verification is incomplete.*reservation retained/);
-      expect(elapsed).toBeLessThanOrEqual(20_000);
+      expect(elapsed).toBeLessThanOrEqual(180_000);
       expect(f.files.has(STATE_FILE)).toBe(false);
       expect(f.deps.kill).not.toHaveBeenCalled();
     });
@@ -268,8 +375,8 @@ describe("local startup reservation", () => {
   it("excludes the second launcher and releases after the owner completes", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-start-lock-"));
     try {
-      const lock = acquireDaemonStartLock(home); lock.recordChild(1234);
-      expect(fs.readFileSync(path.join(home, "daemon-start.lock"), "utf8")).toContain('"childPid":1234');
+      const lock = acquireDaemonStartLock(home); lock.recordChild(1234, { startToken: "linux:42", pidNamespace: "host", host: "127.0.0.1", port: 7433 });
+      expect(fs.readFileSync(path.join(home, "daemon-start.lock"), "utf8")).toContain('{"childPid":1234,"startToken":"linux:42","pidNamespace":"host","host":"127.0.0.1","port":7433}');
       expect(() => acquireDaemonStartLock(home)).toThrow(/already reserved/);
       lock.release(); const next = acquireDaemonStartLock(home); next.release();
       expect(fs.existsSync(path.join(home, "daemon-start.lock"))).toBe(false);
@@ -286,6 +393,293 @@ describe("local startup reservation", () => {
       const third = acquireDaemonStartLock(home); second.release();
       expect(fs.existsSync(file)).toBe(true); third.release();
     } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+  describe("a reservation from before this boot", () => {
+    const startedAt = "2026-11-10T20:05:59.662Z", bootedAtMs = Date.parse("2026-11-10T20:46:15Z");
+    const dead = () => "dead" as const, alive = () => "alive" as const;
+    const leftover = (home: string, at = startedAt, bootId?: string) => {
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt: at, ...(bootId ? { bootId } : {}) }) + "\n" + JSON.stringify({ childPid: 36449 }) + "\n");
+      const written = new Date(Date.parse(at) + 1000);
+      fs.utimesSync(file, written, written);
+      return file;
+    };
+    const archiveOf = (file: string, stamp: string) => `${file}.abandoned-${stamp}-${fs.statSync(file).ino}`;
+    const withHome = (body: (home: string) => void) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-start-lock-"));
+      try { body(home); } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    };
+    it("is archived and the launch goes on when every recorded PID is dead", () => withHome((home) => {
+      const file = leftover(home), archive = archiveOf(file, "20261110T200559Z"), liveness = vi.fn(dead);
+      const lock = acquireDaemonStartLock(home, { bootedAtMs, processLiveness: liveness });
+      expect(lock.archived).toBe(archive);
+      expect(fs.readFileSync(archive, "utf8")).toContain('"childPid":36449');
+      expect(liveness).toHaveBeenCalledWith(35905); expect(liveness).toHaveBeenCalledWith(36449);
+      expect(fs.readFileSync(file, "utf8")).toContain(`"launcherPid":${process.pid}`);
+      lock.release();
+      expect(fs.existsSync(file)).toBe(false);
+    }));
+    it("stays when a recorded PID is alive, in case the clock moved after boot", () => withHome((home) => {
+      const file = leftover(home);
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: (pid) => pid === 36449 ? "alive" : "dead" })).toThrow(/already reserved/);
+      expect(fs.readFileSync(file, "utf8")).toContain('"childPid":36449');
+    }));
+    it("stays when a recorded PID can't be inspected (EPERM)", () => withHome((home) => {
+      const file = leftover(home);
+      const processLiveness = createProcessLiveness({ signal: () => "not-permitted", readProcessState: () => "S" });
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+      expect(fs.readFileSync(file, "utf8")).toContain('"launcherPid":35905');
+    }));
+    it("stays when ps can't run for a recorded PID", () => withHome((home) => {
+      leftover(home);
+      const processLiveness = createProcessLiveness({
+        signal: () => "sent",
+        readProcessState: (pid) => readProcessState(pid, "darwin", () => { throw new Error("ps: not permitted"); }),
+      });
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+    }));
+    it("stays when it was written during this boot", () => withHome((home) => {
+      leftover(home, "2026-11-10T20:50:00.000Z");
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+    }));
+    it("stays when it was modified during this boot", () => withHome((home) => {
+      const file = leftover(home), later = new Date(bootedAtMs + 60_000);
+      fs.utimesSync(file, later, later);
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+    }));
+    it("stays when it can't be read as a reservation", () => withHome((home) => {
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, "not json\n");
+      fs.utimesSync(file, new Date(bootedAtMs - 60_000), new Date(bootedAtMs - 60_000));
+      expect(() => acquireDaemonStartLock(home, { bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+      expect(fs.readFileSync(file, "utf8")).toBe("not json\n");
+    }));
+    it("is archived when it records an earlier boot's ID, even if a recorded PID is now someone else's", () => withHome((home) => {
+      const file = leftover(home, "2026-11-10T20:50:00.000Z", "boot-a"), archive = archiveOf(file, "20261110T205000Z");
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: alive });
+      expect(lock.archived).toBe(archive);
+      expect(fs.readFileSync(file, "utf8")).toContain('"bootId":"boot-b"');
+      lock.release();
+    }));
+    it("stays when it records this boot's ID and this shell's pid namespace isn't given, whatever its times and PIDs", () => withHome((home) => {
+      leftover(home, startedAt, "boot-b");
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+    }));
+    it("without a boot ID of its own, falls back to the boot time and PID checks", () => withHome((home) => {
+      const file = leftover(home), archive = archiveOf(file, "20261110T200559Z");
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: () => "unknown" })).toThrow(/already reserved/);
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead });
+      expect(lock.archived).toBe(archive);
+      lock.release();
+    }));
+    it("has one winner when another launch archives it and takes the lock between this one's inspection and its claim", () => withHome((home) => {
+      const file = leftover(home, startedAt, "boot-a"), archive = archiveOf(file, "20261110T200559Z");
+      let b: ReturnType<typeof acquireDaemonStartLock> | undefined;
+      const afterInspect = () => { b = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead }); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, afterInspect })).toThrow(/already reserved/);
+      expect(b?.archived).toBe(archive);
+      expect(fs.readFileSync(archive, "utf8")).toContain('"launcherPid":35905'); // the archive still holds the abandoned reservation
+      const current = fs.readFileSync(file, "utf8");
+      expect(current).toContain(`"launcherPid":${process.pid}`); // B's fresh lock is still in place, not moved by A
+      expect(fs.readdirSync(home).sort()).toEqual([path.basename(archive), "daemon-start.lock"].sort());
+      b!.release();
+      expect(fs.existsSync(file)).toBe(false); // B still owns its file
+    }));
+    it("is not moved when the path holds a different file than the one inspected", () => withHome((home) => {
+      const file = leftover(home, startedAt, "boot-a");
+      const afterInspect = () => { fs.renameSync(file, file + ".moved"); fs.writeFileSync(file, '{"launcherPid":1,"startedAt":"2026-11-10T21:00:00.000Z","bootId":"boot-b"}\n'); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, afterInspect })).toThrow(/already reserved/);
+      expect(fs.readFileSync(file, "utf8")).toContain('"launcherPid":1');
+      expect(fs.readdirSync(home).sort()).toEqual(["daemon-start.lock", "daemon-start.lock.moved"]);
+    }));
+    it.runIf(process.platform === "darwin" || process.platform === "linux")("reads this boot's ID from the OS", () => {
+      const id = currentBootId();
+      expect(id).toMatch(/^[0-9a-f-]{32,36}$/i);
+      expect(currentBootId()).toBe(id);
+    });
+    it("stays without the boot check, as before", () => withHome((home) => {
+      leftover(home);
+      expect(() => acquireDaemonStartLock(home)).toThrow(/already reserved/);
+    }));
+  });
+  describe("a reservation from this boot", () => {
+    const bootedAtMs = Date.parse("2026-11-10T20:46:15Z"), startedAt = "2026-11-10T21:05:59.662Z";
+    const NS = "pid:[4026531836]";
+    const dead = () => "dead" as const;
+    const withHome = (body: (home: string) => void) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-start-lock-"));
+      try { body(home); } finally { fs.rmSync(home, { recursive: true, force: true }); }
+    };
+    /** A start's archive of a reservation from this boot, and the name `rig daemon stop` gives a spent one. */
+    const abandonedOf = (file: string) => `${file}.abandoned-20261110T210559Z-${fs.statSync(file).ino}`;
+    const stoppedOf = (file: string) => `${file}.stopped-${fs.statSync(file).ino}`;
+    const claimOf = (file: string) => `${file}.claim-${fs.statSync(file).ino}`;
+    const childRecord = (pidNamespace?: string) => JSON.stringify({ childPid: 36449, startToken: "linux:42", ...(pidNamespace ? { pidNamespace } : {}), host: "127.0.0.1", port: 7433 }) + "\n";
+    /** A launch written after this boot: `{launcherPid, startedAt[, bootId]}` and, when `child`, its child record. */
+    const sameBoot = (home: string, opts: { bootId?: string; pidNamespace?: string; child?: boolean } = {}) => {
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt, ...(opts.bootId ? { bootId: opts.bootId } : {}) }) + "\n"
+        + (opts.child === false ? "" : childRecord(opts.pidNamespace)));
+      const written = new Date(Date.parse(startedAt) + 1000);
+      fs.utimesSync(file, written, written);
+      return file;
+    };
+    it("is archived when it records this boot's ID and both its launcher and child are dead in this shell's pid namespace", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS }), archive = abandonedOf(file), liveness = vi.fn(dead);
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: liveness, pidNamespace: NS });
+      expect(lock.archived).toBe(archive);
+      expect(fs.readFileSync(archive, "utf8")).toContain('"childPid":36449');
+      expect(liveness).toHaveBeenCalledWith(35905); expect(liveness).toHaveBeenCalledWith(36449);
+      expect(fs.readFileSync(file, "utf8")).toContain(`"launcherPid":${process.pid}`);
+      lock.release();
+      expect(fs.existsSync(file)).toBe(false);
+    }));
+    it("is archived from an older CLI's reservation (no boot ID, no namespace) where the OS has none, once both PIDs are dead", () => withHome((home) => {
+      // The macOS field case: a 0.7.10 reservation is {launcherPid, startedAt} then {childPid}, written after boot.
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt }) + "\n" + JSON.stringify({ childPid: 36449 }) + "\n");
+      const archive = abandonedOf(file);
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: "host" });
+      expect(lock.archived).toBe(archive);
+      lock.release();
+    }));
+    it("is archived from an older CLI's reservation with no boot ID that names this shell's namespace", () => withHome((home) => {
+      sameBoot(home, { pidNamespace: NS });
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS });
+      expect(lock.archived).toBeDefined();
+      lock.release();
+    }));
+    it("keeps refusing while either recorded PID is alive or can't be inspected, and is archived once both are dead", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS });
+      const unknown = createProcessLiveness({ signal: () => "not-permitted", readProcessState: () => "S" });
+      for (const processLiveness of [
+        (pid: number) => pid === 35905 ? "alive" as const : "dead" as const,
+        (pid: number) => pid === 36449 ? "alive" as const : "dead" as const,
+        unknown,
+      ]) {
+        expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness, pidNamespace: NS })).toThrow(/already reserved/);
+        expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+        expect(fs.readFileSync(file, "utf8")).toContain('"childPid":36449');
+      }
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS });
+      expect(lock.archived).toBeDefined();
+      lock.release();
+    }));
+    it("refuses one with no child record, and is archived once the same launch's child is recorded and both are gone", () => withHome((home) => {
+      // "host" (an OS without pid namespaces), so the missing child record is the only reason to refuse.
+      const file = sameBoot(home, { bootId: "boot-b", child: false });
+      const stale = { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: "host" };
+      expect(() => acquireDaemonStartLock(home, stale)).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+      fs.appendFileSync(file, childRecord());
+      const lock = acquireDaemonStartLock(home, stale);
+      expect(lock.archived).toBeDefined();
+      lock.release();
+    }));
+    it("refuses one that a stop retained after a shutdown it couldn't verify, though both PIDs are dead", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS });
+      fs.appendFileSync(file, JSON.stringify({ retainedBy: "stop", reason: "incomplete-shutdown", at: "2026-11-10T21:10:00.000Z" }) + "\n");
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+    }));
+    it("notes in the archive that a start archived it", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS }), archive = abandonedOf(file);
+      const text = fs.readFileSync(file, "utf8");
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS });
+      expect(lock.archived).toBe(archive);
+      const archived = fs.readFileSync(archive, "utf8");
+      expect(archived.startsWith(text)).toBe(true);
+      expect(JSON.parse(archived.slice(text.length))).toMatchObject({ archivedBy: "start", reason: "launcher-and-child-gone", launcherPid: process.pid });
+      lock.release();
+    }));
+    it("has one winner when a stop releases the same spent reservation between this start's inspection and its claim", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS }), archive = stoppedOf(file);
+      const text = fs.readFileSync(file, "utf8");
+      let released: string | undefined;
+      const afterInspect = () => { released = archiveSpentReservation(file, text); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS, afterInspect })).toThrow(/already reserved/);
+      expect(released).toBe(archive);
+      expect(fs.readdirSync(home)).toEqual([path.basename(archive)]);
+      expect(fs.readFileSync(archive, "utf8")).toBe(text);
+    }));
+    it("leaves the reservation to another remover that holds the claim on its inode", () => withHome((home) => {
+      // Another start or a stop is between its claim and its unlink: whatever name it archives under, this start refuses.
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS }), claim = claimOf(file);
+      const afterInspect = () => { fs.linkSync(file, claim); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS, afterInspect })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home).sort()).toEqual([path.basename(claim), "daemon-start.lock"].sort());
+      expect(fs.statSync(file).ino).toBe(fs.statSync(claim).ino);
+    }));
+    it("keeps refusing when a stop marks it between this start's inspection and its claim", () => withHome((home) => {
+      // The start decided from the text it read; the stop's mark, appended to the same inode since, keeps the refusal.
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS });
+      const text = fs.readFileSync(file, "utf8");
+      let marked: ReturnType<typeof markReservationRetained> | undefined;
+      const afterInspect = () => { marked = markReservationRetained(file, text, "stopping"); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS, afterInspect })).toThrow(/already reserved/);
+      expect(marked).toHaveProperty("written");
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+      expect(fs.readFileSync(file, "utf8")).toBe((marked as { written: string }).written);
+    }));
+    it("writes no stop mark between this start's content check on its claim and its move", () => withHome((home) => {
+      // The stop tries to mark it after the start's claim passed the content check: the claim keeps the mark out, so
+      // nothing is written on a reservation that moves, and the stop is told the claim is there.
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS }), archive = abandonedOf(file);
+      const text = fs.readFileSync(file, "utf8");
+      const link = fs.linkSync;
+      let marked: ReturnType<typeof markReservationRetained> | "not tried" = "not tried";
+      const spy = vi.spyOn(fs, "linkSync").mockImplementation((from, to) => {
+        if (String(to) === archive) marked = markReservationRetained(file, text, "stopping");
+        return link(from, to);
+      });
+      try {
+        const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS });
+        expect(lock.archived).toBe(archive);
+        expect(marked).toEqual({ unwritten: expect.stringContaining(`the claim file ${file}.claim-`) });
+        expect(fs.readFileSync(archive, "utf8")).not.toContain('"retainedBy"');
+        lock.release();
+      } finally {
+        spy.mockRestore();
+      }
+    }));
+    it("has one winner when two starts read an older CLI's reservation as different boots", () => withHome((home) => {
+      // No boot ID: the route rests on each start's boot time. B (a later boot time) archives it as from an earlier
+      // boot and takes the lock between A's inspection and A's claim; A, reading it as from this boot, refuses.
+      const file = path.join(home, "daemon-start.lock");
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt }) + "\n" + JSON.stringify({ childPid: 36449 }) + "\n");
+      const written = new Date(Date.parse(startedAt) + 1000);
+      fs.utimesSync(file, written, written);
+      let b: ReturnType<typeof acquireDaemonStartLock> | undefined;
+      const afterInspect = () => { b = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs: Date.parse(startedAt) + 60_000, processLiveness: dead, pidNamespace: "host" }); };
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: "host", afterInspect })).toThrow(/already reserved/);
+      expect(b?.archived).toBeDefined();
+      expect(fs.readFileSync(file, "utf8")).toContain(`"launcherPid":${process.pid}`);
+      b!.release();
+      expect(fs.existsSync(file)).toBe(false);
+    }));
+    it("leaves a stop nothing to release once a start has archived it, and the start's new lock stays", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS }), archive = abandonedOf(file);
+      const text = fs.readFileSync(file, "utf8");
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS });
+      expect(lock.archived).toBe(archive);
+      expect(archiveSpentReservation(file, text)).toBeUndefined();
+      expect(fs.readFileSync(file, "utf8")).toContain(`"launcherPid":${process.pid}`);
+      lock.release();
+    }));
+    it("refuses one numbered in another pid namespace, one without a namespace on an OS that has them, and any when this shell's is unknown", () => withHome((home) => {
+      const file = sameBoot(home, { bootId: "boot-b", pidNamespace: NS });
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: "pid:[4026532999]" })).toThrow(/already reserved/);
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead })).toThrow(/already reserved/);
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt, bootId: "boot-b" }) + "\n" + childRecord());
+      expect(() => acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS })).toThrow(/already reserved/);
+      expect(fs.readdirSync(home)).toEqual(["daemon-start.lock"]);
+      fs.writeFileSync(file, JSON.stringify({ launcherPid: 35905, startedAt, bootId: "boot-b" }) + "\n" + childRecord(NS));
+      const lock = acquireDaemonStartLock(home, { bootId: "boot-b", bootedAtMs, processLiveness: dead, pidNamespace: NS });
+      expect(lock.archived).toBeDefined();
+      lock.release();
+    }));
   });
 });
 
@@ -321,8 +715,8 @@ it.each(["missing", "stale"] as const)("keeps a slow child discoverable with %s 
     expect(message).toContain("stop child PID 12345 and wait for exit");
     expect(message).toContain(path.join(path.dirname(STATE_FILE), "daemon-start.lock"));
     expect(message).toContain("only after both recorded launcher and child PIDs are absent, archive it and run 'rig daemon start'");
-    expect(message).toContain("'rig daemon stop' cannot target this unpublished child");
-    expect(Date.now() - began).toBeLessThanOrEqual(20_000);
+    expect(message).toContain("Once this launcher has exited, 'rig daemon stop' can check this child against this reservation");
+    expect(Date.now() - began).toBeLessThanOrEqual(180_000);
     expect(f.deps.kill).not.toHaveBeenCalled();
     expect(f.child.exitCode).toBeNull();
     expect(f.files.get(STATE_FILE)).toBe(previousState);

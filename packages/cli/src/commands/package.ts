@@ -5,6 +5,13 @@ import { getDaemonStatus, getDaemonUrl, type LifecycleDeps , daemonStatusGuard} 
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 
+/** A skill or agent that installs outside its kind's usual folder (still inside the target): it installs as named. */
+function printOutsideKindFolder(warnings: string[] | undefined): void {
+  if (!warnings?.length) return;
+  console.log("Outside the usual folder (installed as named):");
+  for (const warning of warnings) console.log(`  ${warning}`);
+}
+
 export function packageCommand(depsOverride?: StatusDeps): Command {
   const cmd = new Command("package").description("Manage agent packages (legacy)");
   const getDeps = () => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
@@ -80,6 +87,7 @@ export function packageCommand(depsOverride?: StatusDeps): Command {
         deferred: number;
         conflicts: number;
         noOps: number;
+        warnings?: string[];
         error?: string;
         errors?: string[];
       }>("/api/packages/plan", {
@@ -113,6 +121,7 @@ export function packageCommand(depsOverride?: StatusDeps): Command {
           console.log(`  ${e.exportType.padEnd(12)} ${e.exportName.padEnd(20)} ${e.classification.padEnd(18)} ${e.targetPath || "(deferred)"}${suffix}`);
         }
       }
+      printOutsideKindFolder(res.data.warnings);
     });
 
   // rig package install <path>
@@ -137,6 +146,8 @@ export function packageCommand(depsOverride?: StatusDeps): Command {
         conflicts?: Array<{ existingPath: string; reason: string }>;
         verification?: { passed: boolean };
         policyRejected?: Array<{ entry: { exportType: string; exportName: string }; reason: string }>;
+        notes?: string[];
+        warnings?: string[];
         error?: string;
         errors?: string[];
         code?: string;
@@ -204,6 +215,12 @@ export function packageCommand(depsOverride?: StatusDeps): Command {
           console.log(`  ${r.entry.exportType.padEnd(12)} ${r.entry.exportName.padEnd(20)} ${r.reason}`);
         }
       }
+
+      if (res.data.notes && res.data.notes.length > 0) {
+        console.log("Left as it is:");
+        for (const note of res.data.notes) console.log(`  ${note}`);
+      }
+      printOutsideKindFolder(res.data.warnings);
     });
 
   // rig package rollback <installId>

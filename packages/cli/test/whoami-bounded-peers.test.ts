@@ -214,6 +214,30 @@ describe("rig whoami --json: bounded peers (output.compact, output.whoami_peers)
     for (const p of BIG_PEERS) expect(out).toContain(p.logicalId);
   });
 
+  // #2871: while `rig up` is still building the team, every form of the answer keeps saying so.
+  it("a team still being built: rosterState and the daemon's opening survive bounding, and edges aren't called complete", async () => {
+    const BUILDING = "rosterState = building: `rig up` is still creating this team's seats and edges, so the peers and edges "
+      + "below are only the ones created so far and more may come; run `rig whoami` again once `rig up` finishes. ";
+    served = { ...response(BIG_PEERS), rosterState: "building", peersNote: BUILDING + DAEMON_NOTE };
+    // Switch off: the daemon's own note and state.
+    let out = JSON.parse(await run("--json"));
+    expect(out.rosterState).toBe("building");
+    expect(out.peersNote).toBe(BUILDING + DAEMON_NOTE);
+    // Switch on: the bounded note opens the same way, and names the edges as the ones written so far.
+    vi.stubEnv("OPENRIG_OUTPUT_COMPACT", "1");
+    out = JSON.parse(await run("--json"));
+    expect(out.rosterState).toBe("building");
+    expect(out.peersOmitted).toBe(15);
+    expect(out.peersNote).toBe(
+      BUILDING
+      + "peers = 8 of this rig's 23 (roster excluding self; edge peers first, then your pod, then roster order; "
+      + "bound output.whoami_peers=8); 15 not shown; all: rig whoami --json --all-peers --node-id 'node-1'; "
+      + "edges = directional relationships (the ones written so far); use `rig ps --nodes` for node inventory including self + live state",
+    );
+    // Plain text says it too.
+    expect(await run()).toContain("Team:       still being built by `rig up`");
+  });
+
   it("the full-list command names the identity the call used: --session, quoted", () => {
     const bounded = boundPeers(response(BIG_PEERS), 2, "rig whoami --json --all-peers --session 'dev-impl@big'");
     expect(bounded.note).toContain("all: rig whoami --json --all-peers --session 'dev-impl@big';");
@@ -249,6 +273,20 @@ describe("rig whoami --json: bounded peers (output.compact, output.whoami_peers)
       // OPENRIG_HOME is restored by afterEach's vi.unstubAllEnvs(); remove only this test's own home.
       fs.rmSync(home, { recursive: true, force: true });
     }
+  });
+
+  // A connected seat finds `rig network` from whoami: the compact JSON keeps the binding, and the text names it.
+  it("keeps a seat's network binding in compact JSON and names it in the text", async () => {
+    vi.stubEnv("OPENRIG_OUTPUT_COMPACT", "1");
+    const networkBinding = { id: "netb-00000000000000000002", hubSeat: "alex@team", hubUrl: "https://hub.example/mcp (query hidden)" };
+    const bound = response(SMALL_PEERS);
+    served = { ...bound, identity: { ...bound.identity, networkBinding } };
+    expect(JSON.parse(await run("--json")).identity.networkBinding).toEqual(networkBinding);
+    expect(await run()).toContain("Network:    netb-00000000000000000002, as alex@team at https://hub.example/mcp (query hidden) (experimental and unsupported). "
+      + "rig network peers netb-00000000000000000002 lists whom you can ask.");
+    served = response(SMALL_PEERS);
+    expect(JSON.parse(await run("--json")).identity).not.toHaveProperty("networkBinding");
+    expect(await run()).not.toContain("Network:");
   });
 });
 

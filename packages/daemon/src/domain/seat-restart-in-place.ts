@@ -1,9 +1,11 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import nodePath from "node:path";
+import { promisify } from "node:util";
 import Database from "better-sqlite3";
 import type BetterSqlite3 from "better-sqlite3";
-import { isStagedSendScriptPath, type TmuxAdapter } from "../adapters/tmux.js";
+import { isStagedSendScriptPath, noticeLine, notAppliedNotice, type SeatProcessLimitsNotice, type TmuxAdapter } from "../adapters/tmux.js";
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
 import type { EventBus } from "./event-bus.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -21,6 +23,9 @@ import type { RunningCodexLaunch } from "../adapters/codex-runtime-adapter.js";
 import { emittedEffortFromArgv } from "./seat-effort.js";
 import { CODEX_NETWORK_DEFAULT_OVERRIDE } from "./codex-network-default.js";
 import { CODEX_NON_LOGIN_SHELL_OVERRIDE } from "./native-resume-probe.js";
+import { readNativeProcessLaunch } from "./native-process-arguments.js";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * OPR.0.7.0.5 — restart ONE Codex seat in place so it reads its Codex home's current account: the same
@@ -39,11 +44,12 @@ export type InPlaceRestartTmux = Pick<TmuxAdapter,
   | "getPanePid" | "getPaneCommand" | "listPanes" | "getSessionEnv" | "signalPid" | "setRemainOnExit"
   | "signalPaneProcess" | "isPaneDead" | "respawnPane" | "getPaneLocalOption" | "restorePaneOption"
   | "capturePaneHistory" | "capturePaneHistoryParts">
-  & Partial<Pick<TmuxAdapter, "getDefaultShell">>;
+  & Partial<Pick<TmuxAdapter, "getDefaultShell" | "seatProcessLimitsSet" | "seatProcessLimitsNotApplied" | "seatProcessLimitsKeepPlan">>;
 
 /** The Codex runtime adapter's resume surface this operation reuses. */
 export interface InPlaceCodexLauncher {
-  buildResumeCommand(binding: NodeBinding, opts: { name: string; resumeToken: string; running?: RunningCodexLaunch; launchShell?: string }):
+  /** `preview` builds the same command without bringing the Codex config to OpenRig's managed state. */
+  buildResumeCommand(binding: NodeBinding, opts: { name: string; resumeToken: string; running?: RunningCodexLaunch; launchShell?: string; preview?: boolean }):
     Promise<{ ok: true; command: string; core: string } | { ok: false; error: string }>;
   /** `nodeId` lets the resume proof read the seat's own CODEX_HOME when it declares one; `home`, the one the running
    *  Codex was read using, wins over both that and the daemon's. */
@@ -150,6 +156,9 @@ export interface InPlaceRestartReport {
   peers: PeerReport[];
   oldProcess: { pid: number; startedAt: string | null };
   newProcess?: { pid: number; startedAt: string | null; sameExecutable: boolean | null };
+  /** #3253: the restart went ahead without the seat's requested process limit (it stays stored; a fresh launch
+   *  applies it). Absent when the seat has no limit, or keeps it. */
+  processLimits?: SeatProcessLimitsNotice;
   paneHeld?: { option: "remain-on-exit"; value: "on"; previous: string | null; detail: string };
   /** After a failed direct-native stop or respawn: the pane and the original process, as observed. */
   observedAfterStop?: { pane: "present" | "gone" | "unknown"; process: "running" | "exited" | "unknown"; detail: string };
@@ -235,7 +244,7 @@ export class CodexInPlaceRestart {
 
   /** Every gate, read-only. Returns the report a restart would start from, or the refusal it would give. */
   async plan(target: InPlaceRestartTarget): Promise<InPlaceRestartReport | InPlaceRestartRefusal> {
-    const observed = await this.observe(target, null);
+    const observed = await this.observe(target, null, true);
     if (!observed.ok) return observed;
     return { ...observed.report, message: "Preview only: nothing was stopped or restarted." };
   }
@@ -278,6 +287,16 @@ export class CodexInPlaceRestart {
     return result;
   }
 
+  /** #3253: the restart's structured warning, on the report (and every result built from it). It is logged only once
+   *  the restart has gone on (logProcessLimits). */
+  private noteProcessLimits(report: InPlaceRestartReport, notice: SeatProcessLimitsNotice): void {
+    report.processLimits = notice;
+  }
+
+  private logProcessLimits(report: InPlaceRestartReport): void {
+    if (report.processLimits) console.warn(`[restart in place] ${report.seat.nodeId}: ${noticeLine(report.processLimits)}`);
+  }
+
   /** The restart after its started event. Updates `progress` so a throw is reported at its stage. */
   private async restart(target: InPlaceRestartTarget, observed: Observed, progress: RestartProgress): Promise<InPlaceRestartReport> {
     const { report, codexPid, codexStartedAt, panePid, relaunch, priorRemainOnExit, cwd, oldExe } = observed;
@@ -288,6 +307,11 @@ export class CodexInPlaceRestart {
 
     let launch: HarnessLaunchResult;
     if (report.paneShape === "shell_backed") {
+      // #3253: the resume is typed into the running shell, so the seat keeps the process tree it has, and any limit
+      // already applied to it. Chosen before anything is stopped: a shell not under the limit goes ahead with a
+      // structured warning (a recovery never stops for a limit), and the request stays stored.
+      const notApplied = await this.deps.tmux.seatProcessLimitsNotApplied?.(target.seat.nodeId, pane);
+      if (notApplied) this.noteProcessLimits(report, notApplied);
       const stopped = await this.stopUnderShell(pane, panePid, codexPid, codexStartedAt, report.oldProcess);
       if (stopped === "running") {
         return { ...report, outcome: "not_started", recoveryCommand, message: "Codex did not exit after TERM and KILL; nothing was restarted and the original process is still running." };
@@ -302,10 +326,21 @@ export class CodexInPlaceRestart {
       // The relaunch runs in the home the running Codex used (anything else refused as drift), so the proof reads that one.
       launch = await this.deps.codex.sendResumeCommand(sessionName, relaunch.command, report.conversationId, target.seat.nodeId, report.codexHome);
       if (!launch.ok) return this.incomplete(report, launch, recoveryCommand);
+      this.logProcessLimits(report);
       progress.stage = "identity check";
       return this.verifyReplacement(target, report, oldExe);
     }
 
+    // #3253: this respawn carries no seat environment. Chosen before anything is stopped: a seat whose process reads
+    // back under its limit is respawned in a new scope with it; otherwise it goes ahead with a structured warning, and a
+    // fresh launch re-applies the limit.
+    const keepPlan = this.deps.tmux.seatProcessLimitsKeepPlan
+      ? await this.deps.tmux.seatProcessLimitsKeepPlan(target.seat.nodeId, pane)
+      : this.deps.tmux.seatProcessLimitsSet?.(target.seat.nodeId)
+        ? { keep: false as const, notice: notAppliedNotice({ kind: "setup",
+          reason: "a restart in place respawns a bare pane without the seat's environment, so it can't keep or re-apply the limit; a fresh launch applies it" }) }
+        : null;
+    if (keepPlan && !keepPlan.keep) this.noteProcessLimits(report, keepPlan.notice);
     // Hold the pane before any signal: without remain-on-exit, Codex exiting would destroy the pane and
     // there would be nothing to respawn into. The hold counts only once tmux reads it back as on.
     progress.stage = "pane hold";
@@ -326,11 +361,19 @@ export class CodexInPlaceRestart {
     if (!terminated.ok) return this.afterFailedStop(target, report, observed, held, recoveryCommand, terminated.message, progress);
     // Respawn the dead pane WITHOUT -k (scrollback stays) with the resume command as its own command.
     progress.stage = "respawn";
-    const respawned = await this.deps.tmux.respawnPane(pane, relaunch.command, { cwd });
+    const respawned = await this.deps.tmux.respawnPane(pane, relaunch.command,
+      { cwd, groupSeatOf: target.seat.nodeId,
+        ...(keepPlan?.keep ? { keepLimitOf: target.seat.nodeId, processLimitsMode: "recovery" as const } : {}) });
     if (!respawned.ok) {
       return this.afterFailedStop(target, report, observed, held, recoveryCommand, `the pane could not be respawned: ${respawned.message}`, progress);
     }
-    if (respawned.warnings) report.warnings.push(...respawned.warnings);
+    // The respawn returns its process-limits notice both as processLimits and as a warning line; the report keeps it
+    // once, as processLimits, which the CLI prints as its own line.
+    const limitsLine = respawned.processLimits ? noticeLine(respawned.processLimits) : undefined;
+    if (respawned.warnings) report.warnings.push(...respawned.warnings.filter((line) => line !== limitsLine));
+    // The respawn logs its own notice (a kept scope that failed late, or a start it can't tell); the plan's is logged here.
+    if (respawned.processLimits) this.noteProcessLimits(report, respawned.processLimits);
+    else this.logProcessLimits(report);
     progress.stage = "resume";
     launch = await this.deps.codex.verifyResumeInPane(sessionName, report.conversationId, target.seat.nodeId, report.codexHome);
     if (!launch.ok) return this.incomplete(report, launch, recoveryCommand, held);
@@ -383,7 +426,7 @@ export class CodexInPlaceRestart {
 
   // -- observation (shared by plan and execute) --
 
-  private async observe(target: InPlaceRestartTarget, seenStartedSeq: number | null): Promise<Observed | InPlaceRestartRefusal> {
+  private async observe(target: InPlaceRestartTarget, seenStartedSeq: number | null, preview = false): Promise<Observed | InPlaceRestartRefusal> {
     const { binding, sessionName, seat } = target;
     const history = this.restartHistory(seat.nodeId, seenStartedSeq);
     if ("code" in history) return history;
@@ -411,7 +454,7 @@ export class CodexInPlaceRestart {
     if (!runningArgv) return { ok: false, code: "settings_unverified", message: "The running Codex's exact arguments could not be read, so its launch settings are unverified. Nothing was stopped." };
     const startedAt = process.startedAt ?? null;
     const facts = await this.io.readProcess(process.pid);
-    if (!facts) return { ok: false, code: "settings_unverified", message: "The running Codex's working directory and Codex home could not be read (this observer reads /proc on Linux). Nothing was stopped." };
+    if (!facts) return { ok: false, code: "settings_unverified", message: "The running Codex's working directory and Codex home could not be read from the OS (Linux reads /proc; macOS reads the process's launch record and lsof; other platforms aren't supported). Nothing was stopped." };
     const codexHome = facts.env.CODEX_HOME ?? (facts.env.HOME ? nodePath.join(facts.env.HOME, ".codex") : null);
     if (!codexHome) return { ok: false, code: "settings_unverified", message: "The running Codex's home could not be determined (no CODEX_HOME or HOME). Nothing was stopped." };
 
@@ -512,6 +555,7 @@ export class CodexInPlaceRestart {
       resumeToken: token,
       running,
       ...(launchShell ? { launchShell } : {}),
+      ...(preview ? { preview: true } : {}),
     });
     if (!relaunch.ok) return { ok: false, code: "relaunch_unavailable", message: `The resume command could not be built: ${relaunch.error}. Nothing was stopped.` };
     const relaunchHome = envAssignment(relaunch.command, "CODEX_HOME")
@@ -1186,9 +1230,54 @@ export function procCmdlineArgv(raw: Buffer | string): string[] | null {
   return words.length > 0 ? words : null;
 }
 
+/** The OS reads behind macOS process facts; tests inject them. */
+export interface DarwinProcessReads {
+  /** The exact launch argv and environment from KERN_PROCARGS2 (readNativeProcessLaunch); null when unreadable. */
+  launch(pid: number): Promise<{ argv: string[]; env: Record<string, string> } | null>;
+  /** `lsof -a -p <pid> -d cwd,txt -Ffn` output, run in a UTF-8 locale. */
+  lsof(pid: number): Promise<string>;
+  isDirectory(path: string): boolean;
+}
+
+// lsof prints only what isprint(3)/iswprint(3) call printable in its own locale, and escapes the rest (`\xc3\xa9` for é).
+// A daemon started with no locale (launchd, a supervisor, a CI runner) would escape every accented name, so lsof is given
+// a UTF-8 locale of its own: en_US.UTF-8 ships with every macOS.
+const darwinReads: DarwinProcessReads = {
+  launch: readNativeProcessLaunch,
+  async lsof(pid) {
+    return (await execFileAsync("/usr/sbin/lsof", ["-a", "-p", String(pid), "-d", "cwd,txt", "-Ffn"],
+      { timeout: 2000, maxBuffer: 64 * 1024, env: { ...process.env, LC_ALL: "en_US.UTF-8" } })).stdout;
+  },
+  isDirectory(path) { try { return fs.statSync(path).isDirectory(); } catch { return false; } },
+};
+
+/** macOS has no /proc. The exact argv and environment are the process's own launch record (KERN_PROCARGS2, the same read
+ *  #2212's identity checks use), kept to CODEX_HOME and HOME; the cwd and the executable (the first txt file) come from
+ *  lsof. Null when the launch record can't be read; a cwd or executable lsof can't give is null. */
+export async function darwinProcessFacts(pid: number, reads: DarwinProcessReads = darwinReads): Promise<ProcessFacts | null> {
+  const launch = await reads.launch(pid);
+  if (!launch) return null;
+  const env: ProcessFacts["env"] = {};
+  for (const key of ["CODEX_HOME", "HOME"] as const) if (launch.env[key] !== undefined) env[key] = launch.env[key];
+  let cwd: string | null = null, exe: string | null = null;
+  try {
+    let fd = "";
+    for (const line of (await reads.lsof(pid)).split("\n")) {
+      if (line.startsWith("f")) fd = line.slice(1);
+      else if (line.startsWith("n") && fd === "cwd" && cwd === null) cwd = line.slice(1);
+      else if (line.startsWith("n") && fd === "txt" && exe === null) exe = line.slice(1);
+    }
+  } catch { /* unknown: the restart refuses where it needs the cwd */ }
+  // lsof still escapes a name that isn't printable UTF-8 (a control character, an invalid byte), so only a path that is
+  // that directory is the cwd.
+  if (cwd !== null && !reads.isDirectory(cwd)) cwd = null;
+  return { cwd, exe, env, argv: launch.argv };
+}
+
 export function defaultInPlaceRestartIo(): InPlaceRestartIo {
   return {
     async readProcess(pid) {
+      if (process.platform === "darwin") return darwinProcessFacts(pid);
       try {
         const environ = fs.readFileSync(`/proc/${pid}/environ`);
         const env: ProcessFacts["env"] = {};

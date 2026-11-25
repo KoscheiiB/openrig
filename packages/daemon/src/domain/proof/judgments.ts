@@ -15,6 +15,8 @@ export interface Evidence { ref: string; sha256: string }
 export interface Judgment {
   version: 1; sequence: number; scope: string; id: string; operationId: string;
   itemId: string; itemRevision: string; policyRevision: string; policySource: string;
+  /** The policy's everyJudge when recorded (#3621). Receipts without it stay bound to the whole policy revision. */
+  policyEveryJudge?: boolean;
   previous: string | null; actor: string; provenance: string; at: string;
   verdict: JudgmentVerdict; reason: string; evidence: Evidence[];
   subject: { kind: "artifact" | "commit" | "patch-equivalent"; ref: string; comparison?: string };
@@ -24,18 +26,33 @@ export interface ItemReadiness {
   id: string; text: string; revision: string; index: number; source: { file: string; line: number };
   state: "accepted" | "pending" | "rejected" | "withdrawn" | "unknown";
   reason: string; judgment: Judgment | null;
+  /** Each judge the policy names: its own latest receipt on this item, evaluated now. `decides` says whether that receipt
+   *  counts toward the item's state: every judge's under `everyJudge`, otherwise only the item's latest receipt. */
+  judges: JudgeReadiness[];
+}
+export interface JudgeReadiness {
+  actor: string; state: ItemReadiness["state"]; reason: string; sequence: number | null; decides: boolean;
 }
 export interface ScopeReadiness {
   configured: boolean; revision: string; state: "ready" | "not-ready" | "unknown" | "legacy";
   history: Array<{ ref: string; id: string; itemId: string; verdict: JudgmentVerdict; previous: string | null }>;
-  items: ItemReadiness[]; issues: string[]; policy: { judges: string[]; source: string; revision: string } | null;
+  items: ItemReadiness[]; issues: string[]; policy: { judges: string[]; everyJudge: boolean; source: string; revision: string } | null;
   /** Input for S04 attention consumers; no timer or delivery is implied. */
   attention: { scope: string; revision: string };
 }
+export type DependsOnBasis = "slice.yaml" | "frontmatter-advisory" | "frontmatter-unparsed" | "not-recorded";
 export interface MissionReadiness {
   revision: string; state: ScopeReadiness["state"]; issues: string[];
-  slices: Array<{ scope: string; id: string; readiness: ScopeReadiness; dependsOn: string[]; eligible: boolean | null }>;
+  /** `dependsOnBasis` says where `dependsOn` came from (EC-1): `slice.yaml` is its recorded list, `[]` included;
+   *  `frontmatter-advisory` means only the SPEC frontmatter lists edges, which readiness treats as advisory build order;
+   *  `frontmatter-unparsed` means only the SPEC frontmatter lists them, in a form EC-1 doesn't define (not an inline JSON
+   *  array); `not-recorded` means no order is recorded (INDETERMINATE). In the last three, eligibility assumes no recorded
+   *  edges. */
+  slices: Array<{ scope: string; id: string; readiness: ScopeReadiness; dependsOn: string[]; dependsOnBasis: DependsOnBasis; eligible: boolean | null }>;
   historicalStatus: string | null;
+  /** How many composition members are active. `not-ready` with 0 means the mission has no active work (#3614), not work
+   *  that isn't ready; `unknown` and `legacy` keep their own readings. */
+  activeSlices: number;
 }
 export class JudgmentError extends Error {
   constructor(public code: string, message: string, public status = 400) { super(message); }
@@ -79,10 +96,13 @@ function policyOf(dir: string, io: ScopeFsDeps, readManifest = manifest, rootOve
       const file = path.join(p, name), doc = readManifest(io, file);
       if (doc && Object.hasOwn(doc, "proofPolicy")) {
         const policy = mapping(doc.proofPolicy, `${file}: proofPolicy`);
-        if (Object.keys(policy).some(k => k !== "judges")) throw new JudgmentError("policy_invalid", `${file}: proofPolicy supports judges only`);
+        if (Object.keys(policy).some(k => k !== "judges" && k !== "everyJudge")) throw new JudgmentError("policy_invalid", `${file}: proofPolicy supports judges and everyJudge only`);
         if (!Array.isArray(policy.judges) || !policy.judges.length || policy.judges.some(x => typeof x !== "string" || !x.trim())) throw new JudgmentError("policy_invalid", `${file}: proofPolicy.judges must name authorized actors`);
-        const judges = [...new Set(policy.judges as string[])].sort();
-        return { judges, source: file, revision: hash(judges) };
+        if (policy.everyJudge !== undefined && typeof policy.everyJudge !== "boolean") throw new JudgmentError("policy_invalid", `${file}: proofPolicy.everyJudge must be true or false`);
+        const judges = [...new Set(policy.judges as string[])].sort(), everyJudge = policy.everyJudge === true;
+        // The default keeps the revision it always had, so judgments recorded before everyJudge existed stay current.
+        // Requiring every judge is a different policy: its revision differs, so earlier receipts can't certify it.
+        return { judges, everyJudge, source: file, revision: everyJudge ? hash({ judges, everyJudge }) : hash(judges) };
       }
     }
     if (p === root) return null;
@@ -128,12 +148,13 @@ function ledger(dir: string, io: ScopeFsDeps): Judgment[] {
     const expected = `${String(receipts.length + 1).padStart(8, "0")}.md`;
     if (name !== expected) throw new JudgmentError("journal_conflict", `${home}: expected ${expected}, found ${name}; inspect retained receipts`);
     const raw = io.readFile(path.join(home, name));
-    const fm = raw && /^---\n([\s\S]*?)\n---(?:\n|$)/.exec(raw);
+    const fm = raw && /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(raw);
     if (!fm) throw new JudgmentError("journal_invalid", `${home}/${name}: incomplete judgment`);
     const obj = mapping(YAML.parse(fm[1]!), name), { id, ...payload } = obj;
     if (id !== hash(payload) || obj.version !== 1 || obj.sequence !== receipts.length + 1 || typeof obj.itemId !== "string" || typeof obj.itemRevision !== "string" || typeof obj.policyRevision !== "string" || typeof obj.actor !== "string" || typeof obj.operationId !== "string" || typeof obj.intent !== "string" || !["accept", "reject", "withdraw"].includes(String(obj.verdict)) || !Array.isArray(obj.evidence)) throw new JudgmentError("journal_invalid", `${home}/${name}: malformed or changed judgment; inspect history`);
     const subject = mapping(obj.subject, name);
     if ([obj.scope, obj.itemId, obj.itemRevision, obj.policyRevision, obj.policySource, obj.actor, obj.operationId, obj.intent, obj.reason, obj.provenance, obj.at].some(v => typeof v !== "string" || !v.trim()) || !Number.isFinite(Date.parse(String(obj.at))) || !["artifact", "commit", "patch-equivalent"].includes(String(subject.kind)) || typeof subject.ref !== "string" || !subject.ref.trim() || (subject.comparison !== undefined && typeof subject.comparison !== "string") || obj.evidence.some(e => !e || typeof e !== "object" || typeof e.ref !== "string" || !e.ref || typeof e.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(e.sha256))) throw new JudgmentError("journal_invalid", `${home}/${name}: malformed judgment fields`);
+    if (obj.policyEveryJudge !== undefined && typeof obj.policyEveryJudge !== "boolean") throw new JudgmentError("journal_invalid", `${home}/${name}: malformed judgment fields`);
     if (receipts.some(r => r.operationId === obj.operationId)) throw new JudgmentError("journal_conflict", `${home}/${name}: repeated operation identity`);
     const prior = receipts.filter(r => r.itemId === obj.itemId).at(-1);
     if (obj.previous !== (prior?.id ?? null)) throw new JudgmentError("journal_conflict", `${home}/${name}: conflicting correction lineage`);
@@ -141,12 +162,20 @@ function ledger(dir: string, io: ScopeFsDeps): Judgment[] {
   }
   return receipts;
 }
+/** The nearest existing ancestor of an absolute path (the path itself when it exists), or null when none does. The walk
+ *  stops at the root, whose dirname is itself, so a missing drive or share root ends it instead of looping. */
+export function nearestExistingAncestor(p: string, exists: (p: string) => boolean = fs.existsSync): string | null {
+  for (let at = p; ; at = path.dirname(at)) {
+    if (exists(at)) return at;
+    if (path.dirname(at) === at) return null;
+  }
+}
 function contained(root: string, target: string): string {
   const base = fs.realpathSync(root), requested = path.resolve(root, target);
   // Resolve the nearest existing ancestor so platform aliases and symlink parents
   // are judged at the real boundary, including a not-yet-created receipt leaf.
-  let existing = requested;
-  while (!fs.existsSync(existing)) existing = path.dirname(existing);
+  const existing = nearestExistingAncestor(requested);
+  if (existing === null) throw new JudgmentError("path_escape", `Path escapes ${base}; paths must stay within the selected workspace`);
   const full = path.resolve(fs.realpathSync(existing), path.relative(existing, requested));
   if (full !== base && !full.startsWith(base + path.sep)) throw new JudgmentError("path_escape", `Path escapes ${base}; paths must stay within the selected workspace`);
   return full;
@@ -181,35 +210,53 @@ export function readSliceReadiness(dir: string, io: ScopeFsDeps = proofFs, readP
     items = promises.map(p => {
       const scope = path.relative(scopeRoot, dir).split(path.sep).join("/");
       const revision = hash([scope, p.id, p.text, policy?.revision ?? null]);
+      // `judgment` stays the item's latest receipt from any judge: corrections chain on it.
       const judgment = receipts.filter(r => r.itemId === p.id).at(-1) ?? null;
+      const evaluate = (j: Judgment): [ItemReadiness["state"], string] => {
+        // #3621: the item binds to the policy revision it was judged under, so a policy edit that keeps the actor listed and
+        // everyJudge as it was (adding a judge, say) leaves it current. Receipts that don't record everyJudge need the
+        // whole revision unchanged, as before.
+        const policyBound = !!policy && (j.policyRevision === policy.revision || j.policyEveryJudge === policy.everyJudge);
+        if (!policy || !policyBound || j.scope !== scope || j.itemRevision !== hash([scope, p.id, p.text, j.policyRevision])) return ["unknown", "Scope, item or policy changed; record a judgment on the current revision"];
+        if (!policy.judges.includes(j.actor)) return ["unknown", "Judgment actor is outside the selected policy"];
+        if (j.verdict !== "accept") return [j.verdict === "reject" ? "rejected" : "withdrawn", j.reason];
+        const valid = j.evidence.length > 0 && j.evidence.every(e => {
+          if (!e || typeof e.ref !== "string" || typeof e.sha256 !== "string") return false;
+          try {
+            const address = parseAddress(e.ref), file = path.resolve(scopeRoot, address.ref);
+            observe?.(file);
+            if (io.readBytes) contained(scopeRoot, file);
+            const bytes = io.readBytes ? io.readBytes(file) : io.readFile(file);
+            if (bytes === null) return false;
+            const addressed = address.headerPath.length ? resolveAddress(typeof bytes === "string" ? bytes : Buffer.from(bytes).toString("utf8"), address.headerPath).text : bytes;
+            return createHash("sha256").update(addressed).digest("hex") === e.sha256;
+          } catch { return false; }
+        });
+        return valid ? ["accepted", j.reason] : ["unknown", "Evidence missing or changed; inspect the retained judgment"];
+      };
+      const judges: JudgeReadiness[] = (policy?.judges ?? []).map(actor => {
+        const own = receipts.filter(r => r.itemId === p.id && r.actor === actor).at(-1);
+        const [state, reason] = own ? evaluate(own) : ["pending" as const, "No judgment from this judge"];
+        return { actor, state, reason, sequence: own?.sequence ?? null, decides: !!own && (policy!.everyJudge || own.id === judgment?.id) };
+      });
       let state: ItemReadiness["state"] = "pending", reason = "No current attributed judgment";
-      if (judgment) {
-        if (!policy || judgment.scope !== scope || judgment.itemRevision !== revision || judgment.policyRevision !== policy.revision) { state = "unknown"; reason = "Scope, item or policy changed; record a judgment on the current revision"; }
-        else if (judgment.verdict !== "accept") { state = judgment.verdict === "reject" ? "rejected" : "withdrawn"; reason = judgment.reason; }
-        else if (!policy.judges.includes(judgment.actor)) { state = "unknown"; reason = "Judgment actor is outside the selected policy"; }
-        else {
-          const valid = judgment.evidence.length > 0 && judgment.evidence.every(e => {
-            if (!e || typeof e.ref !== "string" || typeof e.sha256 !== "string") return false;
-            try {
-              const address = parseAddress(e.ref), file = path.resolve(scopeRoot, address.ref);
-              observe?.(file);
-              if (io.readBytes) contained(scopeRoot, file);
-              const bytes = io.readBytes ? io.readBytes(file) : io.readFile(file);
-              if (bytes === null) return false;
-              const addressed = address.headerPath.length ? resolveAddress(typeof bytes === "string" ? bytes : Buffer.from(bytes).toString("utf8"), address.headerPath).text : bytes;
-              return createHash("sha256").update(addressed).digest("hex") === e.sha256;
-            } catch { return false; }
-          });
-          state = valid ? "accepted" : "unknown"; reason = valid ? judgment.reason : "Evidence missing or changed; inspect the retained judgment";
-        }
-      }
-      return { ...p, revision, state, reason, judgment };
+      if (policy?.everyJudge) {
+        // #2765: each judge the policy names needs its own current acceptance. One judge's accept can't hide another's
+        // reject, withdraw, missing judgment or stale evidence: the worst disposition among them is the item's.
+        const worst = (["rejected", "unknown", "withdrawn", "pending"] as const).find(s => judges.some(j => j.state === s));
+        if (!worst) { state = "accepted"; reason = `Accepted by every judge: ${judges.map(j => j.actor).join(", ")}`; }
+        else if (worst === "pending") { state = "pending"; reason = `Waiting on ${judges.filter(j => j.state === "pending").map(j => j.actor).join(", ")}`; }
+        else { const by = judges.find(j => j.state === worst)!; state = worst; reason = `${by.actor}: ${by.reason}`; }
+      } else if (judgment) [state, reason] = evaluate(judgment);
+      return { ...p, revision, state, reason, judgment, judges };
     });
     if (policy && !items.length) issues.push("No authored proof contract");
   } catch (e) { issues.push(e instanceof Error ? e.message : String(e)); }
   const configured = policy !== null || io.exists(path.join(dir, "proof", "judgments")) || (!policyRead && issues.length > 0);
   const state = issues.length ? "unknown" : !configured ? "legacy" : items.some(i => i.state === "unknown") ? "unknown" : items.length && items.every(i => i.state === "accepted") ? "ready" : "not-ready";
-  const revision = hash([policy?.revision, items, issues]);
+  // The per-judge view is derived from the same receipts and adds nothing the state doesn't, so it stays out of the
+  // revision: a wait or watcher that recorded a revision before it existed still sees the same one.
+  const revision = hash([policy?.revision, items.map(({ judges: _judges, ...item }) => item), issues]);
   const history = receipts.map(r => ({ ref: `${r.scope}/proof/judgments/${String(r.sequence).padStart(8, "0")}.md`, id: r.id, itemId: r.itemId, verdict: r.verdict, previous: r.previous }));
   return { configured, revision, state, history, items, issues, policy, attention: { scope: dir, revision } };
 }
@@ -270,7 +317,7 @@ export function recordJudgment(missionsRoot: string, input: JudgeInput, actor: s
   }
   const latest = receipts.filter(r => r.itemId === item.id).at(-1);
   if (input.expectedRevision !== item.revision || input.expectedPrevious !== (latest?.id ?? null)) throw new JudgmentError("revision_conflict", "Item or correction changed; inspect rig proof show and judge the current evidence", 409);
-  const payload = { version: 1 as const, scope: path.relative(root, dir).split(path.sep).join("/"), sequence: receipts.length + 1, operationId, itemId: item.id, itemRevision: item.revision, policyRevision: current.policy.revision, policySource: path.relative(root, current.policy.source), previous: latest?.id ?? null, actor, provenance, at: new Date().toISOString(), verdict: input.verdict, reason: input.reason, evidence, subject, intent };
+  const payload = { version: 1 as const, scope: path.relative(root, dir).split(path.sep).join("/"), sequence: receipts.length + 1, operationId, itemId: item.id, itemRevision: item.revision, policyRevision: current.policy.revision, policySource: path.relative(root, current.policy.source), policyEveryJudge: current.policy.everyJudge, previous: latest?.id ?? null, actor, provenance, at: new Date().toISOString(), verdict: input.verdict, reason: input.reason, evidence, subject, intent };
   const judgment: Judgment = { ...payload, id: hash(payload) };
   const home = contained(root, path.join(dir, "proof", "judgments"));
   fs.mkdirSync(home, { recursive: true });
@@ -281,8 +328,13 @@ export function recordJudgment(missionsRoot: string, input: JudgeInput, actor: s
   try {
     try { fs.writeFileSync(fd, `---\n${YAML.stringify(judgment)}---\n\n${input.reason}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.linkSync(temporary, target);
-    const directory = fs.openSync(home, "r");
-    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    // Node cannot fsync an opened directory on Windows (EPERM). The receipt's
+    // contents are already synced before exclusive publication; Windows does
+    // not provide the directory durability guarantee used on POSIX here.
+    if (process.platform !== "win32") {
+      const directory = fs.openSync(home, "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    }
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new JudgmentError("revision_conflict", "Another writer committed first; inspect current readiness", 409);
     throw e;
@@ -301,13 +353,14 @@ export function readMissionReadiness(missionDir: string, readPolicy: ProofPolicy
   const issues: string[] = [], slices: MissionReadiness["slices"] = [];
   // #1280: each member's directory, for reading its declared node identity only when a dependency needs it.
   const dirs = new Map<MissionReadiness["slices"][number], string>();
-  let historicalStatus: string | null = null;
+  let historicalStatus: string | null = null, activeSlices = 0;
   try {
     const doc = manifest(io, path.join(missionDir, "mission.yaml"));
-    if (!doc) return { revision: hash("legacy"), state: "legacy", slices, issues, historicalStatus };
+    if (!doc) return { revision: hash("legacy"), state: "legacy", slices, issues, historicalStatus, activeSlices };
     const metadata = doc.metadata != null ? mapping(doc.metadata, "mission metadata") : {};
     historicalStatus = typeof metadata.status === "string" ? metadata.status : null;
     const members = validateMissionComposition(doc, path.join(missionDir, "mission.yaml")).filter(m => m.active);
+    activeSlices = members.length;
     for (const member of members) {
       const dir = path.dirname(member.path), data = manifest(io, member.path);
       const execution = data?.execution as { depends_on?: unknown } | undefined;
@@ -315,7 +368,10 @@ export function readMissionReadiness(missionDir: string, readPolicy: ProofPolicy
       if (!Array.isArray(depends) || depends.some(x => typeof x !== "string")) throw new JudgmentError("dependencies_invalid", `${member.path}: execution.depends_on must be a list`);
       const id = (data?.metadata as { id?: unknown } | undefined)?.id ?? path.basename(dir);
       if (typeof id !== "string" || !id || slices.some(s => s.id === id)) throw new JudgmentError("dependency_identity", `${member.path}: missing or repeated slice identity`);
-      const slice = { scope: path.basename(dir), id, readiness: readSliceReadiness(dir, io, readPolicy, root, observe), dependsOn: depends as string[], eligible: null };
+      const listed = execution?.depends_on != null ? null : frontmatterDependsOn(dir, io);
+      const dependsOnBasis: DependsOnBasis = execution?.depends_on != null ? "slice.yaml"
+        : listed === "json" ? "frontmatter-advisory" : listed === "other" ? "frontmatter-unparsed" : "not-recorded";
+      const slice = { scope: path.basename(dir), id, readiness: readSliceReadiness(dir, io, readPolicy, root, observe), dependsOn: depends as string[], dependsOnBasis, eligible: null };
       slices.push(slice);
       dirs.set(slice, dir);
     }
@@ -348,7 +404,24 @@ export function readMissionReadiness(missionDir: string, readPolicy: ProofPolicy
     for (const s of slices) s.eligible = visit(s);
   } catch (e) { issues.push(e instanceof Error ? e.message : String(e)); for (const s of slices) s.eligible = null; }
   const state = issues.length || slices.some(s => ["unknown", "legacy"].includes(s.readiness.state)) ? "unknown" : slices.length && slices.every(s => s.readiness.state === "ready") ? "ready" : "not-ready";
-  return { revision: hash([slices, issues, historicalStatus]), state, slices, issues, historicalStatus };
+  return { revision: hash([slices, issues, historicalStatus]), state, slices, issues, historicalStatus, activeSlices };
+}
+
+/** How a work node's authored file lists `depends_on:`: as EC-1's inline JSON array (`[]` included), in another form (a
+ *  non-empty value that isn't a JSON array, or `- item` lines under an empty value), or not at all. Only reports the
+ *  form; nothing here reads it as edges. */
+function frontmatterDependsOn(dir: string, io: ScopeFsDeps): "json" | "other" | null {
+  try {
+    const node = resolveNodeFileVia(dir, p => io.readFile(p));
+    const raw = node ? parseFrontmatter(node.content)["depends_on"] : undefined;
+    if (typeof raw !== "string") return null;
+    try { if (Array.isArray(JSON.parse(raw))) return "json"; } catch { /* not JSON */ }
+    if (raw.trim() !== "") return "other";
+    const frontmatter = node!.content.split(/\n---/)[0] ?? "";
+    return /^[ \t]*depends_on:[ \t]*\r?\n[ \t]*-[ \t]*\S/m.test(frontmatter) ? "other" : null;
+  } catch {
+    return null;
+  }
 }
 
 /** The `id:` a work node's authored file declares, or null when it declares none or can't be read. */
@@ -366,6 +439,25 @@ function declaredNodeId(dir: string): string | null {
  *  from them); it defaults to the ordinary filesystem reader and changes nothing about the evaluation. */
 export function readProjectReadiness(missionsRoot: string, readPolicy: ProofPolicyRead = defaultPolicyRead, root?: string, io: ScopeFsDeps = proofFs, observe?: (file: string) => void) {
   const missions = fs.readdirSync(missionsRoot).filter(n => fs.statSync(path.join(missionsRoot, n)).isDirectory()).map(name => ({ name, ...readMissionReadiness(contained(missionsRoot, path.join(missionsRoot, name)), readPolicy, root, io, observe) }));
+  return projectReadiness(missions);
+}
+
+/** The same semantic read, yielding between missions for daemon requests and source-watch refreshes.
+ * A single mission (including its evidence) is still synchronous; this is not a hard time bound or atomic snapshot. */
+export async function readProjectReadinessAsync(missionsRoot: string, readPolicy: ProofPolicyRead = defaultPolicyRead, root?: string, io: ScopeFsDeps = proofFs, observe?: (file: string) => void) {
+  const names = fs.readdirSync(missionsRoot).filter(n => fs.statSync(path.join(missionsRoot, n)).isDirectory());
+  const missions: Array<MissionReadiness & { name: string }> = [];
+  for (const name of names) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    missions.push({ name, ...readMissionReadiness(contained(missionsRoot, path.join(missionsRoot, name)), readPolicy, root, io, observe) });
+  }
+  return projectReadiness(missions);
+}
+
+function projectReadiness(missions: Array<MissionReadiness & { name: string }>) {
   const active = missions.filter(m => ["active", "release-candidate"].includes(m.historicalStatus ?? ""));
-  return { revision: hash(active), state: active.length && active.every(m => m.state === "ready") ? "ready" : active.some(m => m.state === "unknown") ? "unknown" : "not-ready", missions, basis: "Active mission readiness; distinct outcome judgment and publication remain separate" };
+  // `activeSlices` derives from `slices`, so the revision hashes each mission without it, as before (#3614).
+  const revision = hash(active.map(({ activeSlices, ...mission }) => mission));
+  // `not-ready` with `activeMissions: 0` means no mission is active or a release candidate, not work that isn't ready.
+  return { revision, state: active.length && active.every(m => m.state === "ready") ? "ready" : active.some(m => m.state === "unknown") ? "unknown" : "not-ready", missions, activeMissions: active.length, basis: "Active mission readiness; distinct outcome judgment and publication remain separate" };
 }

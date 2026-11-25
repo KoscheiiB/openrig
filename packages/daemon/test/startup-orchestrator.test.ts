@@ -1,3 +1,4 @@
+import { ActivityGrantStore } from "../src/domain/activity-grants.js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
@@ -5,7 +6,7 @@ import { SessionRegistry, sessionCommunityHarnessSelect, sessionCommunityRunnerS
 import { COMMUNITY_HARNESS_RUNG_INVENTORY, COMMUNITY_RUNNER_RUNG_INVENTORY, runtimeRungInventory } from "../src/domain/activity-taxonomy.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
-import { StartupOrchestrator, isRecoverableStartupFailure, type StartupInput, type StartupResult } from "../src/domain/startup-orchestrator.js";
+import { StartupOrchestrator, getLatestStartupFailedEvent, isRecoverableStartupFailure, type StartupInput, type StartupResult } from "../src/domain/startup-orchestrator.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { SessionTransport } from "../src/domain/session-transport.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
@@ -48,7 +49,9 @@ function mockTmux(overrides?: Partial<TmuxAdapter>): TmuxAdapter {
     killSession: vi.fn(async () => ({ ok: true as const })),
     listSessions: vi.fn(async () => []),
     listWindows: vi.fn(async () => []),
-    listPanes: vi.fn(async () => []),
+    listPanes: vi.fn(async () => [{ id: "%1", index: 0, cwd: "/project", width: 80, height: 24, active: true }]),
+    getPanePid: vi.fn(async () => 4242),
+    getPaneCommand: vi.fn(async () => "claude"),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
     capturePaneContent: vi.fn(async () => "❯ \n────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)\n"),
     ...overrides,
@@ -134,6 +137,12 @@ describe("StartupOrchestrator", () => {
         resolveOne: () => ({ value: 30, source: "default", defaultValue: 30 }),
       } as unknown as Pick<SettingsStore, "resolveOne">),
       sleep: async () => {},
+      listProcesses: async () => {
+        const latest = sessionRegistry.getSessionsForRig(rigRepo.listRigs()[0]?.id ?? "").at(-1);
+        const argv = latest?.resumeToken ? ["codex", "resume", latest.resumeToken] : ["codex"];
+        return [{ pid: 4242, ppid: 1, pgid: 4242, tpgid: 4242, executableName: "codex",
+          command: argv.join(" "), argv, startedAt: "Sat Jan  1 12:00:00 2000" }];
+      },
     });
   }
 
@@ -159,6 +168,40 @@ describe("StartupOrchestrator", () => {
       ...overrides,
     };
   }
+
+  it.each([false, true])("revokes its exact run grant on later readiness failure, replacement=%s", async replace => {
+    const seed = seedSession();
+    db.prepare("UPDATE nodes SET runtime = 'pi' WHERE id = ?").run(seed.nodeId);
+    db.prepare("INSERT INTO bindings (id,node_id,tmux_session,tmux_pane) VALUES ('bound',?,'r01-impl','%1')").run(seed.nodeId);
+    const grants = new ActivityGrantStore(db);
+    const issue = (runId: string) => grants.issue({ nodeId: seed.nodeId, generation: sessionRegistry.currentOccupantTenure(seed.nodeId)!.generationUuid,
+      issuedBy: "launch", run: { runId, sessionId: seed.sessionId, binding: { runtime: "pi", runner: 0, pane: "%1", panePid: 101 } } });
+    const first = issue("first"); grants.activate(first.grantId);
+    let replacement: ReturnType<typeof issue> | undefined;
+    const adapter = mockAdapter({ runtime: "pi", launchHarness: vi.fn(async () => ({ ok: true, activityGrantId: first.grantId })),
+      checkReady: vi.fn(async () => { if (replace) { replacement = issue("replacement"); grants.activate(replacement.grantId); } throw new Error("readiness unavailable"); }) });
+    const result = await createOrchestrator().startNode(makeInput(seed, { adapter,
+      binding: { ...makeBinding(), nodeId: seed.nodeId, tmuxPane: "%1" } }));
+    expect(result.startupStatus).toBe("failed");
+    expect(grants.get(first.grantId)?.revokedAt).not.toBeNull();
+    if (replacement) expect(grants.standing(replacement.grantId)).toBe("current");
+  });
+
+  it("revokes its run when context delivery reveals a definitive readiness gate", async () => {
+    const seed = seedSession();
+    db.prepare("UPDATE nodes SET runtime = 'pi' WHERE id = ?").run(seed.nodeId);
+    db.prepare("INSERT INTO bindings (id,node_id,tmux_session,tmux_pane) VALUES ('bound',?,'r01-impl','%1')").run(seed.nodeId);
+    const grants = new ActivityGrantStore(db);
+    const grant = grants.issue({ nodeId: seed.nodeId, generation: sessionRegistry.currentOccupantTenure(seed.nodeId)!.generationUuid,
+      issuedBy: "launch", run: { runId: "first", sessionId: seed.sessionId, binding: { runtime: "pi", runner: 0, pane: "%1", panePid: 101 } } });
+    grants.activate(grant.grantId);
+    const adapter = mockAdapter({ runtime: "pi", launchHarness: vi.fn(async () => ({ ok: true, activityGrantId: grant.grantId })),
+      checkReady: vi.fn().mockResolvedValueOnce({ ready: true }).mockResolvedValue({ ready: false, code: "login_required", reason: "login needed" }) });
+    const result = await createOrchestrator().startNode(makeInput(seed, { adapter, startupActions: [makeAction({ type: "send_text", value: "startup text" })],
+      binding: { ...makeBinding(), nodeId: seed.nodeId, tmuxPane: "%1" } }));
+    expect(result.startupStatus).toBe("attention_required");
+    expect(grants.get(grant.grantId)?.revokedAt).not.toBeNull();
+  });
 
   it("community contract: launch surfaces undelivered startup files without placing or pasting them", async () => {
     const root = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "community-startup-files-"));
@@ -250,7 +293,7 @@ describe("StartupOrchestrator", () => {
     } finally { nodeFs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(["codex-first-login.txt", "codex-first-login-0.162.1.txt"])("persists %s as attention and withholds startup context", async (fixture) => {
+  it.each(["codex-first-login.txt", "codex-first-login-0.162.1.txt", "codex-first-login-0.171.0.txt"])("persists %s as attention and withholds startup context", async (fixture) => {
     const seed = seedSession();
     db.prepare("UPDATE nodes SET runtime = 'codex' WHERE id = ?").run(seed.nodeId);
     const firstLoginPrompt = nodeFs.readFileSync(new URL(`./fixtures/${fixture}`, import.meta.url), "utf8");
@@ -274,6 +317,7 @@ describe("StartupOrchestrator", () => {
     expect(result.startupStatus).toBe("attention_required");
     expect(result.errors.join("\n")).toMatch(/sign in/i);
     expect(result.errors.join("\n")).not.toContain("Readiness timeout");
+    expect(result.errors.join("\n")).toContain("Open this seat's terminal and complete Codex's sign-in prompt.");
     expect(adapter.launchHarness).toHaveBeenCalledTimes(1);
     expect(adapter.checkReady).toHaveBeenCalledTimes(1);
     expect(vi.mocked(adapter.deliverStartup).mock.calls.flatMap(([files]) => files)).toEqual([]);
@@ -1063,7 +1107,7 @@ describe("StartupOrchestrator", () => {
       opts?.resuming ? { file: null } : { file: null, launchInstructions: true });
     const adapter = mockAdapter({ runtime: "codex", guidanceFileFor } as never);
     expect((await orch.startNode(makeInput(seed, { adapter }))).ok).toBe(true);
-    expect(guidanceFileFor).toHaveBeenLastCalledWith(expect.anything(), { resuming: false });
+    expect(guidanceFileFor).toHaveBeenLastCalledWith(expect.anything(), { resuming: false, resumingConversation: false });
     const chosen = { guidanceFile: null, guidanceLaunchInstructions: true };
     expect(vi.mocked(adapter.project).mock.calls[0]?.[1]).toMatchObject(chosen);
     expect(vi.mocked(adapter.deliverStartup).mock.calls[0]?.[1]).toMatchObject(chosen);
@@ -1071,8 +1115,29 @@ describe("StartupOrchestrator", () => {
     expect((db.prepare("SELECT guidance_file FROM node_startup_context WHERE node_id=?").get(seed.nodeId) as { guidance_file: string | null }).guidance_file).toBeNull();
     vi.mocked(adapter.project).mockClear();
     expect((await orch.startNode(makeInput(seed, { adapter, resumeToken: "native-original" }))).ok).toBe(true);
-    expect(guidanceFileFor).toHaveBeenLastCalledWith(expect.anything(), { resuming: true });
+    expect(guidanceFileFor).toHaveBeenLastCalledWith(expect.anything(), { resuming: true, resumingConversation: true });
     expect(vi.mocked(adapter.project).mock.calls[0]?.[1]).not.toMatchObject({ guidanceLaunchInstructions: true });
+  });
+
+  // A restore or `rig up --existing` resumes the seat's own conversation: with a saved repository choice it learns only
+  // whether its launch carries the guidance, so a supported Codex keeps it out of the tracked AGENTS.md. The saved file
+  // never changes, and a fork or a continuation isn't asked.
+  it("a resume with a saved repository choice asks only whether its launch carries the guidance, and keeps the saved file", async () => {
+    const seed = seedSession(); const orch = createOrchestrator();
+    const guidanceFileFor = vi.fn(async (_binding: NodeBinding, opts?: { resuming?: boolean; resumingConversation?: boolean }) =>
+      opts?.resuming && !opts.resumingConversation ? { file: null } : { file: "/elsewhere/AGENTS.md", launchInstructions: true });
+    const adapter = mockAdapter({ runtime: "codex", guidanceFileFor } as never);
+    const saved = { ...makeBinding(), guidanceFile: null } as NodeBinding;
+    expect((await orch.startNode(makeInput(seed, { adapter, isRestore: true, resumeToken: "native-original", binding: saved }))).ok).toBe(true);
+    expect(guidanceFileFor).toHaveBeenLastCalledWith(expect.anything(), { resuming: true, resumingConversation: true });
+    for (const call of [vi.mocked(adapter.project).mock.calls[0]?.[1], vi.mocked(adapter.deliverStartup).mock.calls[0]?.[1], vi.mocked(adapter.launchHarness).mock.calls[0]?.[0]]) {
+      expect(call).toMatchObject({ guidanceFile: null, guidanceLaunchInstructions: true });
+    }
+    // A fork, or a seat whose saved choice is its own file, isn't asked.
+    guidanceFileFor.mockClear();
+    expect((await orch.startNode(makeInput(seed, { adapter, isRestore: true, resumeToken: "native-original", binding: { ...saved, guidanceFile: "/state/agent/AGENTS.md" } as NodeBinding }))).ok).toBe(true);
+    expect((await orch.startNode(makeInput(seed, { adapter, isRestore: true, forkSource: { kind: "native_id", value: "parent-1" }, binding: saved }))).ok).toBe(true);
+    expect(guidanceFileFor).not.toHaveBeenCalled();
   });
 
   it("exact resume retains configured fresh context while sending no replay", async () => {
@@ -2206,6 +2271,64 @@ describe("StartupOrchestrator", () => {
       expect(deriveOriented(db, seed.nodeId)).toBe("missing");
     });
 
+    it.each(["bundled", "standalone"] as const)("skips the reminder when Claude submits the %s challenge before the reminder", async prompt => {
+      const seed = seedSession();
+      const store = new AgentActivityStore({ db, eventBus });
+      let staged = "";
+      const sendText = vi.fn(async (_session: string, text: string) => {
+        staged = text;
+        return { ok: true as const };
+      });
+      const sendKeys = vi.fn(async () => {
+        const [command, challengeId, answer] = staged.match(/rig startup-proof submit --challenge-id (\w+) --answer (\w+)/) ?? [];
+        if (command) {
+          expect(verifyStartupProof({ store, eventBus }, { nodeId: seed.nodeId, challengeId, answer }).ok).toBe(true);
+        }
+        return { ok: true as const };
+      });
+      const startupActions = prompt === "bundled" ? challengeAndIdentity() : challengeAndIdentity().slice(0, 1);
+      const result = await createOrchestrator({ tmux: mockTmux({ sendText, sendKeys }) }).startNode(makeInput(seed, { startupActions }));
+
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready" });
+      expect(deriveOriented(db, seed.nodeId)).toBe("verified");
+      expect(sendText.mock.calls.map(([, text]) => text)).not.toContain(STARTUP_PROOF_INSTRUCTION_LINE);
+    });
+
+    it("skips the reminder when Claude proves the challenge during the pre-paste readiness check", async () => {
+      const seed = seedSession();
+      const store = new AgentActivityStore({ db, eventBus });
+      const sendText = vi.fn(async (_session: string, _text: string) => ({ ok: true as const }));
+      let promptObserved = false;
+      const capturePaneContent = vi.fn(async () => {
+        promptObserved = true;
+        return "❯ \n────────────────────\n⏵⏵ accept edits on (shift+tab to cycle)\n";
+      });
+      const adapter = mockAdapter({ checkReady: vi.fn(async () => {
+        if (promptObserved && deriveOriented(db, seed.nodeId) === "missing") {
+          const [, challengeId, answer] = sendText.mock.calls[0]![1]
+            .match(/rig startup-proof submit --challenge-id (\w+) --answer (\w+)/)!;
+          expect(verifyStartupProof({ store, eventBus }, { nodeId: seed.nodeId, challengeId, answer }).ok).toBe(true);
+        }
+        return { ready: true };
+      }) });
+      const result = await createOrchestrator({ tmux: mockTmux({ sendText, capturePaneContent }) })
+        .startNode(makeInput(seed, { adapter, startupActions: challengeAndIdentity() }));
+
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready" });
+      expect(deriveOriented(db, seed.nodeId)).toBe("verified");
+      expect(sendText.mock.calls.map(([, text]) => text)).not.toContain(STARTUP_PROOF_INSTRUCTION_LINE);
+    });
+
+    it("still sends a reminder when only a previous challenge was verified", async () => {
+      const { seed } = seedVerifiedProof();
+      const sendText = vi.fn(async (_session: string, _text: string) => ({ ok: true as const }));
+      const result = await createOrchestrator({ tmux: mockTmux({ sendText }) }).startNode(makeInput(seed, { startupActions: challengeAndIdentity() }));
+
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready" });
+      expect(deriveOriented(db, seed.nodeId)).toBe("missing");
+      expect(sendText.mock.calls.map(([, text]) => text)).toContain(STARTUP_PROOF_INSTRUCTION_LINE);
+    });
+
     it("sends no line to a Codex seat, which already acts on the pasted challenge", async () => {
       const seed = seedSession();
       const sendText = vi.fn(async (_session: string, _text: string) => ({ ok: true as const }));
@@ -2826,6 +2949,32 @@ describe("StartupOrchestrator", () => {
     const result = await orch.startNode(makeInput(seed, { adapter, readinessTimeoutMs: 100 }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.errors).toEqual([`Readiness timeout after 0.1s — harness did not become interactive: ${notFound}`]);
+  });
+
+  it("#3318 rehearsal: a readiness wait that ends on a return to a shell records that code on the startup failure", async () => {
+    const seed = seedSession();
+    const adapter = mockAdapter({ checkReady: vi.fn(async () => ({ ready: false, reason: "The probe pane returned to a shell instead of staying inside the runtime.", code: "returned_to_shell" })) });
+    const result = await createOrchestrator().startNode(makeInput(seed, { adapter, readinessTimeoutMs: 100 }));
+    expect(result.ok).toBe(false);
+    expect(getLatestStartupFailedEvent(db, seed.nodeId, seed.sessionId)).toMatchObject({ stage: "readiness_check", readinessCode: "returned_to_shell" });
+  });
+
+  it("#3318 rehearsal: a readiness wait that ends while the harness is still starting records that code, not a shell", async () => {
+    const starting = seedSession();
+    const slow = mockAdapter({ checkReady: vi.fn(async () => ({ ready: false, reason: "not yet", code: "awaiting_runtime" })) });
+    await createOrchestrator().startNode(makeInput(starting, { adapter: slow, readinessTimeoutMs: 100 }));
+    expect(getLatestStartupFailedEvent(db, starting.nodeId, starting.sessionId)?.readinessCode).toBe("awaiting_runtime");
+  });
+
+  it("a launch Claude refused under disableSideloadFlags reports the refusal when the readiness wait ends (#3245)", async () => {
+    // A stub adapter returning the Claude adapter's refusal reason: this checks OpenRig's plumbing to the start failure.
+    const refusal = "the pane shows Claude Code's refusal (CLAUDE_CODE_PLUGIN_DIRS is disabled by your organization's managed settings (disableSideloadFlags)). If that line is from this launch, Claude Code's managed settings turn on disableSideloadFlags, which rejects the plugin folders (CLAUDE_CODE_PLUGIN_DIRS) and launch flags OpenRig uses to load this seat's skills and plugins, so this seat can't start while that setting applies.";
+    const seed = seedSession();
+    const adapter = mockAdapter({ checkReady: vi.fn(async () => ({ ready: false, reason: refusal, code: "returned_to_shell" })) });
+    const orch = createOrchestrator();
+    const result = await orch.startNode(makeInput(seed, { adapter, readinessTimeoutMs: 100 }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors).toEqual([`Readiness timeout after 0.1s — harness did not become interactive: ${refusal}`]);
   });
 
   it("a pane back at its shell for another reason still waits for the readiness timeout", async () => {

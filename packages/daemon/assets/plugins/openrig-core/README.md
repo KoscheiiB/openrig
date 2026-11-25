@@ -26,7 +26,7 @@ This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex
   A seat that has OpenRig's activity relay in its own `settings.local.json` (the `claude-activity-hooks` runtime resource)
   already reports activity from there, so the plugin's `activity-relay.cjs` (which the manifest starts with `--from-plugin`)
   exits for an event the seat's settings register it for. It does so only when the entry is exactly the one OpenRig writes
-  (legacy `node` or a quoted absolute Node executable, then one quoted path to
+  (legacy `node` or a quoted absolute Node executable, optionally after one plain leading `exec`, then one quoted path to
   `state/claude-activity-hooks/activity-relay.cjs`), the interpreter is executable, and the script at that path is this same
   script. A missing interpreter/script, a different script, or a wrapper around it never silences the plugin. A seat without
   that resource, and a plugin installed outside OpenRig, report through the plugin's relay, so each event is reported once.
@@ -50,6 +50,12 @@ This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex
     no-ops. The plugin supplies refocus and skills. Disabling an inline activity hook is not bypassed by the plugin.
   - **Seat scope:** the commands require both `OPENRIG_SEAT_PROJECT_DIR` and the executable `OPENRIG_NODE`. Personal and
     unselected sessions are no-ops. A nested Codex inheriting those seat variables still acts as that seat.
+  - **Refocus output:** the Codex prompt handler keeps its unchanged declaration and default 2,500-token budget
+    (10,000 UTF-8 bytes), preserving its native trust identity. Larger packets
+    send a prefix and an explicit shortening notice for the current attempt. After a claimed, successful render/write
+    and state save, the refocus record lists that attempt's omitted tail byte count and full packet's `.context.txt`
+    path, or says the full text could not be saved. A trace/content failure or unavailable final state guard/write can
+    leave older metadata or no record. The metadata describes the last successfully recorded attempt, not model receipt.
 
 Generated Claude settings commands for the activity relay and context collector use the daemon's absolute Node
 executable when its name is recognized (`node` or `node.exe`); other names keep the legacy bare `node` command and

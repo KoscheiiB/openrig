@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -11,6 +11,7 @@ import { PodRepository } from "../src/domain/pod-repository.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { managedBlockBodyHash } from "../src/domain/managed-block-records.js";
 
 describe("SeatStatusService", () => {
   let db: Database.Database;
@@ -31,6 +32,20 @@ describe("SeatStatusService", () => {
 
   afterEach(() => {
     db.close();
+  });
+
+  it("reads only the selected node input route and observes route changes", () => {
+    const rig = rigRepo.createRig("routes");
+    const node = rigRepo.addNode(rig.id, "worker", { runtime: "pi" });
+    const other = rigRepo.addNode(rig.id, "other", { runtime: "pi" });
+    const session = sessionRegistry.registerSession(node.id, "worker@routes");
+    rigRepo.setNodeInputRoute(other.id, "native");
+    const graph = vi.spyOn(rigRepo, "getRig");
+    expect(service.getStatus(session.sessionName)).toMatchObject({ ok: true, status: { inputRoute: "typed" } });
+    rigRepo.setNodeInputRoute(node.id, "native");
+    expect(service.getStatus(session.sessionName)).toMatchObject({ ok: true, status: { inputRoute: "native" } });
+    expect(graph).not.toHaveBeenCalled();
+    graph.mockRestore();
   });
 
   it("does not attach a last tool, another actor's prompt or completed activity to a permission diagnostic", () => {
@@ -123,6 +138,33 @@ describe("SeatStatusService", () => {
     expect(db.prepare("SELECT * FROM sessions WHERE id = ?").get(session.id)).toEqual(stored);
   });
 
+  // #3185 (C14 native): a seat a restore left as a bare shell read `att` on rig ps and `running` on rig seat status.
+  it.each([
+    ["the pane's process identity is ambiguous (a bare shell)", "ready", "mismatch", "process_identity_ambiguous", "attention_required"],
+    ["startup needs attention (restore's own bare-shell marker)", "attention_required", null, null, "attention_required"],
+    ["pane process is verified (control)", "ready", "verified", null, "running"],
+  ] as const)("reads a seat whose %s on seat status as rig ps does", async (_case, startup, verdict, reason, lifecycle) => {
+    const { app, rigRepo: repo, sessionRegistry: registry } = createTestApp(db);
+    const rig = repo.createRig("bare-shell");
+    const node = repo.addNode(rig.id, "dev.impl", { runtime: "claude-code" });
+    const session = registry.registerSession(node.id, "dev-impl@bare-shell");
+    registry.updateStatus(session.id, "running");
+    registry.updateStartupStatus(session.id, startup);
+    registry.updateBinding(node.id, { tmuxSession: session.sessionName, tmuxPane: "%1", attachmentType: "tmux" });
+    if (verdict) new SeatIdentityStore(db).upsert({
+      nodeId: node.id, sessionName: session.sessionName,
+      verdict, reason, evidenceSource: reason ? "pane_process" : null,
+      evidence: { registeredPane: "%1", observedPid: 4242, observedCommand: reason ? "bash" : "claude", matchedLayer: reason ? null : 1 },
+      observedAt: new Date(Date.now() + 1).toISOString(),
+    });
+    const ps = await (await app.request(`/api/rigs/${rig.id}/nodes`)).json() as Array<{ logicalId: string; lifecycleState: string }>;
+    expect(ps.find(entry => entry.logicalId === "dev.impl")?.lifecycleState).toBe(lifecycle);
+    const res = await app.request(`/api/seat/status/${encodeURIComponent(session.sessionName)}`);
+    expect(res.status).toBe(200);
+    // The session record stays running (handover and the process-limit read use it); the seat reads as rig ps reads it.
+    expect(await res.json()).toMatchObject({ session_status: "running", lifecycle_state: lifecycle });
+  });
+
   it("reports the runtime home a Claude or Codex seat's launches use, and where it comes from", () => {
     const rig = rigRepo.createRig("home-rig");
     const nodes = {
@@ -147,6 +189,31 @@ describe("SeatStatusService", () => {
     expect(status("dev-plain@home-rig").runtime_home).toEqual({ variable: "CLAUDE_CONFIG_DIR", home: "/users/op/.claude", source: "native_default" });
     expect(status("dev-pi@home-rig").runtime_home).toEqual({ variable: "PI_CODING_AGENT_DIR", home: null, source: "native_default" });
     expect(status("dev-term@home-rig")).not.toHaveProperty("runtime_home");
+  });
+
+  it("shows what OpenRig's own refocus hook recorded for a Claude or Codex seat, from that hook's state in OPENRIG_HOME", () => {
+    const home = mkdtempSync(path.join(tmpdir(), "seat-refocus-"));
+    try {
+      const rig = rigRepo.createRig("refocus-rig");
+      const nodes = {
+        claude: rigRepo.addNode(rig.id, "dev.claude", { runtime: "claude-code" }),
+        codex: rigRepo.addNode(rig.id, "dev.codex", { runtime: "codex" }),
+        pi: rigRepo.addNode(rig.id, "dev.pi", { runtime: "pi" }),
+      };
+      for (const [name, node] of Object.entries(nodes)) sessionRegistry.registerSession(node.id, `dev-${name}@refocus-rig`);
+      // The claude seat's hook has recorded a conversation; the codex seat's never has.
+      mkdirSync(path.join(home, "refocus"));
+      writeFileSync(path.join(home, "refocus", "dev-claude@refocus-rig__conv-1.json"), JSON.stringify({ lastBytes: 1, baselineAt: "2026-11-10T00:00:00Z" }));
+      const svc = new SeatStatusService({ rigRepo, env: { HOME: "/users/op", OPENRIG_HOME: home } });
+      const status = (ref: string) => {
+        const result = svc.getStatus(ref);
+        if (!result.ok) throw new Error(result.code);
+        return result.status;
+      };
+      expect(status("dev-claude@refocus-rig").refocus).toMatchObject({ lastRecordedAt: expect.any(String), currentConversation: "unknown" });
+      expect(status("dev-codex@refocus-rig").refocus).toMatchObject({ lastRecordedAt: null, detail: expect.stringContaining("has no record for this seat") });
+      expect(status("dev-pi@refocus-rig")).not.toHaveProperty("refocus");
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
   it("names a Claude seat's own subscription token by its label and file, and says when that file wouldn't apply at the next launch", () => {
@@ -287,6 +354,43 @@ describe("SeatStatusService", () => {
       expect(await response.json()).toMatchObject({
         logical_id: "dev.impl", current_occupant: "adopted-private-name", session_status: "running",
       });
+    }
+  });
+
+  // A running Claude or Codex seat gets what OpenRig wrote into its guidance file, set against when the running agent
+  // loaded it; a Pi seat and a stopped seat get no guidance field.
+  it("reports when OpenRig wrote each guidance block, set against the session's recorded startup finish", () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "seat-guidance-"));
+    try {
+      const rig = rigRepo.createRig("guidance-rig");
+      const node = rigRepo.addNode(rig.id, "lead", { runtime: "claude-code", cwd });
+      const session = sessionRegistry.registerSession(node.id, "lead@guidance-rig");
+      sessionRegistry.updateStatus(session.id, "running");
+      db.prepare("UPDATE sessions SET startup_completed_at = ? WHERE id = ?").run("2026-11-10T10:00:00.000Z", session.id);
+      const file = path.join(cwd, "CLAUDE.md");
+      writeFileSync(file, "<!-- BEGIN OpenRig MANAGED BLOCK: openrig-start.md -->\nIdentity.\n<!-- END OpenRig MANAGED BLOCK: openrig-start.md -->\n"
+        + "<!-- BEGIN OpenRig MANAGED BLOCK: openrig-context-entry.md -->\nWhere things are.\n<!-- END OpenRig MANAGED BLOCK: openrig-context-entry.md -->\n");
+      const record = db.prepare("INSERT INTO managed_block_writes (path_key, block_id, body_sha256, written_at) VALUES (?, ?, ?, ?)");
+      record.run(realpathSync.native(file), "openrig-start.md", managedBlockBodyHash("Identity."), "2026-11-10T09:59:30.000Z");
+      record.run(realpathSync.native(file), "openrig-context-entry.md", managedBlockBodyHash("Where things are."), "2026-11-10T12:00:00.000Z");
+
+      const status = service.getStatus("lead@guidance-rig");
+      expect(status.ok && status.status.guidance).toMatchObject({
+        file,
+        mark: { at: "2026-11-10T10:00:00.000Z", kind: "startup_finished" },
+        blocks: [{ id: "openrig-start.md", written: "before" }, { id: "openrig-context-entry.md", written: "after" }],
+      });
+      expect(status.ok && status.status.guidance?.detail).toContain("OpenRig doesn't record what an agent read.");
+
+      const pi = rigRepo.addNode(rig.id, "helper", { runtime: "pi", cwd });
+      sessionRegistry.updateStatus(sessionRegistry.registerSession(pi.id, "helper@guidance-rig").id, "running");
+      const piStatus = service.getStatus("helper@guidance-rig");
+      expect(piStatus.ok && piStatus.status.guidance).toBeUndefined();
+      sessionRegistry.updateStatus(session.id, "exited");
+      const stopped = service.getStatus("lead@guidance-rig");
+      expect(stopped.ok && stopped.status.guidance).toBeUndefined();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 

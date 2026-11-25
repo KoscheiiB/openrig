@@ -6,10 +6,10 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
-import { AgentActivityStore, AGENT_ACTIVITY_FRESHNESS_MS } from "../src/domain/agent-activity-store.js";
+import { AgentActivityStore, AGENT_ACTIVITY_FRESHNESS_MS, latestHookWaitsOnPerson } from "../src/domain/agent-activity-store.js";
 import { deriveRelayEvents } from "../src/domain/claude-activity-hooks.js";
 import { EventBus } from "../src/domain/event-bus.js";
-import { attachAgentActivity } from "../src/domain/node-inventory.js";
+import { attachAgentActivity, attachTerminalActivityAndWork, hookOrPaneActivity, seatNeedsAttention } from "../src/domain/node-inventory.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { ProviderServiceImpl } from "../src/domain/provider/provider-service-impl.js";
 import { deriveUsageLimitPools } from "../src/domain/provider/provider-signals.js";
@@ -23,11 +23,14 @@ import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.j
 const require = createRequire(import.meta.url);
 const relay = require("../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs") as {
   buildOpenRigPayload: (payload: Record<string, unknown>, env: Record<string, string>, now: () => Date) => Record<string, unknown>;
+  claudeLimitResetAt: (text: string, now: Date) => string | null;
 };
 const SESSION = "dev-worker@limit-fixture";
 const NODE = "node-limit-fixture";
 const GENERATION = "generation-current";
 const T0 = "2025-01-01T12:00:00.000Z";
+// The seat's own Claude session: its resume token, which a hook from the seat's Claude reports as session_id.
+const OWN_CLAUDE_SESSION = "11111111-1111-4111-8111-111111111111";
 const identity = { OPENRIG_SESSION_NAME: SESSION, OPENRIG_NODE_ID: NODE, OPENRIG_RUNTIME: "claude-code", OPENRIG_OCCUPANT_GENERATION: GENERATION };
 
 describe("Claude provider interruptions (#99)", () => {
@@ -48,7 +51,8 @@ describe("Claude provider interruptions (#99)", () => {
     db.prepare("INSERT INTO rigs (id, name) VALUES ('rig-limit', 'limit-fixture')").run();
     db.prepare("INSERT INTO pods (id, rig_id, namespace, label) VALUES ('pod-limit', 'rig-limit', 'dev', 'Dev')").run();
     db.prepare("INSERT INTO nodes (id, rig_id, logical_id, runtime, pod_id) VALUES (?, 'rig-limit', 'dev.worker', 'claude-code', 'pod-limit')").run(NODE);
-    db.prepare("INSERT INTO sessions (id, node_id, session_name, status, startup_status) VALUES ('session-limit', ?, ?, 'running', 'ready')").run(NODE, SESSION);
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status, startup_status, resume_type, resume_token) VALUES ('session-limit', ?, ?, 'running', 'ready', 'claude_id', ?)")
+      .run(NODE, SESSION, OWN_CLAUDE_SESSION);
     db.prepare("INSERT INTO bindings (id, node_id, tmux_session) VALUES ('binding-limit', ?, ?)").run(NODE, SESSION);
     const eventBus = new EventBus(db);
     liveGeneration = GENERATION;
@@ -79,9 +83,9 @@ describe("Claude provider interruptions (#99)", () => {
   const reportLimit = () => report({ hook_event_name: "StopFailure", error: "rate_limit" });
   const events = async () => (await service.getReadModel()).signals.filter(signal => signal.sourceClass === "provider_event");
 
-  async function displayLimit(input: { hookAge: number; paneAge: number; permission?: boolean; motion?: boolean }) {
+  async function displayLimit(input: { hookAge: number; paneAge: number; permission?: boolean; motion?: boolean }, error = "rate_limit") {
     vi.setSystemTime(Date.parse(T0) - input.hookAge);
-    reportLimit();
+    report({ hook_event_name: "StopFailure", error });
     vi.setSystemTime(T0);
     return displayActivity(input);
   }
@@ -123,6 +127,124 @@ describe("Claude provider interruptions (#99)", () => {
     expect(payload).not.toHaveProperty("error_details");
     expect(payload).not.toHaveProperty("last_assistant_message");
     expect(store.getLatestForNode({ sessionName: SESSION })).toMatchObject({ state: "unknown", reason: "usage_limit" });
+  });
+
+  describe("the reset a Claude limit states (#99)", () => {
+    const WEEKLY = "You've hit your weekly limit · resets Jan 2, 4pm (America/Sao_Paulo)";
+    const reportStated = (text: string, field = "last_assistant_message", sessionId: string | null = OWN_CLAUDE_SESSION) =>
+      report({ hook_event_name: "StopFailure", error: "rate_limit", [field]: text, ...(sessionId ? { session_id: sessionId } : {}) });
+    const latestResetsAt = () => (store.getLatestForNode({ sessionName: SESSION }) as { resetsAt?: string | null } | null)?.resetsAt;
+
+    it.each([
+      // Real messages from a Claude Code 2.1.296 limit, and the older formats.
+      [WEEKLY, "2025-01-02T19:00:00.000Z"],
+      ["5-hour limit reached ∙ resets 8am (UTC)", "2025-01-02T08:00:00.000Z"],
+      ["5-hour limit reached ∙ resets 1:30pm (UTC)", "2025-01-01T13:30:00.000Z"],
+      ["rate limit · resets in 2h 30m", "2025-01-01T14:30:00.000Z"],
+      ["Claude AI usage limit reached|1735740000", "2025-01-01T14:00:00.000Z"],
+    ])("reads %j", (text, expected) => {
+      expect(relay.claudeLimitResetAt(text, new Date(T0))).toBe(expected);
+    });
+
+    it.each([
+      "API Error: Rate limit reached",
+      "resets 3",
+      "resets 4pm (Not/AZone)",
+      "resets 4pm (Not/AZone", // a truncated zone is not the seat's local time
+      "resets 4pm ()",
+      "resets in 2 months", // not two minutes
+      "resets in 2h 30x",
+      "resets in 2h, 30x", // a separator doesn't end the fragment
+      "resets in 2h and 30x",
+      "resets in soon",
+      "resets Feb 30, 4pm (UTC)",
+      "resets Mar 1, 4pm (UTC)", // more than a week away: not a usage window
+      "Claude AI usage limit reached|1735730000", // already past
+    ])("states no reset for %j", text => {
+      expect(relay.claudeLimitResetAt(text, new Date(T0))).toBeNull();
+    });
+
+    it.each([
+      // Close to the impossible date, where only a calendar check (not the distance cap) can reject it.
+      ["2026-02-28T12:00:00.000Z", "resets Feb 30, 4pm (UTC)", null],
+      ["2026-02-28T12:00:00.000Z", "resets Feb 29, 4pm (UTC)", null], // 2026 is not a leap year
+      ["2026-02-28T12:00:00.000Z", "resets Mar 2, 4pm (UTC)", "2026-03-02T16:00:00.000Z"],
+      ["2028-02-28T12:00:00.000Z", "resets Feb 29, 4pm (UTC)", "2028-02-29T16:00:00.000Z"],
+      ["2026-04-29T12:00:00.000Z", "resets Apr 31, 4pm (UTC)", null],
+      // A wall time a DST change repeats or skips names no single instant: no reset rather than one a day late.
+      ["2025-11-02T05:00:00.000Z", "resets 1:30am (America/New_York)", null], // 1:30 happens twice that night
+      ["2025-11-02T05:00:00.000Z", "resets Nov 2, 1:30am (America/New_York)", null],
+      ["2025-03-09T06:00:00.000Z", "resets 2:30am (America/New_York)", null], // 2:30 never happens that night
+      ["2025-03-09T06:00:00.000Z", "resets 3:30am (America/New_York)", "2025-03-09T07:30:00.000Z"],
+      ["2025-11-02T05:00:00.000Z", "resets 3am (America/New_York)", "2025-11-02T08:00:00.000Z"],
+    ])("at %s reads %j as %j", (now, text, expected) => {
+      expect(relay.claudeLimitResetAt(text, new Date(now))).toBe(expected);
+    });
+
+    it("relays only the instant, never the message", () => {
+      const payload = reportStated(WEEKLY);
+      expect(payload).toMatchObject({ subtype: "rate_limit", resetsAt: "2025-01-02T19:00:00.000Z" });
+      expect(JSON.stringify(payload)).not.toContain("weekly");
+      expect(reportStated(WEEKLY, "error_details")).toMatchObject({ resetsAt: "2025-01-02T19:00:00.000Z" });
+    });
+
+    it.each([
+      { hook_event_name: "StopFailure", error: "overloaded", last_assistant_message: WEEKLY },
+      { hook_event_name: "Stop", last_assistant_message: WEEKLY },
+      { hook_event_name: "Notification", notification_type: "rate_limit", message: WEEKLY },
+    ])("reads no reset off another event: %j", payload => {
+      expect(report(payload)).not.toHaveProperty("resetsAt");
+    });
+
+    it("keeps a stated reset only from the seat's own Claude session, not a helper's", async () => {
+      // A helper Claude started from the seat's shell posts as the seat, but under its own session (maybe another login).
+      reportStated(WEEKLY, "last_assistant_message", "22222222-2222-4222-8222-222222222222");
+      expect(latestResetsAt()).toBeUndefined();
+      const model = await service.getReadModel();
+      expect(deriveUsageLimitPools({ signals: model.signals, bindings: model.bindings, now: new Date(), fallbackSeconds: 300 }))
+        .toEqual([expect.objectContaining({ poolKey: "claude:local", source: "config-fallback",
+          expiresAt: new Date(Date.parse(T0) + 300_000).toISOString() })]);
+
+      reportStated(WEEKLY, "last_assistant_message", null);
+      expect(latestResetsAt()).toBeUndefined();
+      reportStated(WEEKLY);
+      expect(latestResetsAt()).toBe("2025-01-02T19:00:00.000Z");
+    });
+
+    it("drops a stated reset past the eight-day cap from any sender", async () => {
+      const result = store.recordHookEvent({ runtime: "claude-code", sessionName: SESSION, hookEvent: "StopFailure", subtype: "rate_limit",
+        occurredAt: T0, generation: GENERATION, sessionId: OWN_CLAUDE_SESSION, resetsAt: "2025-01-10T12:00:00.000Z" });
+      expect(result.ok && result.activity.resetsAt).toBe("2025-01-10T12:00:00.000Z");
+      expect(await events()).toEqual([expect.not.objectContaining({ resetsAt: expect.anything() })]);
+    });
+
+    it("keeps a stated reset only on the typed limit row", () => {
+      const result = store.recordHookEvent({ runtime: "claude-code", sessionName: SESSION, hookEvent: "Stop",
+        resetsAt: "2025-01-02T19:00:00.000Z", generation: GENERATION, sessionId: OWN_CLAUDE_SESSION });
+      expect(result.ok && result.activity).not.toHaveProperty("resetsAt");
+    });
+
+    it("parks pending work until the stated reset instead of the bounded retry", async () => {
+      reportStated(WEEKLY);
+      const model = await service.getReadModel();
+      expect(model.signals.filter(signal => signal.sourceClass === "provider_event"))
+        .toEqual([expect.objectContaining({ provider: "claude", seatSession: SESSION, resetsAt: "2025-01-02T19:00:00.000Z" })]);
+      expect(deriveUsageLimitPools({ signals: model.signals, bindings: model.bindings, now: new Date(), fallbackSeconds: 300 }))
+        .toEqual([{ poolKey: "claude:local", provider: "claude", seatSessions: [SESSION], expiresAt: "2025-01-02T19:00:00.000Z", source: "provider-reset" }]);
+
+      queue.attachWatchdogJobsRepository(new WatchdogJobsRepository(db, () => new Date()));
+      queue.attachOutbox(new OutboxHandler(db));
+      const source = await queue.create({ sourceSession: "sender@limit-fixture", destinationSession: "relay@limit-fixture", body: "work", nudge: false });
+      const { created: baton } = await queue.handoff({ qitemId: source.qitemId, fromSession: "relay@limit-fixture", toSession: SESSION, nudge: false });
+      db.prepare("UPDATE queue_items SET last_nudge_attempt = ?, last_nudge_result = 'failed:provider limit' WHERE qitem_id = ?")
+        .run(new Date(Date.parse(T0) - 600_000).toISOString(), baton.qitemId);
+      const result = await runWakeLadderTick({ db, queueRepo: queue, attemptWake: vi.fn(async () => "typed"), resolveOrchestrator: () => null,
+        retryIntervalSeconds: 300, usageLimitJitterSeconds: 0, getProviderReadModel: () => service.getReadModel(), log: () => {} });
+      expect(result.actions).toContainEqual({ qitemId: baton.qitemId, action: "park-usage-limit" });
+      const blocker = queue.getById(baton.qitemId)!.blockedOn!;
+      expect(queue.getParkWakeStatus(blocker)).toMatchObject({ kind: "timer", live: true, expiresAt: "2025-01-02T19:00:00.000Z" });
+      expect(queue.transitionLog.listForQitem(blocker).some(row => row.transitionNote?.includes("cause=provider-reset"))).toBe(true);
+    });
   });
 
   it("reports a fresh same-occupant limit without inventing a Claude account, usage meter or reset", async () => {
@@ -329,5 +451,191 @@ describe("Claude provider interruptions (#99)", () => {
     queue.recordWatchdogWakeAttempt(timer.ref!, "typed");
     await queue.drainPendingWakeIntents();
     expect(delivered).toHaveBeenCalledTimes(1);
+  });
+
+  describe("other StopFailure errors keep a typed reason (#3571)", () => {
+    const seat = { rigId: "rig-limit", rigName: "limit-fixture", nodeId: NODE, logicalId: "dev.worker", canonicalSessionName: SESSION,
+      runtime: "claude-code", sessionStatus: "running", startupStatus: "ready", lifecycleState: "running", latestError: null,
+      heldReason: null } as unknown as Parameters<typeof seatNeedsAttention>[0];
+    const latest = () => store.getLatestForNode({ sessionName: SESSION, order: "source" });
+
+    it.each([
+      ["authentication_failed", "provider_auth_error"],
+      ["oauth_org_not_allowed", "provider_auth_error"],
+      ["cloud_credential_error", "provider_auth_error"],
+      ["billing_error", "provider_billing_error"],
+      ["account_on_hold", "provider_billing_error"],
+      ["invalid_request", "provider_error"],
+      ["model_not_found", "provider_error"],
+      ["server_error", "provider_error"],
+      ["max_output_tokens", "provider_error"],
+      ["unknown", "provider_error"],
+      // Not in Claude Code's documented values: generic, never auth or billing.
+      ["overloaded", "provider_error"],
+      ["verification_required", "provider_error"],
+      ["authentication_failed_v2", "provider_error"],
+    ])("%s reads %s with its raw value, as an interruption and not exhaustion", async (error, reason) => {
+      report({ hook_event_name: "StopFailure", error });
+      expect(latest()).toMatchObject({ state: "unknown", reason, rawEvent: "StopFailure", rawSubtype: error, evidence: error, stale: false });
+      expect(await events()).toEqual([]);
+    });
+
+    it("keeps rate_limit the usage limit, and another runtime's claim on the seat unmapped", () => {
+      reportLimit();
+      expect(latest()).toMatchObject({ reason: "usage_limit" });
+      vi.setSystemTime(Date.parse(T0) + 1000);
+      expect(store.recordHookEvent({ sessionName: SESSION, runtime: "codex", hookEvent: "StopFailure", subtype: "authentication_failed",
+        generation: GENERATION } as Parameters<AgentActivityStore["recordHookEvent"]>[0]).ok).toBe(true);
+      expect(latest()).toMatchObject({ state: "unknown", reason: "unmapped_runtime_hook", runtime: "codex", rawSubtype: "authentication_failed" });
+      expect(seatNeedsAttention(seat, latest(), false)).toBe(false);
+    });
+
+    it.each([
+      ["authentication_failed", "provider_auth_error"],
+      ["account_on_hold", "provider_billing_error"],
+    ])("serves a fresh %s over the cached idle pane and counts it toward attention, without asking for input", async (error, reason) => {
+      for (const motion of [false, true]) {
+        const served = await displayLimit({ hookAge: 1000, paneAge: 0, motion }, error);
+        expect(served).toMatchObject({ state: "unknown", reason, rawSubtype: error, evidenceSource: "runtime_hook", stale: false });
+        // An arbitrated "no question" doesn't cancel it: it is attention, not a request for input.
+        expect(seatNeedsAttention(seat, served!, false)).toBe(true);
+        expect(latestHookWaitsOnPerson(latest(), "claude-code")).toBe(false);
+      }
+    });
+
+    it.each(["server_error", "overloaded", "verification_required", "authentication_failed_v2"])(
+      "leaves a generic %s to the pane reading and out of attention", async error => {
+        const served = await displayLimit({ hookAge: 1000, paneAge: 0 }, error);
+        expect(served).toMatchObject({ state: "idle", reason: "idle_prompt", evidenceSource: "pane_heuristic" });
+        expect(seatNeedsAttention(seat, latest(), null)).toBe(false);
+      });
+
+    it("keeps a fresh failure over a permission prompt the pane saw before it", async () => {
+      const served = await displayLimit({ hookAge: 1000, paneAge: 2000, permission: true }, "authentication_failed");
+      expect(served).toMatchObject({ state: "unknown", reason: "provider_auth_error", evidenceSource: "runtime_hook" });
+    });
+
+    it("keeps the failure over a prompt whose capture began before it, though the capture completed after", async () => {
+      vi.setSystemTime(Date.parse(T0) - 1000);
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" });
+      vi.setSystemTime(T0);
+      let clock = new Date(Date.parse(T0) - 2000);
+      const capturePaneContent = vi.fn(async () => { clock = new Date(T0); return "Do you want to proceed?"; });
+      const structural = new SeatStructuralActivityService({ capturePaneContent }, () => clock);
+      const observed = await structural.pollSeat(SESSION, null, "claude-code");
+      expect(observed).toMatchObject({ state: "attention", captureStartedAt: new Date(Date.parse(T0) - 2000).toISOString(), observedAt: T0 });
+      const [entry] = await attachAgentActivity([{
+        canonicalSessionName: SESSION, runtime: "claude-code", attachmentType: "tmux", logicalId: "dev.worker",
+      }] as Parameters<typeof attachAgentActivity>[0], { tmuxAdapter: { capturePaneContent } as never, activityStore: store,
+        structuralActivity: structural, now: new Date(T0) });
+      expect(entry!.agentActivity).toMatchObject({ state: "unknown", reason: "provider_auth_error", evidenceSource: "runtime_hook" });
+    });
+
+    it("retains the failure past Claude's idle notification, with its original time", async () => {
+      report({ hook_event_name: "StopFailure", error: "billing_error" }, identity, "2025-01-01T11:58:00.000Z");
+      report({ hook_event_name: "Notification", notification_type: "idle_prompt" }, identity, "2025-01-01T11:59:00.000Z");
+      expect(latest()).toMatchObject({ state: "idle", rawEvent: "Notification" });
+      const served = await displayActivity();
+      expect(served).toMatchObject({ state: "unknown", reason: "provider_billing_error", rawSubtype: "billing_error",
+        eventAt: "2025-01-01T11:58:00.000Z", stale: false, evidenceSource: "runtime_hook" });
+      expect(seatNeedsAttention(seat, served!, null)).toBe(true);
+      expect(latestHookWaitsOnPerson(latest(), "claude-code")).toBe(false);
+    });
+
+    it("retains the failure past the five-minute window, without lifting hook freshness for anything else", async () => {
+      const hookAge = AGENT_ACTIVITY_FRESHNESS_MS + 60_000;
+      const served = await displayLimit({ hookAge, paneAge: 0 }, "authentication_failed");
+      expect(served).toMatchObject({ state: "unknown", reason: "provider_auth_error", stale: false,
+        eventAt: new Date(Date.parse(T0) - hookAge).toISOString() });
+      expect(seatNeedsAttention(seat, served!, null)).toBe(true);
+      expect(latest()).toMatchObject({ state: "unknown", reason: "stale_runtime_hook", stale: true });
+    });
+
+    it("is superseded by a newer turn, which doesn't certify a repair", async () => {
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" }, identity, "2025-01-01T11:50:00.000Z");
+      report({ hook_event_name: "UserPromptSubmit" }, identity, "2025-01-01T11:55:00.000Z");
+      report({ hook_event_name: "Stop" }, identity, "2025-01-01T11:56:00.000Z");
+      report({ hook_event_name: "Notification", notification_type: "idle_prompt" }, identity, "2025-01-01T11:57:00.000Z");
+      const served = await displayActivity();
+      expect(served?.reason).not.toMatch(/^provider_/);
+      expect(seatNeedsAttention(seat, served!, null)).toBe(false);
+    });
+
+    it.each([
+      { name: "a Stop", hook: { hook_event_name: "Stop" }, expected: { reason: "idle_prompt" } },
+      { name: "a tool batch", hook: { hook_event_name: "PostToolBatch" }, expected: { reason: "idle_prompt" } },
+      // Claude sends StopFailure instead of Stop: a newer one ends its own turn, and a newer limit shows as the limit.
+      { name: "a newer rate limit", hook: { hook_event_name: "StopFailure", error: "rate_limit" }, expected: { reason: "usage_limit" }, idle: false },
+      { name: "a newer generic error", hook: { hook_event_name: "StopFailure", error: "server_error" }, expected: { reason: "idle_prompt" } },
+    ])("is superseded by $name from a newer turn whose prompt wasn't recorded", async ({ hook, expected, idle = true }) => {
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" }, identity, "2025-01-01T11:59:57.000Z");
+      report(hook, identity, "2025-01-01T11:59:58.000Z");
+      if (idle) report({ hook_event_name: "Notification", notification_type: "idle_prompt" }, identity, "2025-01-01T11:59:59.000Z");
+      expect(store.latestUnsupersededProviderFailure({ sessionName: SESSION })).toBeNull();
+      const served = await displayActivity();
+      expect(served).toMatchObject(expected);
+      if (expected.reason !== "usage_limit") expect(seatNeedsAttention(seat, served!, null)).toBe(false);
+    });
+
+    it("is superseded by a newer question to a person", async () => {
+      report({ hook_event_name: "StopFailure", error: "billing_error" }, identity, "2025-01-01T11:59:57.000Z");
+      report({ hook_event_name: "PermissionRequest", tool_name: "Bash" }, identity, "2025-01-01T11:59:58.000Z");
+      report({ hook_event_name: "Notification", notification_type: "idle_prompt" }, identity, "2025-01-01T11:59:59.000Z");
+      expect(store.latestUnsupersededProviderFailure({ sessionName: SESSION })).toBeNull();
+      expect((await displayActivity())?.reason).not.toMatch(/^provider_/);
+    });
+
+    it("counts on a row that serves no pane reading, as the rig count does", () => {
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" }, identity, "2025-01-01T11:50:00.000Z");
+      report({ hook_event_name: "Notification", notification_type: "idle_prompt" }, identity, "2025-01-01T11:51:00.000Z");
+      const [row] = attachTerminalActivityAndWork([{ ...seat, agentActivity: null }] as Parameters<typeof attachTerminalActivityAndWork>[0],
+        { db, agentActivity: store, now: new Date(T0) });
+      expect(row!.needsAttention).toBe(true);
+    });
+
+    it("is superseded by a new occupant", async () => {
+      report({ hook_event_name: "StopFailure", error: "billing_error" }, identity, "2025-01-01T11:58:00.000Z");
+      liveGeneration = "generation-replacement";
+      report({ hook_event_name: "SessionStart" }, { ...identity, OPENRIG_OCCUPANT_GENERATION: "generation-replacement" },
+        "2025-01-01T11:59:00.000Z");
+      const served = await displayActivity();
+      expect(served?.reason).not.toMatch(/^provider_/);
+      expect(seatNeedsAttention(seat, served!, null)).toBe(false);
+    });
+
+    it("keeps a newer failure when an older turn arrives after it", async () => {
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" }, identity, "2025-01-01T11:59:59.000Z");
+      report({ hook_event_name: "UserPromptSubmit" }, identity, "2025-01-01T11:59:58.000Z");
+      expect(await displayActivity()).toMatchObject({ state: "unknown", reason: "provider_auth_error",
+        eventAt: "2025-01-01T11:59:59.000Z" });
+    });
+
+    it.each([
+      { name: "newer permission", hookAge: 2000, paneAge: 1000, permission: true, expected: "permission_prompt" },
+      { name: "replaced occupant", hookAge: 1000, paneAge: 0, expected: "idle_prompt" },
+      { name: "unknown occupant", hookAge: 1000, paneAge: 0, expected: "idle_prompt" },
+    ])("keeps the display's chronology and identity guards: $name", async input => {
+      if (input.name === "replaced occupant") liveGeneration = "generation-replacement";
+      if (input.name === "unknown occupant") liveGeneration = null;
+      const served = await displayLimit(input, "billing_error");
+      expect(served).toMatchObject({ reason: input.expected, evidenceSource: "pane_heuristic" });
+      if (input.expected === "idle_prompt") expect(seatNeedsAttention(seat, latest(), null)).toBe(false);
+    });
+
+    it("ends with a newer turn that arrives before the older failure", async () => {
+      report({ hook_event_name: "UserPromptSubmit" }, identity, "2025-01-01T11:59:59.000Z");
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" }, identity, "2025-01-01T11:59:58.000Z");
+      expect(await displayActivity()).toMatchObject({ state: "running", rawEvent: "UserPromptSubmit" });
+      expect(seatNeedsAttention(seat, latest(), null)).toBe(false);
+    });
+
+    it("holds no wake: the readers of hookOrPaneActivity keep the pane's reading", async () => {
+      report({ hook_event_name: "StopFailure", error: "authentication_failed" });
+      const capturePaneContent = vi.fn(async () => "output\n❯ ");
+      const structural = new SeatStructuralActivityService({ capturePaneContent }, () => new Date(T0));
+      await structural.pollSeat(SESSION, null, "claude-code");
+      expect(hookOrPaneActivity(latest(), structural.getStructuralActivity(SESSION), false, "claude-code"))
+        .toMatchObject({ source: "pane", activity: { state: "idle" } });
+    });
   });
 });

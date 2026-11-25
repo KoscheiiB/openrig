@@ -29,6 +29,7 @@ import type {
   removeChannelMapEntry as RemoveChannelMapEntryFn,
   FEATURE_SCOPES as FeatureScopes,
   BASELINE_REQUIRED_SCOPES as BaselineScopes,
+  PRIVATE_CHANNEL_SCOPES as PrivateChannelScopes,
   SlackConnectorConfig,
   FetchImpl,
 } from "@openrig/daemon/gateway-slack";
@@ -92,6 +93,7 @@ interface SlackSurface {
   removeChannelMapEntry: typeof RemoveChannelMapEntryFn;
   FEATURE_SCOPES: typeof FeatureScopes;
   BASELINE_REQUIRED_SCOPES: typeof BaselineScopes;
+  PRIVATE_CHANNEL_SCOPES: typeof PrivateChannelScopes;
 }
 
 export interface SlackDeps {
@@ -121,8 +123,22 @@ const CHANNEL_MAP_APPLY =
 
 const POST_OPEN_ASKS = "`rig slack post-open-asks`";
 
+type PrivateScopeCheck = { status: "not-applicable" | "unknown" | "missing" | "complete"; missing: string[] };
+
+function checkPrivateScopes(
+  isPrivate: boolean | null | undefined,
+  scope: Awaited<ReturnType<typeof VerifyScopesFn>>,
+  privateScopes: readonly string[],
+): PrivateScopeCheck {
+  if (isPrivate === false) return { status: "not-applicable", missing: [] };
+  if (isPrivate !== true || scope.error || scope.granted.length === 0) return { status: "unknown", missing: [] };
+  const granted = new Set(scope.granted);
+  const missing = privateScopes.filter((required) => !granted.has(required));
+  return { status: missing.length ? "missing" : "complete", missing };
+}
+
 type OpenAskOutcome = "posted" | "already-posted" | "queued" | "held" | "below-floor" | "no-longer-active" | "superseded"
-  | "recipient-changed" | "state-unavailable" | "transport-failed" | "uncertain";
+  | "recipient-changed" | "no-connector" | "state-unavailable" | "transport-failed" | "uncertain";
 interface OpenAsk { qitemId: string; recipient: string; summary: string | null; outcome: OpenAskOutcome; detail?: string }
 interface PostOpenAsksResponse { ok: boolean; asks: OpenAsk[] }
 
@@ -135,6 +151,7 @@ const OUTCOME_LABEL: Record<OpenAskOutcome, string> = {
   "no-longer-active": "no longer active",
   superseded: "superseded",
   "recipient-changed": "recipient changed",
+  "no-connector": "no connector (Steering and the Feed only)",
   "state-unavailable": "state unavailable",
   "transport-failed": "transport failed",
   uncertain: "uncertain",
@@ -180,13 +197,14 @@ export function slackCommand(deps: SlackDeps = {}): Command {
     .command("setup")
     .description("Configure the connector (first-class config; secrets stay in the env file, never here)")
     .option("--channel <id>", "Slack channel id the connector app must be a member of")
-    .option("--inbound-destination <session>", "where inbound human messages land (default operator-agent@kernel)")
+    .option("--inbound-destination <session>", "where a person's unrouted message lands: a seat's session, or default-receiver (the default) for the host's default receiving agent (agents.operator_session, else the kernel operator)")
     .option("--minimum-level-that-posts <level>", "minimum OWNER level posted to Slack: RECORD|NOTICE|ALERT")
     .option("--minimum-level-that-interrupts <level>", "minimum OWNER level that mentions/interrupts: RECORD|NOTICE|ALERT")
     .option("--source-label <label>", "label shown in the posted message footer (where the queue lives)")
     .option("--secrets-env-file <path>", "path to the 0600 env file with SLACK_BOT_TOKEN / SLACK_APP_TOKEN")
     .option("--required-scopes <csv>", "comma-separated bot scopes to require at verify time")
     .option("--reactions <mode>", "what a person's emoji reaction on an OpenRig post does: route (default) makes a row for the seat that asked; off ignores reactions, so an acknowledging emoji costs no agent turn")
+    .option("--unfurl <mode>", "link and media previews on human-row posts: off (default) or on; takes effect when the connector rewires")
     .option("--reason <reason>", "Reason recorded with the configuration change", "configure human delivery")
     .option("--actor <actor>", "Named operator when outside a managed seat")
     .action(async (opts) => {
@@ -202,6 +220,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         secretsEnvFile: opts.secretsEnvFile ?? cur.secretsEnvFile,
         requiredScopes: opts.requiredScopes ? String(opts.requiredScopes).split(",").map((s: string) => s.trim()).filter(Boolean) : cur.requiredScopes,
         ...(opts.reactions !== undefined ? { reactions: opts.reactions } : {}),
+        ...(opts.unfurl !== undefined ? { unfurl: opts.unfurl } : {}),
       };
       const { runChannelOperation, channelStateDigest } = await import("@openrig/daemon/gateway-slack");
       const result = await runChannelOperation({
@@ -250,7 +269,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         for (const r of readiness) log(`  ${r.ok ? "✓" : "✗"} ${r.label}: ${r.detail}`);
         log(`Daemon: ${observation.state}${observation.reason ? ` (${observation.reason})` : ""}`);
         const connector = observation.connector as { configurationDigest?: string; inboundReady?: boolean; outboundReady?: boolean;
-          inboundRouting?: { fallback: string; destination: string };
+          inboundRouting?: { fallback: string; destination: string; destinationFrom?: string; destinationNote?: string };
           settlement?: { pending: number; lastFailure: string | null };
           deadLetterBacklog?: number | null; deadLetterBacklogState?: string; deadLetterBacklogReason?: string; relayAttemptsInFlight?: number;
           inbound?: InboundDeliveryStatus & { state?: string; generation?: number; lastEventAt?: string };
@@ -258,7 +277,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
             coverage?: { coverageStart: string; coveredThrough: string; pending?: { upper: string; nextLatest: string }; nextRetryAt?: number } | null;
             channels?: Array<{ channel?: string | null; state?: string; reason?: string; lastScanAt?: string;
               coverage?: { coverageStart: string; coveredThrough: string; nextRetryAt?: number } | null }>;
-            threads?: { state?: string; reason?: string; tracked?: number; scanned?: number; pending?: number; oldestPendingSeconds?: number | null;
+            threads?: { state?: string; reason?: string; tracked?: number; scanned?: number; pending?: number; settled?: number; settledRescanHours?: number; oldestPendingSeconds?: number | null;
               backoff?: Record<string, number>; incomplete?: Record<string, number> };
             limits?: string[] } } | undefined;
         if (connector) {
@@ -267,6 +286,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
             if (connector.settlement.lastFailure) log(`  Last ask-edit failure: ${connector.settlement.lastFailure}`);
           }
           if (connector.inboundRouting?.fallback === "local") log(`  Configured routing fallback: local to ${connector.inboundRouting.destination} (after forwarding, thread and channel routes)`);
+          if (connector.inboundRouting?.destinationNote) log(`  ${connector.inboundRouting.destinationFrom === "receiving-agent" ? "Default receiving agent" : "No receiving agent"}: ${connector.inboundRouting.destinationNote}`);
           log(`  Socket: ${connector.inbound?.state ?? "unknown"}; generation ${connector.inbound?.generation ?? "unknown"}; last event ${connector.inbound?.lastEventAt ?? "unknown"}`);
           for (const line of socketDeliveryLines(connector.inbound)) log(`  ${line}`);
           const recovery = connector.recovery;
@@ -288,6 +308,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
             const behind = threads.oldestPendingSeconds != null ? ` (oldest ${Math.round(threads.oldestPendingSeconds / 60)} min behind)` : "";
             log(`  Thread recovery: ${threads.state ?? "unknown"}${threads.reason ? ` (${threads.reason})` : ""}; ${threads.tracked ?? 0} tracked (open, or closed within seven days); `
               + `${threads.scanned ?? 0} scanned, ${threads.pending ?? 0} waiting their turn${behind}`
+              + `${threads.settled ? `, ${threads.settled} settled (nobody waiting; rescanned ${!threads.settledRescanHours || threads.settledRescanHours === 24 ? "daily" : `every ${threads.settledRescanHours} hours`})` : ""}`
               + `${reasons(threads.backoff) ? `; backing off: ${reasons(threads.backoff)}` : ""}${reasons(threads.incomplete) ? `; incomplete: ${reasons(threads.incomplete)}` : ""}`);
           }
           log(`  Recovery counts since connector start: accepted ${recovery?.acceptedThisProcess ?? "unknown"}; dead-lettered ${recovery?.deadLetteredThisProcess ?? "unknown"} (custody, not delivery)`);
@@ -315,6 +336,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
   cmd
     .command("manifest")
     .description("Print the Slack app manifest for creating your own OpenRig Slack app (offline)")
+    .option("--private-channel", "also request private-channel scopes and the message.groups event")
     .option("--url", "print Slack's create-app link with the manifest prefilled (URL-encoded)")
     .option("--json", "JSON output: the manifest plus its bot scopes and bot events")
     .addHelpText("after", [
@@ -322,7 +344,9 @@ export function slackCommand(deps: SlackDeps = {}): Command {
       "Creates nothing: open the --url link yourself in a browser signed in to your Slack workspace.",
       "If Slack shows an empty manifest or parsing error with --url, paste the plain YAML output of",
       "`rig slack manifest` into the YAML tab in Slack's \"Create an app from an app manifest\" dialog.",
+      "If you chose --private-channel, keep it when printing the YAML.",
       "The app is private to that workspace (Socket Mode; OpenRig hosts nothing and publishes nothing).",
+      "--private-channel is opt-in; without it the manifest remains public-channel-only.",
       "--json lists every requested scope and why. `rig slack verify` checks only the baseline scopes,",
       "so a READY there does not prove attachments or mentions have their grants.",
       "Steps after creating the app: docs/reference/slack-app-setup.md",
@@ -330,11 +354,16 @@ export function slackCommand(deps: SlackDeps = {}): Command {
     ].join("\n"))
     .action(async (opts) => {
       const surface = await loadSurface();
-      const bundle = surface.buildSlackAppManifest();
+      const bundle = opts.privateChannel
+        ? surface.buildSlackAppManifest(undefined, { privateChannel: true })
+        : surface.buildSlackAppManifest();
       if (opts.json) {
         const reasons: Record<string, string> = {};
         for (const scope of surface.BASELINE_REQUIRED_SCOPES) reasons[scope] = "baseline: checked by `rig slack verify`";
         for (const f of surface.FEATURE_SCOPES) reasons[f.scope] = `feature, not checked by verify: ${f.usedBy}`;
+        for (const scope of surface.PRIVATE_CHANNEL_SCOPES) {
+          reasons[scope] = "optional private-channel access; request with `rig slack manifest --private-channel`";
+        }
         log(JSON.stringify({
           manifest: bundle.manifest, url: bundle.url, scopes: bundle.scopes, events: bundle.events,
           why: Object.fromEntries(bundle.scopes.map((scope) => [scope, reasons[scope] ?? "unexplained"])),
@@ -362,7 +391,12 @@ export function slackCommand(deps: SlackDeps = {}): Command {
       // #192: membership in every channel the connector uses — the default and each mapped one.
       const channels = [];
       for (const c of surface.mappedChannels(cfg)) {
-        channels.push({ ...c, member: await surface.verifyChannelMembership(s.bot, c.channel, deps.fetchImpl) });
+        const membership = await surface.verifyChannelMembership(s.bot, c.channel, deps.fetchImpl);
+        const isPrivate = typeof membership.isPrivate === "boolean" ? membership.isPrivate : null;
+        channels.push({
+          ...c,
+          member: { ...membership, isPrivate, privateScopes: checkPrivateScopes(isPrivate, scope, surface.PRIVATE_CHANNEL_SCOPES) },
+        });
       }
       const member = channels.find((c) => c.isDefault)?.member ?? null;
       const ready = scope.ok && member !== null && channels.every((c) => c.member.isMember);
@@ -381,6 +415,17 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         for (const c of channels.filter((x) => !x.isDefault)) {
           const forWhom = `for ${c.matches.join(", ")}`;
           log(c.member.isMember ? `✓ channel member (${c.member.name ?? c.channel}) ${forWhom}` : `✗ NOT a member of channel ${c.channel} ${forWhom} — invite the app`);
+        }
+        for (const c of channels) {
+          const forWhom = c.isDefault ? "" : ` for ${c.matches.join(", ")}`;
+          if (c.member.isPrivate === false) continue;
+          if (c.member.isPrivate !== true) {
+            log(`… channel privacy unknown for ${c.channel}${forWhom}; private-channel scopes were not assessed.`);
+          } else if (c.member.privateScopes.status === "unknown") {
+            log(`… private channel grant status unknown for ${c.channel}${forWhom}; Slack did not return an available scope list.`);
+          } else if (c.member.privateScopes.status === "missing") {
+            log(`⚠ private channel ${c.channel}${forWhom} missing scopes: ${c.member.privateScopes.missing.join(", ")}. Create an app with \`rig slack manifest --private-channel\` and reinstall it.`);
+          }
         }
         for (const feature of missingFeatures ?? []) {
           log(`⚠ ${feature.scope} missing: ${feature.usedBy}. Reinstall the app with this scope to use the feature.`);

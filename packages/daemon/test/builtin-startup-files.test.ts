@@ -1,7 +1,8 @@
 // #261: recognized built-in startup files re-anchor to the running install; nothing else moves.
 import { describe, it, expect } from "vitest";
 import path from "node:path";
-import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry, runningBuiltinAssetsRoot, runningShippedSpecsRoot } from "../src/domain/builtin-startup-files.js";
+import { readFileSync } from "node:fs";
+import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry, runningBuiltinAssetsRoot, runningShippedSpecsRoot, withContextEntryFloor } from "../src/domain/builtin-startup-files.js";
 
 const RUNNING = "/new/lib/node_modules/@openrig/cli/daemon/assets";
 const OLD = "/mise/installs/npm-openrig-cli/0.6.2/node_modules/@openrig/cli/daemon/assets";
@@ -11,6 +12,7 @@ describe("reanchorBuiltinStartupFile", () => {
   it.each([
     ["CULTURE-default.md", "guidance/CULTURE-default.md"],
     ["openrig-start.md", "guidance/openrig-start.md"],
+    ["openrig-context-entry.md", "guidance/openrig-context-entry.md"],
     ["openrig-onboarding-01.md", "onboarding/01-world-and-purpose.md"],
     ["openrig-onboarding-02.md", "onboarding/02-self-and-competent-action.md"],
   ])("re-anchors %s from an old packaged install, preserving metadata", (name, rel) => {
@@ -173,6 +175,51 @@ describe("dev-checkout layouts re-anchor only when the stored file is missing", 
   });
 });
 
+// The lost-host exercise: an install at /old-home/opt/openrig (no known layout) whose home moved to /new-home. Its
+// files follow the running install only once they're gone and the running install has the same file, so a folder that
+// merely looks like daemon/{assets,specs} is left alone while it exists, and nothing points at a file that isn't there.
+describe("an install no known layout names re-anchors only when its file is gone and the running install has it", () => {
+  const OLD = "/old-home/opt/openrig/daemon";
+  const RUN_ASSETS = "/new-home/opt/openrig/daemon/assets";
+  const RUN_SPECS = "/new-home/opt/openrig/daemon/specs";
+  const runningOnly = (p: string) => p.startsWith("/new-home/");
+  const both = () => true;
+  const neither = () => false;
+
+  it("a built-in follows the running install once its own copy is gone", () => {
+    const stored = { path: "openrig-start.md", absolutePath: `${OLD}/assets/guidance/openrig-start.md`, ownerRoot: `${OLD}/assets`, ...meta };
+    expect(reanchorBuiltinStartupFile(stored, RUN_ASSETS, RUN_SPECS, runningOnly))
+      .toEqual({ ...stored, absolutePath: `${RUN_ASSETS}/guidance/openrig-start.md`, ownerRoot: RUN_ASSETS });
+    expect(reanchorBuiltinStartupFile(stored, RUN_ASSETS, RUN_SPECS, both)).toBe(stored);
+    expect(reanchorBuiltinStartupFile(stored, RUN_ASSETS, RUN_SPECS, neither)).toBe(stored);
+  });
+
+  it("a shipped-spec startup file and projection resource follow the same rule", () => {
+    const culture = { path: "culture/CULTURE.md", absolutePath: `${OLD}/specs/rigs/launch/kernel/culture/CULTURE.md`, ownerRoot: `${OLD}/specs/rigs/launch/kernel`, ...meta };
+    expect(reanchorBuiltinStartupFile(culture, RUN_ASSETS, RUN_SPECS, runningOnly)).toMatchObject({
+      absolutePath: `${RUN_SPECS}/rigs/launch/kernel/culture/CULTURE.md`, ownerRoot: `${RUN_SPECS}/rigs/launch/kernel`,
+    });
+    expect(reanchorBuiltinStartupFile(culture, RUN_ASSETS, RUN_SPECS, both)).toBe(culture);
+    const hooks = { category: "runtime_resource", effectiveId: "shared:claude-activity-hooks", resourcePath: "runtime/claude-activity-hooks.json",
+      sourcePath: `${OLD}/specs/agents/shared`, absolutePath: `${OLD}/specs/agents/shared/runtime/claude-activity-hooks.json` };
+    expect(reanchorShippedProjectionEntry(hooks, RUN_SPECS, runningOnly)).toEqual({
+      ...hooks, sourcePath: `${RUN_SPECS}/agents/shared`, absolutePath: `${RUN_SPECS}/agents/shared/runtime/claude-activity-hooks.json`,
+    });
+    expect(reanchorShippedProjectionEntry(hooks, RUN_SPECS, neither)).toBe(hooks);
+  });
+
+  it("a plugin selected under the OpenRig home follows the running home, and the spec that selected it follows the install", () => {
+    const plugin = { category: "plugin", effectiveId: "shared:openrig-core", sourceSpec: "shared", resourcePath: "openrig-home:plugins/openrig-core",
+      sourcePath: `${OLD}/specs/agents/shared`, absolutePath: "/old-home/.openrig/plugins/openrig-core" };
+    expect(reanchorShippedProjectionEntry(plugin, RUN_SPECS, runningOnly, "/new-home/.openrig")).toEqual({
+      ...plugin, sourcePath: `${RUN_SPECS}/agents/shared`, absolutePath: "/new-home/.openrig/plugins/openrig-core",
+    });
+    // In place, nothing moves: the same entry comes back.
+    const inPlace = { ...plugin, sourcePath: `${RUN_SPECS}/agents/shared`, absolutePath: "/new-home/.openrig/plugins/openrig-core" };
+    expect(reanchorShippedProjectionEntry(inPlace, RUN_SPECS, both, "/new-home/.openrig")).toBe(inPlace);
+  });
+});
+
 describe("legacy persisted shapes are returned exactly as stored", () => {
   it("startup file without ownerRoot (or path) does not throw and is unchanged", () => {
     const noOwner = { path: "required-onboarding.md", absolutePath: "/tmp/never-read/required-onboarding.md", required: true } as unknown as { path: string; absolutePath: string; ownerRoot: string };
@@ -184,5 +231,59 @@ describe("legacy persisted shapes are returned exactly as stored", () => {
   it("projection entry without sourcePath does not throw and is unchanged", () => {
     const legacy = { absolutePath: "/tmp/never-read/CLAUDE.md", category: "memory" } as unknown as { sourcePath: string; absolutePath: string };
     expect(reanchorShippedProjectionEntry(legacy)).toBe(legacy);
+  });
+});
+
+// The context-entry floor reaches seats saved before it existed: wherever their saved built-in openrig-start.md is
+// delivered, the floor is delivered beside it, from the running install. The saved context itself isn't changed.
+describe("withContextEntryFloor", () => {
+  const culture = { path: "CULTURE-default.md", absolutePath: `${RUNNING}/guidance/CULTURE-default.md`, ownerRoot: RUNNING, ...meta };
+  const start = { path: "openrig-start.md", absolutePath: `${RUNNING}/guidance/openrig-start.md`, ownerRoot: RUNNING, ...meta, required: false };
+  const member = { path: "notes.md", absolutePath: "/rigs/team/notes.md", ownerRoot: "/rigs/team", ...meta };
+
+  it("adds the floor right after a saved built-in openrig-start.md, from the running install and with its delivery", () => {
+    const files = withContextEntryFloor([culture, start, member], RUNNING);
+    expect(files.map((file) => file.path)).toEqual(["CULTURE-default.md", "openrig-start.md", "openrig-context-entry.md", "notes.md"]);
+    expect(files[2]).toEqual({ ...start, path: "openrig-context-entry.md", absolutePath: `${RUNNING}/guidance/openrig-context-entry.md`, ownerRoot: RUNNING, required: false });
+  });
+
+  it("adds nothing when the floor is already there, when there's no built-in openrig-start.md, or for a user file of that name", () => {
+    const floor = { ...start, path: "openrig-context-entry.md", absolutePath: `${RUNNING}/guidance/openrig-context-entry.md` };
+    expect(withContextEntryFloor([culture, start, floor], RUNNING)).toHaveLength(3);
+    expect(withContextEntryFloor([culture, member], RUNNING)).toHaveLength(2);
+    const userStart = { ...start, absolutePath: "/rigs/team/openrig-start.md", ownerRoot: "/rigs/team" };
+    expect(withContextEntryFloor([userStart], RUNNING)).toEqual([userStart]);
+  });
+
+  it("anchors on a built-in from any recognized install, and takes its delivery from that entry", () => {
+    const old = { ...start, absolutePath: `${OLD}/guidance/openrig-start.md`, ownerRoot: OLD };
+    expect(withContextEntryFloor([old], RUNNING).map((file) => [file.path, file.absolutePath])).toEqual([
+      ["openrig-start.md", `${OLD}/guidance/openrig-start.md`], ["openrig-context-entry.md", `${RUNNING}/guidance/openrig-context-entry.md`]]);
+  });
+
+  // A custom file can sit under its own assets/guidance folder. It isn't OpenRig's, so it's never the anchor, and a block
+  // anchored on the real built-in after it keeps the built-in's managed delivery, not the custom file's.
+  it("a custom openrig-start.md under an assets/guidance folder isn't the anchor, alone or before the built-in", () => {
+    const custom = { path: "openrig-start.md", absolutePath: "/team/agents/assets/guidance/openrig-start.md", ownerRoot: "/team/agents/assets/guidance",
+      deliveryHint: "send_text" as const, required: false, appliesOn: ["fresh_start" as const] };
+    expect(withContextEntryFloor([custom], RUNNING)).toEqual([custom]);
+    const files = withContextEntryFloor([custom, start], RUNNING);
+    expect(files.map((file) => file.path)).toEqual(["openrig-start.md", "openrig-start.md", "openrig-context-entry.md"]);
+    expect(files[2]).toMatchObject({ deliveryHint: "guidance_merge", appliesOn: ["fresh_start", "restore"], ownerRoot: RUNNING, required: false });
+  });
+
+  // An older saved entry can lack ownerRoot. Its identity is unknown, so it isn't an anchor, and nothing throws.
+  it("an older saved openrig-start.md with no ownerRoot isn't an anchor, and the list comes back as it was", () => {
+    const legacy = { path: "openrig-start.md", absolutePath: `${OLD}/guidance/openrig-start.md`, deliveryHint: "guidance_merge" as const,
+      required: false, appliesOn: ["fresh_start" as const, "restore" as const] } as unknown as typeof start;
+    const files = [culture, legacy];
+    expect(withContextEntryFloor(files, RUNNING)).toEqual(files);
+  });
+
+  it("ships a thin pointer that names the skills router, help and declared context, not a method", () => {
+    const text = readFileSync(path.join(runningBuiltinAssetsRoot(), "guidance", "openrig-context-entry.md"), "utf8");
+    for (const pointer of ["openrig-skills", "rig context get help", "rig context list", "rig context work-install", "LEARNED.md"]) expect(text).toContain(pointer);
+    expect(text).not.toContain("mission-slice-sop");
+    expect(text.length).toBeLessThan(1000);
   });
 });

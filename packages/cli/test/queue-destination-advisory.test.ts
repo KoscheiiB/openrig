@@ -1,6 +1,20 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Hono } from "hono";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDaemon } from "../../daemon/src/startup.js";
+import { SettingsStore } from "../../daemon/src/domain/user-settings/settings-store.js";
+import { deriveCrossHostSuccessorId, stampSelfHostSuffix } from "../../daemon/src/domain/queue-repository.js";
+import { addHumanFragment } from "../../daemon/src/domain/gateway/human-registry.js";
+import { crossHostProvenanceTags, queueRoutes } from "../../daemon/src/routes/queue.js";
+import { getSelfHostId, setSelfHostId } from "../../daemon/src/domain/hosts/fanout-contract.js";
+import { deriveCurrentWork, resolveWorkNodeDirs } from "../../daemon/src/domain/current-work.js";
 import { queueCommand, type QueueDeps } from "../src/commands/queue.js";
+import { DaemonClient, DaemonResponseError } from "../src/client.js";
+import { createMcpServer } from "../src/mcp-server.js";
 
 describe("queue destination advisory through CLI and route", () => {
   it("prints the accepted typo unchanged for create and both handoffs", async () => {
@@ -55,4 +69,1659 @@ describe("queue destination advisory through CLI and route", () => {
       else process.env.OPENRIG_SESSION_NAME = saved.session;
     }
   }, 30_000);
+});
+
+describe("queue create scope advisories preserve admission and output", () => {
+  type Daemon = Awaited<ReturnType<typeof createDaemon>>;
+  type Fixture = { daemon: Daemon; app: Hono; root: string; missions: string; hostId: string | null };
+  let scratch: string;
+  let daemons: Daemon[];
+  let source: Fixture;
+  let stdout: string[];
+  let stderr: string[];
+  let responseHeaders: Headers[];
+  let createResponses: Array<{ status: number; data: Record<string, unknown> }>;
+  let handoffResponses: Array<{ status: number; data: Record<string, unknown> }>;
+  let handoffTransportHeaders: Record<string, string> | undefined;
+  let handoffRequestBody: Record<string, unknown> | undefined;
+  let savedHost: string | null;
+  let savedExit: typeof process.exitCode;
+
+  function spec(directory: string, id: string): void {
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, "SPEC.md"), `---\nid: ${id}\n---\n# Fixture\n`);
+  }
+
+  async function fixture(name: string): Promise<Fixture> {
+    const root = path.join(scratch, name);
+    const missions = path.join(root, "alpha", "missions");
+    spec(path.join(root, "alpha"), "alpha");
+    fs.writeFileSync(path.join(root, "workspace.yaml"), "projects:\n  - id: alpha\n    root: alpha\n");
+    fs.writeFileSync(path.join(root, "alpha", "project.yaml"), "id: alpha\nmissions:\n  root: missions\n");
+    spec(path.join(missions, "release"), "MISSION.ONE");
+    spec(path.join(missions, "release", "slices", "build"), "SLICE.ONE");
+    for (const dir of ["duplicate-a", "duplicate-b"]) {
+      spec(path.join(missions, dir), "DUP.MISSION");
+      spec(path.join(missions, "release", "slices", dir), "DUP.SLICE");
+    }
+    const fallback = path.join(root, "fallback");
+    spec(path.join(fallback, "release"), "FALLBACK.MISSION");
+    spec(path.join(fallback, "release", "slices", "build"), "FALLBACK.SLICE");
+    const config = path.join(root, "settings.json");
+    fs.writeFileSync(config, JSON.stringify({ workspace: {
+      root, slicesRoot: fallback, catalogPath: path.join(root, "workspace.yaml"),
+    } }));
+    const daemon = await createDaemon({ dbPath: ":memory:", tmuxExec: async () => "",
+      cmuxFactory: async () => { throw Object.assign(new Error("no fixture socket"), { code: "ENOENT" }); } });
+    daemons.push(daemon);
+    const rig = daemon.deps.rigRepo.createRig("scope");
+    for (const member of ["writer", "worker"]) daemon.deps.rigRepo.addNode(rig.id, member, { runtime: null });
+    const app = new Hono();
+    app.use("*", async (c, next) => {
+      const set = c.set.bind(c) as (key: string, value: unknown) => void;
+      for (const key of ["eventBus", "queueRepo", "inboxHandler", "outboxHandler", "rigRepo"] as const) {
+        set(key, daemon.deps[key]);
+      }
+      set("settingsStore", new SettingsStore(config));
+      await next();
+    });
+    app.route("/api/queue", queueRoutes());
+    return { daemon, app, root, missions, hostId: getSelfHostId() };
+  }
+
+  beforeEach(async () => {
+    savedExit = process.exitCode;
+    savedHost = getSelfHostId();
+    process.exitCode = undefined;
+    daemons = [];
+    scratch = fs.mkdtempSync(path.join(os.tmpdir(), "queue-scope-"));
+    vi.stubEnv("OPENRIG_NO_KERNEL", "1");
+    vi.stubEnv("OPENRIG_SESSION_NAME", "writer@scope");
+    vi.stubEnv("OPENRIG_OUTPUT_COMPACT", "0");
+    stdout = [];
+    stderr = [];
+    responseHeaders = [];
+    createResponses = [];
+    handoffResponses = [];
+    handoffTransportHeaders = undefined;
+    handoffRequestBody = undefined;
+    vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => { stdout.push(args.join(" ")); });
+    vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => { stderr.push(args.join(" ")); });
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true; });
+    source = await fixture("sender");
+  });
+
+  afterEach(() => {
+    for (const daemon of daemons) {
+      daemon.eventLoopMonitor.stop();
+      daemon.contextMonitor.stop();
+      daemon.deps.seatActivityService?.stop();
+      daemon.db.close();
+    }
+    setSelfHostId(savedHost);
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    process.exitCode = savedExit;
+    fs.rmSync(scratch, { recursive: true, force: true });
+  });
+
+  async function create(app: Hono, args: string[], json: boolean, id = "qitem-create-contract", clientFactory?: QueueDeps["clientFactory"], destination = "worker@scope", jsonOnlyResponse = false): Promise<void> {
+    stdout.length = 0;
+    stderr.length = 0;
+    const deps: QueueDeps = {
+      lifecycleDeps: { readFile: () => null, exists: () => false,
+        fetch: async () => ({ ok: true }) } as QueueDeps["lifecycleDeps"],
+      clientFactory: clientFactory ?? (() => ({
+        post: async (url: string, body: unknown) => {
+          const response = await app.request(url, { method: "POST",
+            headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope" },
+            body: JSON.stringify(body) });
+          responseHeaders.push(response.headers);
+          const data = await response.json() as Record<string, unknown>;
+          createResponses.push({ status: response.status, data });
+          return { status: response.status, data, ...(jsonOnlyResponse ? {} : { headers: response.headers }) };
+        },
+      }) as unknown as ReturnType<QueueDeps["clientFactory"]>),
+    };
+    await queueCommand(deps).parseAsync(["create", "--destination", destination,
+      "--body", "scope contract body", "--summary", "scope contract", "--id", id,
+      "--no-nudge", "--full", ...args, ...(json ? ["--json"] : [])], { from: "user" });
+  }
+
+  async function seedHandoffSource(tags: string[] | null, humanAlert = false, destination = "writer@scope") {
+    return source.daemon.deps.queueRepo.create({
+      sourceSession: "writer@scope",
+      destinationSession: destination,
+      body: "handoff source body",
+      summary: "handoff source",
+      ...(humanAlert ? { evidenceRef: "/fixture/human-alert-source.md" } : {}),
+      nudge: false,
+      ...(humanAlert ? { humanAlert: true } : {}),
+      ...(tags === null ? {} : { tags }),
+    });
+  }
+
+  function registerSyntheticHuman(entityId: string): string {
+    const tempRoot = path.resolve(scratch);
+    expect(tempRoot.startsWith(`${path.resolve(os.tmpdir())}${path.sep}`)).toBe(true);
+    const home = path.join(tempRoot, "registered-humans");
+    vi.stubEnv("OPENRIG_HOME", home);
+    const added = addHumanFragment({
+      entityId,
+      class: "human",
+      displayName: "Synthetic fixture human",
+      address: `${entityId}@external`,
+      connectorBindings: [],
+      prefs: { deliveryClass: "B" },
+    }, home);
+    expect(added.ok, added.ok ? undefined : added.error).toBe(true);
+    const loaded = source.daemon.deps.queueRepo.humanRegistry();
+    expect(loaded.ok, loaded.ok ? undefined : loaded.error).toBe(true);
+    if (!loaded.ok) throw new Error("synthetic human registry did not load from its isolated home");
+    expect(loaded.entities.some(entity => entity.entityId === entityId && entity.address === `${entityId}@external`)).toBe(true);
+    return `${entityId}@external`;
+  }
+
+  async function handoff(
+    app: Hono,
+    qitemId: string,
+    verb: "handoff" | "handoff-and-complete",
+    options: { json?: boolean; tags?: string[]; host?: string; destination?: string; compact?: boolean;
+      alert?: boolean; evidenceRef?: string } = {},
+  ): Promise<void> {
+    stdout.length = 0;
+    stderr.length = 0;
+    handoffResponses = [];
+    const client = {
+      post: async (url: string, body: unknown, options?: { headers?: Record<string, string> }) => {
+        handoffTransportHeaders = options?.headers;
+        handoffRequestBody = body as Record<string, unknown>;
+        const response = await app.request(url, { method: "POST",
+          headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope", ...(options?.headers ?? {}) },
+          body: JSON.stringify(body) });
+        const data = await response.json() as Record<string, unknown>;
+        handoffResponses.push({ status: response.status, data });
+        return { status: response.status, data };
+      },
+      get: async () => ({ status: 200, data: { selfHostId: source.hostId } }),
+    };
+    const deps: QueueDeps = {
+      lifecycleDeps: { readFile: () => null, exists: () => false,
+        fetch: async () => ({ ok: true }) } as QueueDeps["lifecycleDeps"],
+      clientFactory: () => client as unknown as ReturnType<QueueDeps["clientFactory"]>,
+    };
+    const args = [verb, qitemId, "--to", options.destination ?? "worker@scope", "--summary", "handoff scope contract",
+      "--no-nudge", ...(options.compact ? [] : ["--full"]), ...(options.tags ? ["--tags", options.tags.join(",")] : []),
+      ...(options.host ? ["--host", options.host] : []), ...(options.alert ? ["--alert"] : []),
+      ...(options.evidenceRef ? ["--evidence-ref", options.evidenceRef] : []), ...(options.json ? ["--json"] : [])];
+    await queueCommand(deps).parseAsync(args, { from: "user" });
+  }
+
+  const scopeAdvisoryCodes = new Set(["unresolved_scope", "ambiguous_scope", "empty_scope", "conflicting_scope",
+    "scope_check_unavailable", "scope_check_skipped"]);
+
+  function handoffScopeAdvisories(data: Record<string, unknown>): Array<Record<string, unknown>> {
+    const advisories = Array.isArray(data.advisories) ? data.advisories as Array<Record<string, unknown>> : [];
+    return advisories.filter(advisory => scopeAdvisoryCodes.has(String(advisory.code)));
+  }
+
+  function expectHandoffJsonProjection(data: Record<string, unknown>, space?: number): void {
+    const closedId = (data.closed as { qitemId: string }).qitemId;
+    const closed = source.daemon.deps.queueRepo.getById(closedId);
+    expect(closed).toBeTruthy();
+    // These baseline cases use a registered destination, whose unchanged response had no
+    // destination advisory. Derive the expected stdout from the committed source row and
+    // the actual successor result (which may carry receiver-owned advice on a forward).
+    expect(stdout).toEqual([JSON.stringify({ closed: JSON.parse(JSON.stringify(closed)), created: data.created }, null, space)]);
+  }
+
+  const handoffVerbs = [
+    { verb: "handoff" as const, closedState: "handed-off" },
+    { verb: "handoff-and-complete" as const, closedState: "done" },
+  ];
+
+  it.each(handoffVerbs)("keeps the default HTTP $verb response at its prior row-and-destination-advice shape", async ({ verb }) => {
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const destination = "missing-worker@scope";
+    const destinationAdvice = source.daemon.deps.queueRepo.destinationAdvisory(destination);
+    expect(destinationAdvice).toMatchObject({ code: "unmatched_destination_seat", destinationSession: destination });
+    const response = await source.app.request(`/api/queue/${encodeURIComponent(original.qitemId)}/${verb}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope" },
+      body: JSON.stringify({ toSession: destination, summary: "HTTP default contract", nudge: false }),
+    });
+    const actual = await response.json() as Record<string, unknown>;
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    const createdId = (actual.created as { qitemId: string }).qitemId;
+    const created = source.daemon.deps.queueRepo.getById(createdId);
+    expect(response.status).toBe(201);
+    expect(actual).toEqual({ closed: JSON.parse(JSON.stringify(closed)), created: JSON.parse(JSON.stringify(created)), advisories: [destinationAdvice] });
+  });
+
+  it.each(handoffVerbs)("keeps the default cross-host HTTP $verb response free of a new top-level scope field", async ({ verb }) => {
+    const receiver = await fixture("default-http-receiver");
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const { app, observation } = forwardingApp(receiver);
+    setSelfHostId(source.hostId);
+    const response = await app.request(`/api/queue/${encodeURIComponent(original.qitemId)}/${verb}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope" },
+      body: JSON.stringify({ toSession: "worker@scope", hostId: "remote-fixture", summary: "cross-host default contract", nudge: false }),
+    });
+    const actual = await response.json() as Record<string, unknown>;
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    expect(response.status).toBe(201);
+    expect(observation.forwards).toBe(1);
+    expect(observation.receiverPayloads).toHaveLength(1);
+    expect(actual).toEqual({ closed: JSON.parse(JSON.stringify(closed)), created: observation.receiverPayloads[0] });
+  });
+
+  it("keeps MCP handoff structured and text output at the default HTTP contract", async () => {
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const destination = "missing-worker@scope";
+    const destinationAdvice = source.daemon.deps.queueRepo.destinationAdvisory(destination);
+    let requestOptions: unknown;
+    let routedData: Record<string, unknown> | undefined;
+    const daemonClient = {
+      post: async (url: string, body: unknown, options?: unknown) => {
+        requestOptions = options;
+        const response = await source.app.request(url, { method: "POST",
+          headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope" },
+          body: JSON.stringify(body) });
+        routedData = await response.json() as Record<string, unknown>;
+        return { status: response.status, data: routedData };
+      },
+    };
+    const server = createMcpServer(daemonClient as never);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const mcpClient = new Client({ name: "2725-contract-test", version: "1" });
+    await server.connect(serverTransport);
+    await mcpClient.connect(clientTransport);
+    try {
+      const result = await mcpClient.callTool({ name: "rig_queue_handoff", arguments: {
+        qitemId: original.qitemId, to: destination, summary: "MCP default contract",
+      } });
+      const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+      const text = (result.content as Array<{ type: string; text: string }>).find(item => item.type === "text")?.text;
+      const parsed = JSON.parse(text ?? "null");
+      const expected = { closed: JSON.parse(JSON.stringify(closed)), created: routedData?.created, advisories: [destinationAdvice] };
+      expect(requestOptions).toBeUndefined();
+      expect(parsed).toEqual(expected);
+      expect(result.structuredContent).toEqual(expected);
+      expect(result.isError).toBeFalsy();
+    } finally {
+      await mcpClient.close();
+      await server.close();
+    }
+  });
+
+  it.each(handoffVerbs)("keeps the CLI $verb JSON rows and destination advice while scope advice goes to stderr", async ({ verb }) => {
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const destination = "missing-worker@scope";
+    const destinationAdvice = source.daemon.deps.queueRepo.destinationAdvisory(destination);
+    expect(destinationAdvice).toMatchObject({ code: "unmatched_destination_seat", destinationSession: destination });
+
+    await handoff(source.app, original.qitemId, verb, { json: true, destination });
+
+    const data = handoffResponses[0]!.data;
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    const createdId = (data.created as { qitemId: string }).qitemId;
+    const created = source.daemon.deps.queueRepo.getById(createdId);
+    expect(data.advisories).toEqual([destinationAdvice, expect.objectContaining({ code: "unresolved_scope" })]);
+    expect(data.handoffScopeCheckAcknowledged).toBe(true);
+    expect(handoffTransportHeaders).toEqual({ "X-OpenRig-CLI-Handoff-Scope-Advisory": "1" });
+    expect(handoffRequestBody).not.toHaveProperty("X-OpenRig-CLI-Handoff-Scope-Advisory");
+    expect(scopeLines()).toContain("Warning:");
+    expect(scopeLines()).toContain("mission:missing-mission");
+    expect(stdout).toEqual([JSON.stringify({ closed: JSON.parse(JSON.stringify(closed)),
+      created: JSON.parse(JSON.stringify(created)), advisories: [destinationAdvice] })]);
+    expect(JSON.parse(stdout[0]!)).not.toHaveProperty("handoffScopeCheckAcknowledged");
+    expect(closed).toMatchObject({ state: verb === "handoff" ? "handed-off" : "done", closureReason: "handed_off_to" });
+    expect(created).toMatchObject({ destinationSession: destination, tags: ["mission:missing-mission", "project:alpha"] });
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it.each(handoffVerbs)("keeps skipped-scope advice on an opted-in self-id $verb re-drive without sender reads", async ({ verb, closedState }) => {
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const selfHostId = source.hostId;
+    expect(selfHostId).toEqual(expect.any(String));
+    const successorId = deriveCrossHostSuccessorId(original.qitemId, "worker@scope", selfHostId!);
+    const successorTags = crossHostProvenanceTags(original.tags ?? undefined);
+    const successor = await source.daemon.deps.queueRepo.create({
+      qitemId: successorId,
+      sourceSession: stampSelfHostSuffix("writer@scope"),
+      destinationSession: "worker@scope",
+      body: original.body,
+      summary: "preexisting self-forward successor",
+      priority: original.priority,
+      tags: successorTags,
+      chainOfRecord: [original.qitemId],
+      nudge: false,
+      identityProvenance: "claimed:v1",
+    });
+    const before = JSON.parse(JSON.stringify(successor));
+    const senderReads = observeSenderScopeReads();
+    const response = await source.app.request(`/api/queue/${encodeURIComponent(original.qitemId)}/${verb}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope",
+        "X-OpenRig-CLI-Handoff-Scope-Advisory": "1" },
+      body: JSON.stringify({ toSession: "worker@scope", hostId: selfHostId, summary: "self-id re-drive",
+        tags: ["mission:requested-but-not-accepted"], nudge: false }),
+    });
+    const data = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(201);
+    expect(data.advisories).toEqual([expect.objectContaining({ code: "scope_check_skipped",
+      message: expect.stringContaining("self-id re-drive") })]);
+    expect(data.handoffScopeCheckAcknowledged).toBe(true);
+    expect(senderReads).toEqual([]);
+    expect(data.created).toEqual(before);
+    const [advisory] = handoffScopeAdvisories(data);
+    expect(advisory?.message).toContain("mission:missing-mission");
+    expect(advisory?.message).not.toContain("mission:requested-but-not-accepted");
+    expect(advisory?.message).toContain("tag provenance is unknown");
+    expect(advisory?.message).not.toMatch(/row was forwarded/i);
+    expect(source.daemon.deps.queueRepo.getById(successorId)).toEqual(successor);
+    expect(data.closed).toMatchObject({ qitemId: original.qitemId, state: closedState, closureReason: "handed_off_to" });
+    expect(source.daemon.deps.queueRepo.getById(original.qitemId)).toMatchObject({ state: closedState, handedOffTo: "worker@scope" });
+  });
+
+  function committed(f: Fixture, id: string, tags: string[] | null): void {
+    const stored = f.daemon.deps.queueRepo.getById(id);
+    expect(stored).toMatchObject({ qitemId: id, destinationSession: "worker@scope",
+      body: "scope contract body", summary: "scope contract", state: "pending", priority: "routine", tags });
+    expect(f.daemon.db.prepare("SELECT COUNT(*) AS n FROM queue_items WHERE qitem_id = ?").get(id)).toEqual({ n: 1 });
+    expect(process.exitCode ?? 0).toBe(0);
+    expect(stdout).toHaveLength(1);
+    // The independent read pins the unchanged primary row; advisories are the additive response field.
+    const output = JSON.parse(stdout[0]!) as Record<string, unknown>;
+    const { advisories, ...primary } = output;
+    expect(primary).toEqual(JSON.parse(JSON.stringify(stored)));
+    expect(advisories === undefined || Array.isArray(advisories)).toBe(true);
+  }
+
+  const scopeLines = () => stderr.join("\n").split("\n")
+    .filter(line => /\bscope\b|mission:|slice:/i.test(line)).join("\n");
+
+  const inheritedHandoffScopeCases = [
+    { name: "unresolved mission", tags: ["mission:missing-mission", "project:alpha"], code: "unresolved_scope", text: /unresolved|resolves to 0/i },
+    { name: "ambiguous mission", tags: ["mission:DUP.MISSION", "project:alpha"], code: "ambiguous_scope", text: /ambiguous|resolves to 2/i },
+    { name: "empty mission", tags: ["mission:", "project:alpha"], code: "empty_scope", text: /empty value/i },
+    { name: "conflicting missions", tags: ["mission:release", "mission:missing-mission", "project:alpha"], code: "conflicting_scope", text: /conflicting scope tags/i },
+    { name: "unavailable catalogue", tags: ["mission:release", "project:alpha"], code: "scope_check_unavailable", text: /unavailable|could not run/i },
+  ];
+
+  it.each(handoffVerbs.flatMap(({ verb, closedState }) => inheritedHandoffScopeCases.map(scopeCase => ({
+    ...scopeCase, verb, closedState,
+  }))))("queue handoff scope reports inherited $name for $verb without changing the committed write", async row => {
+    if (row.name === "unavailable catalogue") fs.writeFileSync(path.join(source.root, "workspace.yaml"), "projects: invalid\n");
+    const original = await seedHandoffSource(row.tags);
+    await handoff(source.app, original.qitemId, row.verb, { json: true });
+
+    expect(handoffResponses).toHaveLength(1);
+    expect(handoffResponses[0]!.status).toBe(201);
+    const data = handoffResponses[0]!.data;
+    const advisories = handoffScopeAdvisories(data);
+    expect(advisories).toHaveLength(1);
+    expect(advisories[0]).toMatchObject({ code: row.code, message: expect.stringMatching(row.text) });
+    expect(advisories[0]!.message).toContain(`queue ${row.verb} scope check`);
+    expect(advisories[0]!.message).toContain("inherited from the source item");
+    expect(scopeLines()).toContain("Warning:");
+    expect(scopeLines()).toContain("inherited from the source item");
+    if (row.code === "scope_check_unavailable") {
+      expect(scopeLines()).not.toMatch(/unresolved|resolves to 0/i);
+      expect(stderr.join("\n")).not.toContain("didn't report a scope check");
+    }
+
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    const created = data.created as { qitemId: string; tags: string[] | null; state: string };
+    expect(closed).toMatchObject({ state: row.closedState, closureReason: "handed_off_to" });
+    expect(created.tags).toEqual(row.tags);
+    expect(source.daemon.deps.queueRepo.getById(created.qitemId)?.tags).toEqual(row.tags);
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  it.each(handoffVerbs.flatMap(({ verb, closedState }) => [
+    { verb, closedState, sourceTags: ["mission:release", "project:alpha"], tags: ["mission:missing-mission", "project:alpha"], warns: true },
+    { verb, closedState, sourceTags: ["mission:missing-mission", "project:alpha"], tags: ["mission:release", "project:alpha"], warns: false },
+  ]))("queue handoff scope treats explicit tags as a full $verb replacement (warns: $warns)", async row => {
+    const original = await seedHandoffSource(row.sourceTags);
+    await handoff(source.app, original.qitemId, row.verb, { json: true, tags: row.tags });
+
+    const data = handoffResponses[0]!.data;
+    const created = data.created as { qitemId: string; tags: string[] | null };
+    expect(handoffResponses[0]!.status).toBe(201);
+    expect(created.tags).toEqual(row.tags);
+    expect(source.daemon.deps.queueRepo.getById(created.qitemId)?.tags).toEqual(row.tags);
+    expect(source.daemon.deps.queueRepo.getById(original.qitemId)?.state).toBe(row.closedState);
+    if (row.warns) {
+      const [advisory] = handoffScopeAdvisories(data);
+      expect(advisory).toMatchObject({ code: "unresolved_scope", message: expect.stringContaining("explicit tags supplied on this handoff") });
+      expect(scopeLines()).toContain("explicit tags supplied on this handoff");
+    } else {
+      expect(handoffScopeAdvisories(data)).toEqual([]);
+      expect(scopeLines()).toBe("");
+    }
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  it.each(handoffVerbs.flatMap(({ verb, closedState }) => [
+    { verb, closedState, tags: ["mission:release", "slice:SLICE.ONE", "project:alpha"] },
+    { verb, closedState, tags: null },
+  ]))("queue handoff scope stays quiet for resolved or untagged $verb rows", async row => {
+    const original = await seedHandoffSource(row.tags);
+    await handoff(source.app, original.qitemId, row.verb, { json: true });
+    const data = handoffResponses[0]!.data;
+    const created = data.created as { qitemId: string; tags: string[] | null };
+
+    expect(handoffResponses[0]!.status).toBe(201);
+    expect(data.handoffScopeCheckAcknowledged).toBe(true);
+    expect(handoffScopeAdvisories(data)).toEqual([]);
+    expect(scopeLines()).toBe("");
+    expect(created.tags).toEqual(row.tags);
+    expect(source.daemon.deps.queueRepo.getById(original.qitemId)?.state).toBe(row.closedState);
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  it.each(handoffVerbs)("queue handoff scope checks local inherited cross-host provenance for $verb", async ({ verb }) => {
+    const tags = ["mission:missing-mission", "project:alpha", "cross-host"];
+    const original = await seedHandoffSource(tags);
+    await handoff(source.app, original.qitemId, verb, { json: true });
+    const data = handoffResponses[0]!.data;
+    const [advisory] = handoffScopeAdvisories(data);
+
+    expect(advisory).toMatchObject({ code: "unresolved_scope", message: expect.stringContaining("inherited from the source item") });
+    expect(scopeLines()).toContain("inherited from the source item");
+    expect(scopeLines()).not.toMatch(/skipped|forwarded/i);
+    expectHandoffJsonProjection(data);
+  });
+
+  it("queue handoff scope keeps the default full stdout projection unchanged", async () => {
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    await handoff(source.app, original.qitemId, "handoff");
+    const data = handoffResponses[0]!.data;
+
+    expect(handoffScopeAdvisories(data)).toHaveLength(1);
+    expect(scopeLines()).toContain("Warning:");
+    expectHandoffJsonProjection(data, 2);
+  });
+
+  it.each(handoffVerbs)("acknowledges the opted-in $verb scope check for absent tags and keeps it out of stdout", async ({ verb }) => {
+    const original = await seedHandoffSource(null);
+    await handoff(source.app, original.qitemId, verb, { json: true });
+    const data = handoffResponses[0]!.data;
+
+    expect(handoffResponses[0]!.status).toBe(201);
+    expect(data.handoffScopeCheckAcknowledged).toBe(true);
+    expect(handoffScopeAdvisories(data)).toEqual([]);
+    expect(stderr.join("\n")).not.toMatch(/didn't report a scope check|scope_check_unavailable/i);
+    expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!)).not.toHaveProperty("handoffScopeCheckAcknowledged");
+    expectHandoffJsonProjection(data);
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it.each(handoffVerbs)("queue handoff scope reports cross-host $verb as skipped without sender scope reads", async ({ verb, closedState }) => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(["mission:missing-mission", "slice:MISSING.SLICE", "project:alpha"]);
+    const senderReads = observeSenderScopeReads();
+    const { app, observation } = forwardingApp(receiver);
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, verb, { json: true, host: "remote-fixture" });
+
+    expect(observation.forwards).toBe(1);
+    expect(observation.committedStatuses).toEqual([201]);
+    expect(observation.forwardedDiagnosticHeaders).toEqual([null]);
+    expect(observation.forwardedBodies[0]).not.toHaveProperty("X-OpenRig-CLI-Handoff-Scope-Advisory");
+    expect(handoffResponses[0]!.status).toBe(201);
+    const data = handoffResponses[0]!.data;
+    expect(data.handoffScopeCheckAcknowledged).toBe(true);
+    const [advisory] = handoffScopeAdvisories(data);
+    expect(handoffResponses[0]!.status, JSON.stringify(data, null, 2)).toBe(201);
+    expect(advisory).toMatchObject({ code: "scope_check_skipped",
+      message: expect.stringContaining(`queue ${verb} scope check skipped for cross-host write`) });
+    expect(advisory!.message).toContain("cross-host");
+    expect(advisory!.message).toContain("requested effective scope tags were inherited from the source item");
+    expect(scopeLines()).toContain("Note:");
+    expect(scopeLines()).toContain("skipped");
+    expect(senderReads).toEqual([]);
+
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    const created = data.created as { qitemId: string; tags: string[]; advisories?: Array<{ code: string }> };
+    expect(closed?.state).toBe(closedState);
+    expect(created.tags).toEqual(expect.arrayContaining(["mission:missing-mission", "slice:MISSING.SLICE", "cross-host"]));
+    expect(receiver.daemon.deps.queueRepo.getById(created.qitemId)?.tags).toEqual(created.tags);
+    expect(created.tags).not.toContain("X-OpenRig-CLI-Handoff-Scope-Advisory");
+    expect(process.exitCode ?? 0).toBe(0);
+    // The new internal daemon diagnostic is intentionally absent from stdout; the forwarded row remains intact.
+    expectHandoffJsonProjection(data);
+  });
+
+  it.each(handoffVerbs)("reports accepted explicit scope tags for absorbed cross-host $verb rows", async ({ verb }) => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const selfHostId = source.hostId;
+    setSelfHostId(selfHostId);
+    const successorId = deriveCrossHostSuccessorId(original.qitemId, "worker@scope", "remote-fixture");
+    const accepted = await receiver.daemon.deps.queueRepo.create({
+      qitemId: successorId,
+      sourceSession: stampSelfHostSuffix("writer@scope"),
+      destinationSession: "worker@scope",
+      body: original.body,
+      summary: "accepted existing successor",
+      priority: original.priority,
+      tags: crossHostProvenanceTags(["mission:accepted-scope"]),
+      chainOfRecord: [original.qitemId],
+      nudge: false,
+      identityProvenance: "claimed:v1",
+    });
+    expect(accepted.sourceSession).toBe(stampSelfHostSuffix("writer@scope"));
+    const { app } = forwardingApp(receiver);
+    setSelfHostId(selfHostId);
+    await handoff(app, original.qitemId, verb, { json: true, host: "remote-fixture", tags: ["mission:changed-request"] });
+
+    const data = handoffResponses[0]!.data;
+    const [advisory] = handoffScopeAdvisories(data);
+    expect(handoffResponses[0]!.status, JSON.stringify(data, null, 2)).toBe(201);
+    expect((data.created as { tags: string[] }).tags).toEqual(accepted.tags);
+    expect(advisory?.message).toContain("mission:accepted-scope");
+    expect(advisory?.message).not.toContain("mission:changed-request");
+    expect(advisory?.message).toContain("tag provenance is unknown");
+    expect(advisory?.message).toContain(`queue ${verb} scope check skipped for cross-host write`);
+  });
+
+  const absorbedNullTagHandoffCases = handoffVerbs.flatMap(({ verb, closedState }) => [
+    { path: "cross-host" as const, scope: "inherited" as const, tags: undefined },
+    { path: "cross-host" as const, scope: "explicit" as const, tags: ["mission:explicit-missing"] },
+    { path: "self-id" as const, scope: "inherited" as const, tags: undefined },
+    { path: "self-id" as const, scope: "explicit" as const, tags: ["mission:explicit-missing"] },
+  ].map(row => ({ ...row, verb, closedState })));
+
+  it.each(absorbedNullTagHandoffCases)("keeps native null tags quiet on an absorbed $path $scope $verb successor", async row => {
+    const receiver = row.path === "cross-host" ? await fixture("null-tags-receiver") : source;
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    setSelfHostId(source.hostId);
+    const targetHostId = row.path === "cross-host" ? "remote-fixture" : source.hostId;
+    const successorId = deriveCrossHostSuccessorId(original.qitemId, "worker@scope", targetHostId);
+    const accepted = await receiver.daemon.deps.queueRepo.create({
+      qitemId: successorId,
+      sourceSession: stampSelfHostSuffix("writer@scope"),
+      destinationSession: "worker@scope",
+      body: original.body,
+      summary: "previously absorbed null-tag successor",
+      priority: original.priority,
+      chainOfRecord: [original.qitemId],
+      nudge: false,
+      identityProvenance: "claimed:v1",
+      // Omit tags to model the repository's native response for an untagged row.
+    });
+    expect(accepted.tags).toBeNull();
+    expect(accepted.sourceSession).toBe(stampSelfHostSuffix("writer@scope"));
+
+    let app: Hono;
+    if (row.path === "cross-host") {
+      app = forwardingApp(receiver).app;
+      setSelfHostId(source.hostId);
+    } else {
+      app = source.app;
+      setSelfHostId(source.hostId);
+    }
+    await handoff(app, original.qitemId, row.verb, {
+      json: true,
+      host: targetHostId,
+      ...(row.tags === undefined ? {} : { tags: row.tags }),
+    });
+
+    const data = handoffResponses[0]!.data;
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    const returned = data.created as Record<string, unknown>;
+    const stored = receiver.daemon.deps.queueRepo.getById(successorId);
+    expect(handoffResponses[0]!.status, JSON.stringify(data, null, 2)).toBe(201);
+    expect(returned.tags).toBeNull();
+    expect(returned).toEqual(JSON.parse(JSON.stringify(accepted)));
+    expect(stored).toEqual(accepted);
+    expect(receiver.daemon.db.prepare("SELECT COUNT(*) AS n FROM queue_items WHERE qitem_id = ?").get(successorId)).toEqual({ n: 1 });
+    expect(handoffScopeAdvisories(data)).toEqual([]);
+    expect(scopeLines()).toBe("");
+    expect(closed).toMatchObject({
+      qitemId: original.qitemId,
+      state: row.closedState,
+      closureReason: "handed_off_to",
+      handedOffTo: "worker@scope",
+      closureTarget: `${successorId}@${targetHostId}`,
+    });
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  it.each(handoffVerbs)("qualifies requested explicit tags for fresh cross-host $verb rows", async ({ verb }) => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(["mission:source-scope"]);
+    const { app } = forwardingApp(receiver);
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, verb, { json: true, host: "remote-fixture", tags: ["mission:explicit-scope"] });
+
+    const data = handoffResponses[0]!.data;
+    const [advisory] = handoffScopeAdvisories(data);
+    expect(handoffResponses[0]!.status, JSON.stringify(data, null, 2)).toBe(201);
+    expect((data.created as { tags: string[] }).tags).toEqual(crossHostProvenanceTags(["mission:explicit-scope"]));
+    expect(advisory?.message).toContain("requested effective scope tags came from explicit tags supplied on this handoff");
+    expect(advisory?.message).toContain("mission:explicit-scope");
+    expect(advisory?.message).not.toContain("mission:source-scope");
+  });
+
+  it.each(handoffVerbs.flatMap(({ verb, closedState }) => [
+    { label: "inherited", sourceTags: ["mission:source-scope"], requestedTags: undefined, expectedScopeTags: ["mission:source-scope"] },
+    { label: "explicit", sourceTags: ["mission:source-scope"], requestedTags: ["mission:requested-scope"], expectedScopeTags: ["mission:requested-scope"] },
+  ].map(row => ({ ...row, verb, closedState }))))("uses requested $label scope for a successful cross-host $verb response with missing tags", async row => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(row.sourceTags);
+    let reportedPayload: Record<string, unknown> | undefined;
+    const { app, observation } = forwardingApp(receiver, false, undefined, async response => {
+      reportedPayload = await response.clone().json() as Record<string, unknown>;
+      delete reportedPayload.tags;
+      const headers = new Headers(response.headers);
+      headers.delete("content-length");
+      return new Response(JSON.stringify(reportedPayload), { status: response.status, headers });
+    });
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, row.verb, { json: true, host: "remote-fixture",
+      ...(row.requestedTags === undefined ? {} : { tags: row.requestedTags }) });
+
+    const data = handoffResponses[0]!.data;
+    const [advisory] = handoffScopeAdvisories(data);
+    const created = data.created as Record<string, unknown>;
+    const successorId = deriveCrossHostSuccessorId(original.qitemId, "worker@scope", "remote-fixture");
+    const accepted = receiver.daemon.deps.queueRepo.getById(successorId);
+
+    expect(observation.committedStatuses).toEqual([201]);
+    expect(observation.forwardedDiagnosticHeaders).toEqual([null]);
+    expect(handoffResponses[0]!.status).toBe(201);
+    expect(source.daemon.deps.queueRepo.getById(original.qitemId)?.state).toBe(row.closedState);
+    expect(accepted?.tags).toEqual(crossHostProvenanceTags(row.requestedTags ?? original.tags ?? []));
+    expect(reportedPayload).not.toHaveProperty("tags");
+    expect(created).toEqual(reportedPayload);
+    expect(created).not.toHaveProperty("tags");
+    expect(advisory).toMatchObject({ code: "scope_check_skipped" });
+    expect(advisory?.message).toContain("queue " + row.verb + " scope check skipped for cross-host write");
+    for (const tag of row.expectedScopeTags) expect(advisory?.message).toContain(tag);
+    expect(advisory?.message).toContain("effective scope tag provenance is unknown");
+    expect(advisory?.message).not.toContain("inherited from the source item");
+    expect(advisory?.message).not.toContain("explicit tags supplied on this handoff");
+    expect(scopeLines()).toContain("Note:");
+    for (const tag of row.expectedScopeTags) expect(scopeLines()).toContain(tag);
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  it.each(handoffVerbs)("does not infer requested scope when a successful cross-host $verb response explicitly reports empty tags", async ({ verb }) => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(["mission:source-scope"]);
+    let reportedPayload: Record<string, unknown> | undefined;
+    const { app } = forwardingApp(receiver, false, undefined, async response => {
+      reportedPayload = await response.clone().json() as Record<string, unknown>;
+      reportedPayload.tags = [];
+      const headers = new Headers(response.headers);
+      headers.delete("content-length");
+      return new Response(JSON.stringify(reportedPayload), { status: response.status, headers });
+    });
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, verb, { json: true, host: "remote-fixture", tags: ["mission:requested-scope"] });
+
+    const data = handoffResponses[0]!.data;
+    expect(handoffResponses[0]!.status).toBe(201);
+    expect(data.created).toEqual(reportedPayload);
+    expect((data.created as Record<string, unknown>).tags).toEqual([]);
+    expect(handoffScopeAdvisories(data)).toHaveLength(0);
+    expect(scopeLines()).toBe("");
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  const crossHostHumanAlertTagCases = [
+    {
+      name: "inherited scope with --alert addition",
+      recipientId: "human-alert-inherited-add",
+      sourceTags: ["mission:missing-mission", "project:alpha"],
+      alert: true,
+      tags: undefined,
+      effectiveScopeTags: ["mission:missing-mission", "project:alpha"],
+      expectedProvenance: "requested effective scope tags were inherited from the source item",
+      humanAlert: true,
+    },
+    {
+      name: "explicit scope with --alert addition",
+      recipientId: "human-alert-explicit-add",
+      sourceTags: ["mission:source-scope", "project:alpha"],
+      alert: true,
+      tags: ["mission:explicit-scope", "project:alpha"],
+      effectiveScopeTags: ["mission:explicit-scope", "project:alpha"],
+      expectedProvenance: "requested effective scope tags came from explicit tags supplied on this handoff",
+      humanAlert: true,
+    },
+    {
+      name: "inherited human-alert removal",
+      recipientId: "human-alert-inherited-remove",
+      sourceTags: ["mission:missing-mission", "project:alpha", "human-alert"],
+      alert: false,
+      tags: undefined,
+      effectiveScopeTags: ["mission:missing-mission", "project:alpha"],
+      expectedProvenance: "requested effective scope tags were inherited from the source item",
+      humanAlert: false,
+    },
+  ];
+
+  it.each(handoffVerbs.flatMap(({ verb, closedState }) => crossHostHumanAlertTagCases.map(row => ({
+    ...row, verb, closedState,
+  }))))("preserves $name provenance on cross-host $verb", async row => {
+    const recipient = registerSyntheticHuman(row.recipientId);
+    const receiver = await fixture("receiver");
+    const removingAlert = row.name.includes("removal");
+    const original = await seedHandoffSource(row.sourceTags, removingAlert, removingAlert ? recipient : "writer@scope");
+    if (removingAlert) {
+      expect(original.tags).toContain("human-alert");
+      expect(original.destinationSession).toBe(recipient);
+    }
+    const { app, observation } = forwardingApp(receiver);
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, row.verb, {
+      json: true,
+      host: "remote-fixture",
+      destination: recipient,
+      alert: row.alert,
+      evidenceRef: "/fixture/human-alert-scope.md",
+      ...(row.tags ? { tags: row.tags } : {}),
+    });
+
+    expect(observation.forwards).toBe(1);
+    expect(observation.committedStatuses, JSON.stringify(handoffResponses[0]?.data, null, 2)).toEqual([201]);
+    expect(handoffResponses).toHaveLength(1);
+    expect(handoffResponses[0]!.status).toBe(201);
+    const data = handoffResponses[0]!.data;
+    const [advisory] = handoffScopeAdvisories(data);
+    expect(advisory).toMatchObject({ code: "scope_check_skipped" });
+    expect(advisory!.message).toContain(`queue ${row.verb} scope check skipped for cross-host write`);
+    expect(advisory!.message).toContain(row.expectedProvenance);
+    expect(advisory!.message).not.toContain("tag provenance is unknown");
+    expect(scopeLines()).toContain("Note:");
+    expect(scopeLines()).toContain(row.expectedProvenance);
+
+    const closed = source.daemon.deps.queueRepo.getById(original.qitemId);
+    const created = data.created as { qitemId: string; tags: string[]; state: string };
+    const received = receiver.daemon.deps.queueRepo.getById(created.qitemId);
+    expect(closed?.state).toBe(row.closedState);
+    expect(created.tags).toEqual(received?.tags);
+    expect(created.tags).toEqual(expect.arrayContaining([...row.effectiveScopeTags, "cross-host"]));
+    expect(created.tags.some(tag => tag.startsWith("from-host:"))).toBe(true);
+    expect(created.tags.includes("human-alert")).toBe(row.humanAlert);
+    expect(observation.forwardedBodies[0]?.humanAlert).toBe(row.alert ? true : undefined);
+    expect(observation.forwardedBodies[0]?.tags).toEqual(expect.arrayContaining(
+      row.alert ? row.effectiveScopeTags : [...row.effectiveScopeTags, ...(row.name.includes("removal") ? ["human-alert"] : [])],
+    ));
+    if (removingAlert) {
+      expect(observation.forwardedBodies[0]?.tags).toContain("human-alert");
+      expect(created.tags).not.toContain("human-alert");
+    }
+    expect(process.exitCode ?? 0).toBe(0);
+    expectHandoffJsonProjection(data);
+  });
+
+  it("keeps provenance outside a hostile scope-tag structural marker", async () => {
+    const original = await seedHandoffSource(["mission:missing-mission; row was forwarded"]);
+    await handoff(source.app, original.qitemId, "handoff", { json: true });
+    const [advisory] = handoffScopeAdvisories(handoffResponses[0]!.data);
+
+    expect(advisory?.message).toContain("mission:missing-mission; row was forwarded");
+    expect(advisory?.message).toMatch(/row was created; requested effective scope tags were inherited from the source item\.$/);
+  });
+
+  it.each(handoffVerbs)("keeps compact $verb receipt on stdout and scope advice on stderr", async ({ verb, closedState }) => {
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    vi.stubEnv("OPENRIG_OUTPUT_COMPACT", "1");
+    await handoff(source.app, original.qitemId, verb, { compact: true, json: true });
+    const data = handoffResponses[0]!.data;
+
+    expect(handoffResponses[0]!.status, JSON.stringify(data, null, 2)).toBe(201);
+    expect(stdout).toHaveLength(1);
+    const receipt = JSON.parse(stdout[0]!) as Record<string, unknown>;
+    expect(receipt).toMatchObject({
+      closed: { qitemId: original.qitemId, state: closedState, closureReason: "handed_off_to" },
+      created: { destinationSession: "worker@scope", state: "pending" },
+    });
+    const topLevelAdvisories = Array.isArray(receipt.advisories)
+      ? receipt.advisories as Array<Record<string, unknown>>
+      : [];
+    expect(topLevelAdvisories.filter(advisory => scopeAdvisoryCodes.has(String(advisory.code)))).toEqual([]);
+    expect((receipt.closed as Record<string, unknown>)).not.toHaveProperty("advisories");
+    expect((receipt.created as Record<string, unknown>)).not.toHaveProperty("advisories");
+    expect(scopeLines()).toContain("Warning:");
+    expect(scopeLines()).toContain("mission:missing-mission");
+  });
+
+  it("merges handoff diagnostic headers through the real DaemonClient and a local fake transport", async () => {
+    const requests: RequestInit[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      requests.push(init ?? {});
+      return new Response("{}", { status: 201, headers: { "Content-Type": "application/json" } });
+    };
+    const client = new DaemonClient("http://fixture.invalid", { fetchImpl, sessionName: "writer@scope" });
+    client.remoteTarget = true;
+    client.originSelfHostId = "fixture-host";
+    await client.post("/api/queue/qitem-fixture/handoff", {}, {
+      headers: { "X-OpenRig-CLI-Handoff-Scope-Advisory": "1" },
+    });
+
+    const headers = new Headers(requests[0]?.headers);
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(headers.get("x-openrig-cli-handoff-scope-advisory")).toBe("1");
+    expect(headers.get("x-openrig-session")).toBe("writer@scope@fixture-host");
+  });
+
+  it.each(handoffVerbs)("queue handoff scope emits no advice when local $verb fails", async ({ verb }) => {
+    await handoff(source.app, "qitem-does-not-exist", verb, { json: true });
+    expect(handoffResponses[0]!.status).toBe(404);
+    expect(handoffResponses[0]!.data).not.toHaveProperty("handoffScopeCheckAcknowledged");
+    expect(handoffScopeAdvisories(handoffResponses[0]!.data)).toEqual([]);
+    expect(scopeLines()).toBe("");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it.each(handoffVerbs)("queue handoff scope emits no advice when cross-host $verb forwarding fails", async ({ verb }) => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    const { app, observation } = forwardingApp(receiver, false, () => new Response(JSON.stringify({ error: "fixture_forward_failed" }), { status: 502 }));
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, verb, { json: true, host: "remote-fixture" });
+
+    expect(observation.forwards).toBe(1);
+    expect(handoffResponses[0]!.status).toBe(502);
+    expect(handoffResponses[0]!.data).not.toHaveProperty("handoffScopeCheckAcknowledged");
+    expect(source.daemon.deps.queueRepo.getById(original.qitemId)?.state).toBe("pending");
+    expect(handoffScopeAdvisories(handoffResponses[0]!.data)).toEqual([]);
+    expect(scopeLines()).toBe("");
+    expect(process.exitCode).toBe(2);
+  });
+
+  it.each(handoffVerbs)("queue handoff scope emits no advice when cross-host $verb close conflicts", async ({ verb }) => {
+    const receiver = await fixture("receiver");
+    const original = await seedHandoffSource(["mission:missing-mission", "project:alpha"]);
+    if (verb === "handoff") {
+      await source.daemon.deps.queueRepo.handoff({ qitemId: original.qitemId,
+        fromSession: "writer@scope", toSession: "worker@scope", nudge: false });
+    } else {
+      await source.daemon.deps.queueRepo.handoffAndComplete({ qitemId: original.qitemId,
+        fromSession: "writer@scope", toSession: "worker@scope", nudge: false });
+    }
+    const { app, observation } = forwardingApp(receiver);
+    setSelfHostId(source.hostId);
+    await handoff(app, original.qitemId, verb, { json: true, host: "remote-fixture" });
+
+    expect(observation.forwards).toBe(0);
+    expect(handoffResponses[0]!.status).toBe(409);
+    expect(handoffResponses[0]!.data).not.toHaveProperty("handoffScopeCheckAcknowledged");
+    expect(handoffScopeAdvisories(handoffResponses[0]!.data)).toEqual([]);
+    expect(scopeLines()).toBe("");
+    expect(process.exitCode).toBe(1);
+  });
+
+  function assertJsonCreate(f: Fixture, destination: string, tags: string[]): Record<string, unknown> {
+    expect(createResponses).toHaveLength(1);
+    expect(createResponses[0]!.status).toBe(201);
+    const data = createResponses[0]!.data;
+    const stored = f.daemon.deps.queueRepo.getById("qitem-create-contract");
+    expect(stored).toMatchObject({ destinationSession: destination, body: "scope contract body", tags });
+    expect(f.daemon.db.prepare("SELECT COUNT(*) AS n FROM queue_items WHERE qitem_id = ?")
+      .get("qitem-create-contract")).toEqual({ n: 1 });
+    const { advisories: _advisories, ...primary } = data;
+    expect(primary).toEqual(JSON.parse(JSON.stringify(stored)));
+    expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!)).toEqual(data);
+    expect(process.exitCode ?? 0).toBe(0);
+    return data;
+  }
+
+  it.each([
+    { mission: "MISSING.MISSION", code: "unresolved_scope", diagnostic: /unresolved|resolves to 0/i },
+    { mission: "DUP.MISSION", code: "ambiguous_scope", diagnostic: /ambiguous|resolves to 2/i },
+    { mission: "release", code: "scope_check_unavailable", diagnostic: /unavailable|could not.*check/i },
+  ])("carries $code in the real create JSON and renders it once without response headers", async row => {
+    if (row.code === "scope_check_unavailable") {
+      fs.writeFileSync(path.join(source.root, "workspace.yaml"), "projects: invalid\n");
+    }
+    const unchanged = preserveAuthored(source);
+    const tag = "mission:" + row.mission;
+    await create(source.app, ["--mission", row.mission, "--tags", "project:alpha"], true,
+      "qitem-create-contract", undefined, "worker@scope", true);
+    const data = assertJsonCreate(source, "worker@scope", [tag, "project:alpha"]);
+    unchanged();
+    expect.soft(data.advisories).toEqual([expect.objectContaining({ code: row.code,
+      message: expect.stringMatching(row.diagnostic) })]);
+    const advice = Array.isArray(data.advisories) ? data.advisories : [];
+    expect.soft(advice.map(item => item.message).join("\n")).toContain(tag);
+    expect.soft(responseHeaders[0]!.has("X-OpenRig-Scope-Advisory")).toBe(false);
+    const rendered = scopeLines().split("\n").filter(line => line.includes(tag) && row.diagnostic.test(line));
+    expect.soft(rendered).toHaveLength(1);
+  });
+
+  it("keeps the destination advisory before scope advice in the real JSON response", async () => {
+    const destination = "missing-worker@scope";
+    await create(source.app, ["--mission", "MISSING.MISSION", "--tags", "project:alpha"], true,
+      "qitem-create-contract", undefined, destination, true);
+    const data = assertJsonCreate(source, destination, ["mission:MISSING.MISSION", "project:alpha"]);
+    const advice = Array.isArray(data.advisories) ? data.advisories : [];
+    expect.soft(advice.map(item => item.code)).toEqual(["unmatched_destination_seat", "unresolved_scope"]);
+    expect.soft(advice[0]).toMatchObject({ destinationSession: destination,
+      availableDestinations: expect.arrayContaining(["worker@scope", "writer@scope"]) });
+    expect.soft(scopeLines().split("\n").filter(line => /mission:MISSING.MISSION.*unresolved|unresolved.*mission:MISSING.MISSION/i.test(line)))
+      .toHaveLength(1);
+  });
+
+  it("keeps long Unicode scope messages in JSON and stderr without a header-sized limit", async () => {
+    fs.writeFileSync(path.join(source.root, "workspace.yaml"), "projects: invalid\n");
+    const tags = ["project:alpha", ...Array.from({ length: 9 }, (_, i) =>
+      "mission:" + ("部署_" + i + "_").padEnd(150, "x") + "_末尾")];
+    await create(source.app, ["--tags", tags.join(",")], true,
+      "qitem-create-contract", undefined, "worker@scope", true);
+    const data = assertJsonCreate(source, "worker@scope", tags);
+    const advice = Array.isArray(data.advisories) ? data.advisories : [];
+    const messages = advice.map(item => item.message).join("\n");
+    expect.soft(advice).toEqual([expect.objectContaining({ code: "scope_check_unavailable", message: expect.any(String) })]);
+    expect.soft(messages.length).toBeGreaterThan(1024);
+    for (const tag of tags.slice(1)) {
+      expect.soft(messages).toContain(tag);
+      expect.soft(scopeLines()).toContain(tag);
+    }
+    expect.soft(scopeLines().split("\n").filter(line => /unavailable|could not.*check/i.test(line))).toHaveLength(1);
+    expect.soft(responseHeaders[0]!.has("X-OpenRig-Scope-Advisory")).toBe(false);
+  });
+
+  it("returns skipped scope advice for a forwarded create without sender scope reads", async () => {
+    const receiver = await fixture("json-receiver");
+    const { app, observation } = forwardingApp(receiver);
+    const senderReads = observeSenderScopeReads();
+    setSelfHostId(source.hostId);
+    await create(app, ["--host", "remote-fixture", "--mission", "MISSING.MISSION", "--tags", "project:alpha"], true,
+      "qitem-create-contract", undefined, "worker@scope", true);
+    const data = assertJsonCreate(receiver, "worker@scope", ["mission:MISSING.MISSION", "project:alpha", "cross-host", "from-host:" + os.hostname()]);
+    expect(observation.forwards).toBe(1);
+    expect(source.daemon.deps.queueRepo.getById("qitem-create-contract")).toBeNull();
+    expect(senderReads).toEqual([]);
+    const advice = Array.isArray(data.advisories) ? data.advisories : [];
+    expect.soft(advice).toEqual([expect.objectContaining({ code: expect.any(String), message: expect.stringMatching(/skipped.*cross-host|cross-host.*skipped/i) })]);
+    expect.soft(scopeLines()).toMatch(/skipped/i);
+    expect.soft(scopeLines()).not.toMatch(/unresolved|unavailable|resolves to 0/i);
+    expect.soft(responseHeaders[0]!.has("X-OpenRig-Scope-Advisory")).toBe(false);
+  });
+
+  it("keeps receiver destination advice before forwarded skipped scope advice", async () => {
+    const receiver = await fixture("advisory-receiver");
+    const { app, observation } = forwardingApp(receiver);
+    const senderReads = observeSenderScopeReads();
+    setSelfHostId(source.hostId);
+    const destination = "missing-worker@scope";
+    const tags = ["mission:release", "slice:SLICE.ONE", "project:alpha", "cross-host", "from-host:" + os.hostname()];
+
+    await create(app, ["--host", "remote-fixture", "--mission", "release", "--slice", "SLICE.ONE",
+      "--tags", "project:alpha"], true, "qitem-create-contract", undefined, destination);
+
+    const data = assertJsonCreate(receiver, destination, tags);
+    const advisories = Array.isArray(data.advisories)
+      ? data.advisories as Array<{ code?: unknown; message?: unknown }>
+      : [];
+    expect(advisories.map(advisory => advisory.code)).toEqual(["unmatched_destination_seat", "scope_check_skipped"]);
+    expect(advisories[0]).toMatchObject({ destinationSession: destination,
+      availableDestinations: expect.arrayContaining(["worker@scope", "writer@scope"]) });
+    expect(advisories[1]).toMatchObject({ message: expect.stringMatching(/skipped.*cross-host|cross-host.*skipped/i) });
+    expect(observation.forwards).toBe(1);
+    expect(observation.committedStatuses).toEqual([201]);
+    expect(source.daemon.deps.queueRepo.getById("qitem-create-contract")).toBeNull();
+    expect(receiver.daemon.deps.queueRepo.getById("qitem-create-contract")?.sourceSession)
+      .toBe("writer@scope@" + source.hostId);
+    expect(senderReads).toEqual([]);
+  });
+
+  it.each([
+    { label: "JSON null", reply: () => Response.json(null, { status: 202 }), expectedBody: "null" },
+    { label: "JSON array", reply: () => Response.json(["receiver-payload"], { status: 202 }), expectedBody: '["receiver-payload"]' },
+    { label: "non-JSON body", reply: () => new Response("receiver-payload", {
+      status: 202, headers: { "Content-Type": "text/plain" },
+    }), expectedBody: "" },
+  ])("passes through a forwarded $label response unchanged", async row => {
+    const receiver = await fixture("malformed-response-receiver");
+    const { app, observation } = forwardingApp(receiver, false, row.reply);
+    const senderReads = observeSenderScopeReads();
+    setSelfHostId(source.hostId);
+    const id = "qitem-create-contract";
+    const response = await app.request("/api/queue/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope" },
+      body: JSON.stringify({ qitemId: id, destinationSession: "worker@scope", body: "scope contract body",
+        summary: "scope contract", nudge: false, hostId: "remote-fixture",
+        tags: ["mission:release", "slice:SLICE.ONE", "project:alpha"] }),
+    });
+    const responseBody = await response.text();
+
+    expect(response.status).toBe(202);
+    expect(responseBody).toBe(row.expectedBody);
+    expect(observation.forwards).toBe(1);
+    expect(observation.committedStatuses).toEqual([202]);
+    expect(source.daemon.deps.queueRepo.getById(id)).toBeNull();
+    expect(receiver.daemon.deps.queueRepo.getById(id)).toBeNull();
+    expect(senderReads).toEqual([]);
+  });
+
+  function preserveAuthored(f: Fixture): () => void {
+    const read = fs.readFileSync.bind(fs);
+    const stat = fs.statSync.bind(fs);
+    const list = fs.readdirSync.bind(fs);
+    const snapshot = (): Record<string, string> => {
+      const files: Record<string, string> = {};
+      const visit = (file: string): void => {
+        if (stat(file).isDirectory()) {
+          for (const child of list(file).sort()) visit(path.join(file, child));
+        } else files[path.relative(f.root, file)] = read(file, "utf8");
+      };
+      for (const file of ["workspace.yaml", "alpha/project.yaml", "alpha/missions"]) visit(path.join(f.root, file));
+      return files;
+    };
+    const before = snapshot();
+    return () => expect(snapshot()).toEqual(before);
+  }
+
+  function observeSenderScopeReads(): string[] {
+    const reads: string[] = [];
+    for (const method of ["readdirSync", "readFileSync", "statSync", "existsSync"] as const) {
+      const original = fs[method].bind(fs) as (...args: unknown[]) => unknown;
+      vi.spyOn(fs, method).mockImplementation(((...args: unknown[]) => {
+        if (String(args[0]) === path.join(source.root, "workspace.yaml")
+          || String(args[0]) === source.missions || String(args[0]).startsWith(source.missions + path.sep)) {
+          reads.push(method + ":" + String(args[0]));
+        }
+        return original(...args);
+      }) as never);
+    }
+    return reads;
+  }
+
+  function forwardingApp(receiver: Fixture, loseResponse = false, remoteResponse?: () => Response,
+    transformRemoteResponse?: (response: Response) => Promise<Response>) {
+    const observation = { forwards: 0, committedStatuses: [] as number[],
+      forwardedDiagnosticHeaders: [] as Array<string | null>, forwardedBodies: [] as Array<Record<string, unknown>>,
+      receiverPayloads: [] as Array<Record<string, unknown>> };
+    const app = new Hono();
+    app.use("*", async (c, next) => {
+      const set = c.set.bind(c) as (key: string, value: unknown) => void;
+      for (const key of ["eventBus", "queueRepo", "inboxHandler", "outboxHandler", "rigRepo"] as const) set(key, source.daemon.deps[key]);
+      set("settingsStore", new SettingsStore(path.join(source.root, "settings.json")));
+      set("hostRegistryLoader", () => ({ ok: true, registry: { hosts: [
+        { id: "remote-fixture", transport: "http", url: "http://remote-fixture.invalid:39001" },
+      ] } }));
+      set("remoteFetchImpl", async (_url: unknown, init: RequestInit) => {
+        observation.forwards++;
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        observation.forwardedBodies.push(body);
+        observation.forwardedDiagnosticHeaders.push(new Headers(init.headers).get("X-OpenRig-CLI-Handoff-Scope-Advisory"));
+        const previous = getSelfHostId();
+        setSelfHostId(receiver.hostId);
+        try {
+          const originResponse = remoteResponse ? null : await receiver.app.request("/api/queue/create", { ...init,
+            headers: { "Content-Type": "application/json", "X-OpenRig-Session": body.sourceSession } });
+          let response = remoteResponse ? remoteResponse() : originResponse!;
+          observation.committedStatuses.push(response.status);
+          if (originResponse && originResponse.status < 400) observation.receiverPayloads.push(await originResponse.clone().json() as Record<string, unknown>);
+          if (transformRemoteResponse) response = await transformRemoteResponse(response);
+          if (loseResponse) {
+            await response.text();
+            return new Response(new ReadableStream({ start(controller) {
+              controller.error(new Error("fixture lost receiver body after commit"));
+            } }), { status: response.status, headers: response.headers });
+          }
+          return response;
+        } finally { setSelfHostId(previous); }
+      });
+      await next();
+    });
+    app.route("/api/queue", queueRoutes());
+    return { app, observation };
+  }
+
+  function recoveredClient(app: Hono, target: Fixture, typedLoss: boolean, readHealth?: (observation: number) => string | null) {
+    const calls = { posts: [] as string[], readbacks: [] as Array<{ base: string; url: string }>, postStatuses: [] as number[],
+      postBodies: [] as unknown[], committedBeforeLoss: [] as unknown[], healthReads: 0,
+      healthResults: [] as Array<string | null> };
+    const factory: QueueDeps["clientFactory"] = (base: string) => ({
+      senderIdentity: async () => ({ session: "writer@scope", originUnknown: false }),
+      post: async (url: string, body: unknown) => {
+        calls.posts.push(url);
+        calls.postBodies.push(body);
+        const response = await app.request(url, { method: "POST",
+          headers: { "Content-Type": "application/json", "X-OpenRig-Session": "writer@scope" },
+          body: JSON.stringify(body) });
+        calls.postStatuses.push(response.status);
+        if (typedLoss) {
+          await response.text();
+          calls.committedBeforeLoss.push(target.daemon.deps.queueRepo.getById((body as { qitemId: string }).qitemId));
+          throw new DaemonResponseError(response.status, "fixture lost committed response body");
+        }
+        return { status: response.status, data: await response.json(), headers: response.headers };
+      },
+      get: async (url: string) => {
+        if (url === "/healthz") {
+          calls.healthReads++;
+          try {
+            const selfHostId = readHealth ? readHealth(calls.healthReads) : source.hostId;
+            calls.healthResults.push(selfHostId);
+            return { status: 200, data: { selfHostId } };
+          } catch (error) {
+            calls.healthResults.push("unreadable");
+            throw error;
+          }
+        }
+        calls.readbacks.push({ base, url });
+        const row = target.daemon.deps.queueRepo.getById(decodeURIComponent(url.slice("/api/queue/".length)));
+        return row ? { status: 200, data: row } : { status: 404, data: { error: "not_found" } };
+      },
+    }) as unknown as ReturnType<QueueDeps["clientFactory"]>;
+    return { factory, calls };
+  }
+
+  it.each(["SLICE.ONE", "MISSING.SLICE"])("reports slice-only %s as unavailable without mission context", async slice => {
+    const unchanged = preserveAuthored(source);
+    await create(source.app, ["--slice", slice, "--tags", "project:alpha"], true);
+    committed(source, "qitem-create-contract", ["slice:" + slice, "project:alpha"]);
+    unchanged();
+    expect.soft(scopeLines()).toContain("slice:" + slice);
+    expect.soft(scopeLines()).toMatch(/\bunavailable\b/i);
+    expect.soft(scopeLines()).toMatch(/\bmission\b/i);
+    expect.soft(scopeLines()).toMatch(/absent|missing|need|requir|without|not supplied/i);
+    expect.soft(scopeLines()).not.toMatch(/resolves to 0|checked.*unresolved|not found/i);
+  });
+
+  it.each([
+    { label: "mission alone", tags: ["mission:"], empty: "mission:", valid: null },
+    { label: "slice alone", tags: ["slice:"], empty: "slice:", valid: null },
+    { label: "mission beside valid slice", tags: ["mission:", "slice:SLICE.ONE"], empty: "mission:", valid: "slice:SLICE.ONE" },
+    { label: "slice beside valid mission", tags: ["mission:release", "slice:"], empty: "slice:", valid: "mission:release" },
+  ])("identifies the empty value for $label without blaming the other tag", async row => {
+    const unchanged = preserveAuthored(source);
+    const tags = [...row.tags, "project:alpha"];
+    await create(source.app, ["--tags", tags.join(",")], true);
+    committed(source, "qitem-create-contract", tags);
+    unchanged();
+    expect.soft(scopeLines()).toContain(row.empty);
+    expect.soft(scopeLines()).toMatch(/\bempty\b/i);
+    expect.soft(scopeLines()).not.toMatch(/resolves to 0|checked.*unresolved/i);
+    if (row.valid) expect.soft(scopeLines()).not.toContain(row.valid + " is unresolved");
+  });
+
+  it.each(["mission:", "slice:"])("keeps remote empty-only %s SKIPPED without sender scope reads", async empty => {
+    const receiver = await fixture("receiver");
+    const sourceUnchanged = preserveAuthored(source);
+    const receiverUnchanged = preserveAuthored(receiver);
+    const { app, observation } = forwardingApp(receiver);
+    const senderReads = observeSenderScopeReads();
+    setSelfHostId(source.hostId);
+    await create(app, ["--host", "remote-fixture", "--tags", empty + ",project:alpha"], true);
+    const tags = [empty, "project:alpha", "cross-host", "from-host:" + os.hostname()];
+    committed(receiver, "qitem-create-contract", tags);
+    expect(source.daemon.deps.queueRepo.getById("qitem-create-contract")).toBeNull();
+    expect(receiver.daemon.deps.queueRepo.getById("qitem-create-contract")?.sourceSession).toBe("writer@scope@" + source.hostId);
+    expect(observation.forwards).toBe(1);
+    expect(observation.committedStatuses).toEqual([201]);
+    expect(senderReads).toEqual([]);
+    sourceUnchanged();
+    receiverUnchanged();
+    expect.soft(scopeLines()).toMatch(/\bskipped\b/i);
+    expect.soft(scopeLines()).toContain(empty);
+    expect.soft(scopeLines()).not.toMatch(/unresolved|unavailable|resolves to 0/i);
+  });
+
+  it.each(["mission", "slice"] as const)("checks an exact-name regular file at %s level as unresolved", async level => {
+    const parent = level === "mission" ? source.missions : path.join(source.missions, "release", "slices");
+    const wanted = level === "mission" ? "release" : "build";
+    const target = path.join(parent, wanted);
+    fs.rmSync(target, { recursive: true });
+    fs.writeFileSync(target, "a regular file is not a work directory");
+    expect(fs.statSync(target).isFile()).toBe(true);
+    // Historical current-work resolution stays permissive; this advisory has a stricter directory contract.
+    expect(resolveWorkNodeDirs(parent, wanted)).toEqual([{ dir: wanted, form: "directory name" }]);
+    const unchanged = preserveAuthored(source);
+    const args = level === "mission" ? ["--mission", wanted] : ["--mission", "release", "--slice", wanted];
+    const tags = level === "mission" ? ["mission:release", "project:alpha"] : ["mission:release", "slice:build", "project:alpha"];
+    await create(source.app, [...args, "--tags", "project:alpha"], true);
+    committed(source, "qitem-create-contract", tags);
+    unchanged();
+    expect.soft(scopeLines()).toContain(level + ":" + wanted);
+    expect.soft(scopeLines()).toMatch(/\bunresolved\b/i);
+    expect.soft(scopeLines()).not.toMatch(/unavailable|skipped/i);
+  });
+
+  it.each([true, false])("reconciles a real local commit once with scope-tagged=%s", async tagged => {
+    const unchanged = preserveAuthored(source);
+    const { factory, calls } = recoveredClient(source.app, source, true);
+    const args = tagged ? ["--mission", "missing-mission", "--tags", "project:alpha"] : [];
+    await create(source.app, args, true, "qitem-create-contract", factory);
+    committed(source, "qitem-create-contract", tagged ? ["mission:missing-mission", "project:alpha"] : null);
+    expect(calls.posts).toEqual(["/api/queue/create"]);
+    expect(calls.postStatuses).toEqual([201]);
+    expect(calls.readbacks.map(call => call.url)).toEqual(["/api/queue/qitem-create-contract"]);
+    expect(stderr.join("\n")).toContain("committed after all: row qitem-create-contract");
+    unchanged();
+    if (tagged) {
+      expect.soft(scopeLines()).toContain("mission:missing-mission");
+      expect.soft(scopeLines()).toMatch(/\bunavailable\b/i);
+      expect.soft(scopeLines()).toMatch(/\boutcome\b|\bresult\b/i);
+      expect.soft(scopeLines()).not.toMatch(/resolves to 0|checked.*unresolved/i);
+    } else expect(scopeLines()).toBe("");
+  });
+
+  async function recoverOwnHost(form: "--host" | "qualified destination", readHealth?: (observation: number) => string | null) {
+    expect(source.hostId).toEqual(expect.any(String));
+    expect(source.hostId).not.toBe("local");
+    expect(getSelfHostId()).toBe(source.hostId);
+    const health = await source.daemon.app.request("/healthz");
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ selfHostId: source.hostId });
+    const unchanged = preserveAuthored(source);
+    const { factory, calls } = recoveredClient(source.app, source, true, readHealth);
+    const args = ["--mission", "missing-mission", "--tags", "project:alpha"];
+    if (form === "--host") args.push("--host", source.hostId!);
+    const destination = form === "qualified destination" ? "worker@scope@" + source.hostId : "worker@scope";
+    await create(source.app, args, true, "qitem-create-contract", factory, destination);
+    const tags = ["mission:missing-mission", "project:alpha"];
+    committed(source, "qitem-create-contract", tags);
+    const stored = source.daemon.deps.queueRepo.getById("qitem-create-contract");
+    expect(stored?.sourceSession).toBe("writer@scope");
+    expect(stored?.destinationSession).toBe("worker@scope");
+    expect(stored?.tags).toEqual(tags);
+    expect(source.daemon.db.prepare("SELECT COUNT(*) AS n FROM queue_items WHERE body = ?").get("scope contract body")).toEqual({ n: 1 });
+    expect(calls.posts).toEqual(["/api/queue/create"]);
+    expect(calls.postStatuses).toEqual([201]);
+    expect(calls.postBodies).toEqual([expect.objectContaining({ hostId: source.hostId,
+      destinationSession: "worker@scope", qitemId: "qitem-create-contract", tags })]);
+    expect(calls.committedBeforeLoss).toEqual([stored]);
+    expect(calls.healthReads).toBeGreaterThan(0);
+    expect(calls.readbacks.map(call => call.url)).toEqual(["/api/queue/qitem-create-contract"]);
+    expect(stderr.join("\n")).toContain("committed after all: row qitem-create-contract");
+    unchanged();
+    return calls;
+  }
+
+  it.each(["--host", "qualified destination"] as const)("keeps recovered own-host %s advice local after a committed response is lost", async form => {
+    await recoverOwnHost(form);
+    expect.soft(scopeLines()).toContain("mission:missing-mission");
+    expect.soft(scopeLines()).toMatch(/\bunavailable\b/i);
+    expect.soft(scopeLines()).toMatch(/\boutcome\b|\bresult\b/i);
+    expect.soft(scopeLines()).toMatch(/response recovery/i);
+    expect.soft(scopeLines()).not.toMatch(/\bskipped\b|cross-host|\bforwarded\b/i);
+  });
+
+  it.each(["--host", "qualified destination"] as const)(
+    "keeps own-host %s recovery advice unknown when the first identity read fails but the later match succeeds",
+    async form => {
+      const registryUrl = "http://own-host-recovery.invalid:39001";
+      const home = path.join(scratch, "cli-home-own-host-recovery");
+      fs.mkdirSync(home);
+      fs.writeFileSync(path.join(home, "hosts.yaml"), `hosts:\n  - id: ${source.hostId}\n    transport: http\n    url: ${registryUrl}\n`);
+      vi.stubEnv("OPENRIG_HOME", home);
+
+      const calls = await recoverOwnHost(form, observation => {
+        if (observation === 1) throw new Error("fixture first identity read is unavailable");
+        return source.hostId;
+      });
+
+      expect(calls.healthResults).toEqual(["unreadable", source.hostId]);
+      expect(calls.healthReads).toBe(2);
+      expect(calls.readbacks).toEqual([{
+        base: registryUrl,
+        url: "/api/queue/qitem-create-contract",
+      }]);
+      expect(scopeLines()).toContain("mission:missing-mission");
+      expect(scopeLines()).toMatch(/scope check outcome unavailable after response recovery/i);
+      expect(scopeLines()).not.toMatch(/\bskipped\b|cross-host|\bforwarded\b/i);
+    },
+  );
+
+  function healthAfterMatchedRecovery(later: "different" | "null" | "unreadable") {
+    return (observation: number): string | null => {
+      // The target and source checks see the real host. Only the later advice read changes.
+      if (observation <= 2) return source.hostId;
+      if (later === "unreadable") throw new Error("fixture health became unreadable after matching recovery");
+      return later === "null" ? null : "replacement-fixture";
+    };
+  }
+
+  it.each((["--host", "qualified destination"] as const).flatMap(form =>
+    (["different", "null", "unreadable"] as const).map(later => ({ form, later }))))(
+    "keeps matched own-host $form recovery local when later health is $later", async ({ form, later }) => {
+      const calls = await recoverOwnHost(form, healthAfterMatchedRecovery(later));
+      const evidence = "observed health sequence: " + JSON.stringify(calls.healthResults);
+      expect.soft(scopeLines(), evidence).toContain("mission:missing-mission");
+      expect.soft(scopeLines(), evidence).toMatch(/\bunavailable\b/i);
+      expect.soft(scopeLines(), evidence).toMatch(/\boutcome\b|\bresult\b/i);
+      expect.soft(scopeLines(), evidence).toMatch(/response recovery/i);
+      expect.soft(scopeLines(), evidence).not.toMatch(/\bskipped\b|cross-host|\bforwarded\b/i);
+    },
+  );
+
+  it.each(["--host", "qualified destination"] as const)(
+    "keeps own-host %s outcome unknown when health becomes unreadable before source matching", async form => {
+      expect(source.hostId).toEqual(expect.any(String));
+      expect(getSelfHostId()).toBe(source.hostId);
+      const unchanged = preserveAuthored(source);
+      const { factory, calls } = recoveredClient(source.app, source, true, observation => {
+        if (observation === 1) return source.hostId;
+        throw new Error("fixture health unreadable while matching the stored source");
+      });
+      const args = ["--mission", "missing-mission", "--tags", "project:alpha"];
+      if (form === "--host") args.push("--host", source.hostId!);
+      const destination = form === "qualified destination" ? "worker@scope@" + source.hostId : "worker@scope";
+      await expect(create(source.app, args, true, "qitem-create-contract", factory, destination))
+        .rejects.toMatchObject({ name: "DaemonResponseError", status: 201 });
+      const stored = source.daemon.deps.queueRepo.getById("qitem-create-contract");
+      expect(stored).toMatchObject({ qitemId: "qitem-create-contract", sourceSession: "writer@scope",
+        destinationSession: "worker@scope", body: "scope contract body", summary: "scope contract", state: "pending",
+        tags: ["mission:missing-mission", "project:alpha"] });
+      expect(source.daemon.db.prepare("SELECT COUNT(*) AS n FROM queue_items WHERE body = ?")
+        .get("scope contract body")).toEqual({ n: 1 });
+      expect(calls.committedBeforeLoss).toEqual([stored]);
+      expect(calls.posts).toEqual(["/api/queue/create"]);
+      expect(calls.postStatuses).toEqual([201]);
+      expect(calls.readbacks.map(call => call.url)).toEqual(["/api/queue/qitem-create-contract"]);
+      expect(stdout).toEqual([]);
+      expect(stderr.join("\n")).toContain("couldn't read this daemon's host id to tell whether its source is this create's");
+      expect(stderr.join("\n")).toContain("outcome is still unknown");
+      expect(stderr.join("\n")).not.toContain("committed after all");
+      expect(scopeLines()).not.toMatch(/scope check|\bforwarded\b/i);
+      unchanged();
+    },
+  );
+
+  async function recoverForwardedCommit(readHealth?: (observation: number) => string | null) {
+    const receiver = await fixture("receiver");
+    const sourceUnchanged = preserveAuthored(source);
+    const receiverUnchanged = preserveAuthored(receiver);
+    const { app, observation } = forwardingApp(receiver, true);
+    const { factory, calls } = recoveredClient(app, receiver, false, readHealth);
+    const home = path.join(scratch, "cli-home");
+    fs.mkdirSync(home);
+    fs.writeFileSync(path.join(home, "hosts.yaml"), "hosts:\n  - id: remote-fixture\n    transport: http\n    url: http://remote-fixture.invalid:39001\n");
+    vi.stubEnv("OPENRIG_HOME", home);
+    const senderReads = observeSenderScopeReads();
+    setSelfHostId(source.hostId);
+    await create(app, ["--host", "remote-fixture", "--mission", "release", "--slice", "SLICE.ONE", "--tags", "project:alpha"], true,
+      "qitem-create-contract", factory);
+    committed(receiver, "qitem-create-contract", ["mission:release", "slice:SLICE.ONE", "project:alpha", "cross-host", "from-host:" + os.hostname()]);
+    expect(source.daemon.deps.queueRepo.getById("qitem-create-contract")).toBeNull();
+    expect(receiver.daemon.deps.queueRepo.getById("qitem-create-contract")?.sourceSession).toBe("writer@scope@" + source.hostId);
+    expect(calls.posts).toEqual(["/api/queue/create"]);
+    expect(calls.postStatuses).toEqual([502]);
+    expect(observation.forwards).toBe(1);
+    expect(observation.committedStatuses).toEqual([201]);
+    expect(calls.readbacks).toEqual([{ base: "http://remote-fixture.invalid:39001", url: "/api/queue/qitem-create-contract" }]);
+    expect(stderr.join("\n")).toContain("committed after all: row qitem-create-contract on host 'remote-fixture'");
+    expect(senderReads).toEqual([]);
+    sourceUnchanged();
+    receiverUnchanged();
+    expect.soft(scopeLines()).toMatch(/\bskipped\b/i);
+    expect.soft(scopeLines()).toContain("mission:release");
+    expect.soft(scopeLines()).toContain("slice:SLICE.ONE");
+    expect.soft(scopeLines()).not.toMatch(/unavailable|unresolved|resolves to 0/i);
+  }
+
+  it("reconciles a forwarded indeterminate commit with SKIPPED and destination provenance", async () => {
+    await recoverForwardedCommit();
+  });
+
+  it.each(["null", "unreadable"] as const)(
+    "keeps confirmed remote recovery SKIPPED when later health is %s", async later => {
+      await recoverForwardedCommit(healthAfterMatchedRecovery(later));
+    },
+  );
+
+  it.each([
+    { level: "mission", tags: ["mission:release", "mission:MISSION.ONE", "slice:SLICE.ONE", "project:alpha"] },
+    { level: "slice", tags: ["mission:release", "slice:SLICE.ONE", "slice:build", "project:alpha"] },
+  ])("reports distinct $level inputs as a conflict, not a directory count", async row => {
+    const unchanged = preserveAuthored(source);
+    const old = deriveCurrentWork([{ qitemId: "input-conflict", state: "in-progress", tags: row.tags }], source.missions);
+    expect(old.currentWork).toBeNull();
+    expect(old.currentWorkBasis).toContain("conflicting typed tags:");
+    expect(old.currentWorkBasis).toContain("2 distinct " + row.level + " tags");
+    await create(source.app, ["--tags", row.tags.join(",")], true);
+    committed(source, "qitem-create-contract", row.tags);
+    unchanged();
+    expect.soft(scopeLines()).toMatch(/\bconflict(?:ing)?\b/i);
+    expect.soft(scopeLines()).toContain(row.level + ":");
+    expect.soft(scopeLines()).not.toMatch(/resolves to \d+ directories/i);
+  });
+
+  it.each(["mission", "slice"] as const)("retains a visible %s conflict when long values share a display prefix", async level => {
+    const common = ("ordinary_" + level + "_").padEnd(220, "x");
+    const first = level + ":" + common + "A";
+    const second = level + ":" + common + "B";
+    const tags = level === "mission"
+      ? [first, second, "project:alpha"] : ["mission:release", first, second, "project:alpha"];
+    const unchanged = preserveAuthored(source);
+    await create(source.app, ["--tags", tags.join(",")], true);
+    committed(source, "qitem-create-contract", tags);
+    unchanged();
+    const advisories = createResponses[0]?.data.advisories as Array<{ code?: unknown; message?: unknown }> | undefined;
+    expect(advisories).toHaveLength(1);
+    expect(advisories?.[0]).toMatchObject({ code: "conflicting_scope", message: expect.any(String) });
+    const message = advisories?.[0]?.message as string;
+    expect(message).toContain(first);
+    expect(message).toContain(second);
+    expect.soft(scopeLines()).toMatch(/\bconflict(?:ing)?\b/i);
+    expect.soft(scopeLines()).toContain(level + ":");
+    expect.soft(scopeLines()).toContain(first);
+    expect.soft(scopeLines()).toContain(second);
+    expect.soft(scopeLines()).not.toMatch(/resolves to \d+ directories/i);
+  });
+
+  it.each([
+    { level: "mission", code: "EACCES", wanted: "DUP.MISSION" },
+    { level: "slice", code: "EIO", wanted: "DUP.SLICE" },
+  ])("reports unavailable for two $level matches plus unreadable extra SPEC ($code)", async row => {
+    const lookup = row.level === "mission" ? source.missions : path.join(source.missions, "release", "slices");
+    for (const child of ["duplicate-a", "duplicate-b"]) {
+      expect(fs.statSync(path.join(lookup, child)).isDirectory()).toBe(true);
+      expect(fs.readFileSync(path.join(lookup, child, "SPEC.md"), "utf8")).toContain("id: " + row.wanted);
+    }
+    const extra = path.join(lookup, "unreadable-extra");
+    spec(extra, "EXTRA");
+    const file = path.join(extra, "SPEC.md");
+    expect(fs.statSync(file).isFile()).toBe(true);
+    const unchanged = preserveAuthored(source);
+    const read = fs.readFileSync.bind(fs);
+    let faults = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      if (String(args[0]) === file) {
+        faults++;
+        throw Object.assign(new Error("fixture extra SPEC read failed"), { code: row.code });
+      }
+      return (read as (...input: unknown[]) => unknown)(...args);
+    }) as typeof fs.readFileSync);
+    const args = row.level === "mission" ? ["--mission", row.wanted] : ["--mission", "release", "--slice", row.wanted];
+    const tags = row.level === "mission"
+      ? ["mission:DUP.MISSION", "project:alpha"] : ["mission:release", "slice:DUP.SLICE", "project:alpha"];
+    await create(source.app, [...args, "--tags", "project:alpha"], true);
+    committed(source, "qitem-create-contract", tags);
+    expect(faults).toBeGreaterThan(0);
+    unchanged();
+    expect.soft(scopeLines()).toContain(row.level + ":" + row.wanted);
+    expect.soft(scopeLines()).toMatch(/\bunavailable\b/i);
+    expect.soft(scopeLines()).not.toMatch(/resolves to \d+ directories/i);
+  });
+
+  it.each([false, true])("keeps valid project scope successful with unchanged JSON (json=%s)", async json => {
+    await create(source.app, ["--mission", "release", "--slice", "SLICE.ONE", "--tags", "project:alpha"], json);
+    committed(source, "qitem-create-contract", ["mission:release", "slice:SLICE.ONE", "project:alpha"]);
+    expect(scopeLines()).not.toMatch(/unresolved|ambiguous|unavailable|could not|skipped/i);
+  });
+
+  it.each([false, true])("keeps untagged create unchanged (json=%s)", async json => {
+    await create(source.app, [], json);
+    committed(source, "qitem-create-contract", null);
+    expect(scopeLines()).toBe("");
+  });
+
+  it.each([
+    { label: "missing mission", mission: "missing-mission", slice: "SLICE.ONE", tag: "mission:missing-mission", kind: /unresolved|not found|does not (?:exist|resolve)|resolves to 0|cannot.*uniquely/i },
+    { label: "ambiguous mission", mission: "DUP.MISSION", slice: "SLICE.ONE", tag: "mission:DUP.MISSION", kind: /ambiguous|more than one|resolves to 2|not.*uniquely|cannot.*uniquely/i },
+    { label: "missing slice", mission: "release", slice: "MISSING.SLICE", tag: "slice:MISSING.SLICE", kind: /unresolved|not found|does not (?:exist|resolve)|resolves to 0|cannot.*uniquely/i },
+    { label: "ambiguous slice", mission: "release", slice: "DUP.SLICE", tag: "slice:DUP.SLICE", kind: /ambiguous|more than one|resolves to 2|not.*uniquely|cannot.*uniquely/i },
+    { label: "completed empty-directory check", mission: "missing-mission", slice: "SLICE.ONE", tag: "mission:missing-mission", kind: /unresolved|not found|does not (?:exist|resolve)|resolves to 0|cannot.*uniquely/i },
+  ])("commits $label and reports checked nonunique scope only on stderr", async row => {
+    if (row.label === "completed empty-directory check") {
+      fs.rmSync(source.missions, { recursive: true });
+      fs.mkdirSync(source.missions);
+    }
+    await create(source.app, ["--mission", row.mission, "--slice", row.slice, "--tags", "project:alpha"], true);
+    committed(source, "qitem-create-contract", [`mission:${row.mission}`, `slice:${row.slice}`, "project:alpha"]);
+    expect(scopeLines()).toContain(row.tag);
+    expect(scopeLines()).toMatch(row.kind);
+    expect(scopeLines()).not.toMatch(/unavailable|could not (?:run|check)|skipped/i);
+  });
+
+  it.each(["non-directory missions root", "invalid catalogue"])(
+    "commits when the check cannot run: %s, without calling it checked unresolved", async cause => {
+      if (cause === "non-directory missions root") {
+        fs.rmSync(source.missions, { recursive: true });
+        fs.writeFileSync(source.missions, "not a directory");
+      } else {
+        fs.writeFileSync(path.join(source.root, "workspace.yaml"), "projects: invalid\n");
+      }
+      await create(source.app, ["--mission", "release", "--slice", "SLICE.ONE", "--tags", "project:alpha"], true);
+      committed(source, "qitem-create-contract", ["mission:release", "slice:SLICE.ONE", "project:alpha"]);
+      expect(scopeLines()).toMatch(/unavailable|could not (?:run|check)|unable to (?:run|check)/i);
+      expect(scopeLines()).not.toMatch(/resolves to 0|not found|checked.*unresolved/i);
+    },
+  );
+
+  const longScopeTags = () => [
+    ...Array.from({ length: 7 }, (_, i) => "mission:" + ("ordinary_mission_" + i + "_").padEnd(150, "x")),
+    ...Array.from({ length: 2 }, (_, i) => "slice:" + ("ordinary_slice_" + i + "_").padEnd(150, "x")),
+  ];
+
+  it.each([
+    { level: "mission", code: "EACCES", mission: "MISSION.ONE", slice: "SLICE.ONE" },
+    { level: "slice", code: "EIO", mission: "release", slice: "SLICE.ONE" },
+  ])("reports unavailable when existing $level SPEC lookup fails with $code", async row => {
+    const file = row.level === "mission"
+      ? path.join(source.missions, "release", "SPEC.md")
+      : path.join(source.missions, "release", "slices", "build", "SPEC.md");
+    expect(fs.statSync(file).isFile()).toBe(true);
+    const read = fs.readFileSync.bind(fs);
+    let faults = 0;
+    vi.spyOn(fs, "readFileSync").mockImplementation(((...args: unknown[]) => {
+      if (String(args[0]) === file) {
+        faults++;
+        throw Object.assign(new Error("fixture SPEC read failed"), { code: row.code });
+      }
+      return (read as (...input: unknown[]) => unknown)(...args);
+    }) as typeof fs.readFileSync);
+    await create(source.app, ["--mission", row.mission, "--slice", row.slice, "--tags", "project:alpha"], true);
+    committed(source, "qitem-create-contract", [`mission:${row.mission}`, `slice:${row.slice}`, "project:alpha"]);
+    expect(faults).toBeGreaterThan(0);
+    expect(scopeLines()).toMatch(/unavailable|could not (?:run|check)|unable to (?:run|check)/i);
+    expect(scopeLines()).not.toMatch(/resolves to 0|checked.*unresolved/i);
+  });
+
+  it("keeps absent unrelated metadata distinct from an unreadable existing SPEC", async () => {
+    fs.unlinkSync(path.join(source.missions, "duplicate-a", "SPEC.md"));
+    await create(source.app, ["--mission", "MISSION.ONE", "--slice", "SLICE.ONE", "--tags", "project:alpha"], true);
+    committed(source, "qitem-create-contract", ["mission:MISSION.ONE", "slice:SLICE.ONE", "project:alpha"]);
+    expect(scopeLines()).toBe("");
+  });
+
+  it("keeps the unavailable notice for ordinary long scope tags without changing the committed result", async () => {
+    fs.writeFileSync(path.join(source.root, "workspace.yaml"), "projects: invalid\n");
+    const tags = ["project:alpha", ...longScopeTags()];
+    await create(source.app, ["--tags", tags.join(",")], true);
+    committed(source, "qitem-create-contract", tags);
+    expect(JSON.stringify(tags).length).toBeGreaterThan(1024);
+    const advisories = createResponses[0]?.data.advisories as Array<{ code?: unknown; message?: unknown }> | undefined;
+    expect(advisories).toEqual([expect.objectContaining({ code: "scope_check_unavailable", message: expect.any(String) })]);
+    const message = advisories?.[0]?.message as string;
+    for (const tag of tags.slice(1)) expect(message).toContain(tag);
+    expect(scopeLines()).toMatch(/unavailable|could not (?:run|check)|unable to (?:run|check)/i);
+    expect(scopeLines()).not.toMatch(/resolves to 0|checked.*unresolved/i);
+  });
+
+  it.each(["valid", "missing", "long tags"])("remote create is SKIPPED even when sender scope is %s", async senderState => {
+    const receiver = await fixture("receiver");
+    fs.rmSync(receiver.missions, { recursive: true });
+    fs.mkdirSync(receiver.missions);
+    if (senderState === "missing") {
+      fs.rmSync(source.missions, { recursive: true });
+      fs.mkdirSync(source.missions);
+      spec(path.join(receiver.missions, "release"), "MISSION.ONE");
+      spec(path.join(receiver.missions, "release", "slices", "build"), "SLICE.ONE");
+    }
+    const senderReads: string[] = [];
+    for (const method of ["readdirSync", "readFileSync", "statSync", "existsSync"] as const) {
+      const original = fs[method].bind(fs) as (...args: unknown[]) => unknown;
+      vi.spyOn(fs, method).mockImplementation(((...args: unknown[]) => {
+        if (String(args[0]) === path.join(source.root, "workspace.yaml")
+          || String(args[0]) === source.missions || String(args[0]).startsWith(source.missions + path.sep)) {
+          senderReads.push(method + ":" + String(args[0]));
+        }
+        return original(...args);
+      }) as never);
+    }
+    let forwarded = 0;
+    const app = new Hono();
+    app.use("*", async (c, next) => {
+      const set = c.set.bind(c) as (key: string, value: unknown) => void;
+      for (const key of ["eventBus", "queueRepo", "inboxHandler", "outboxHandler", "rigRepo"] as const) set(key, source.daemon.deps[key]);
+      set("settingsStore", new SettingsStore(path.join(source.root, "settings.json")));
+      set("hostRegistryLoader", () => ({ ok: true, registry: { hosts: [
+        { id: "remote-fixture", transport: "http", url: "http://remote-fixture.invalid:39001" },
+      ] } }));
+      set("remoteFetchImpl", async (_url: unknown, init: RequestInit) => {
+        forwarded++;
+        const body = JSON.parse(String(init.body));
+        const previous = getSelfHostId();
+        setSelfHostId(receiver.hostId);
+        try {
+          return await receiver.app.request("/api/queue/create", { ...init,
+            headers: { "Content-Type": "application/json", "X-OpenRig-Session": body.sourceSession } });
+        } finally { setSelfHostId(previous); }
+      });
+      await next();
+    });
+    app.route("/api/queue", queueRoutes());
+    setSelfHostId(source.hostId);
+    const extraTags = senderState === "long tags" ? longScopeTags() : [];
+    await create(app, ["--host", "remote-fixture", "--mission", "release", "--slice", "SLICE.ONE", "--tags", ["project:alpha", ...extraTags].join(",")], true);
+    expect(forwarded).toBe(1);
+    expect(source.daemon.deps.queueRepo.getById("qitem-create-contract")).toBeNull();
+    const stored = receiver.daemon.deps.queueRepo.getById("qitem-create-contract");
+    expect(stored).toMatchObject({ destinationSession: "worker@scope", body: "scope contract body", state: "pending" });
+    expect(stored?.sourceSession).toBe(`writer@scope@${source.hostId}`);
+    expect(stored?.tags).toEqual(expect.arrayContaining(["mission:release", "slice:SLICE.ONE", "project:alpha"]));
+    expect(process.exitCode ?? 0).toBe(0);
+    expect(stdout).toHaveLength(1);
+    const output = JSON.parse(stdout[0]!) as Record<string, unknown>;
+    const { advisories: _advisories, ...primary } = output;
+    expect(primary).toEqual(JSON.parse(JSON.stringify(stored)));
+    expect(output).toEqual(createResponses[0]?.data);
+    expect(senderReads).toEqual([]);
+    if (senderState === "long tags") {
+      expect(stored?.tags).toEqual(["mission:release", "slice:SLICE.ONE", "project:alpha", ...extraTags, "cross-host", `from-host:${os.hostname()}`]);
+      expect(JSON.stringify(extraTags).length).toBeGreaterThan(1024);
+    }
+    const advisories = createResponses[0]?.data.advisories as Array<{ code?: unknown; message?: unknown }> | undefined;
+    expect(advisories).toEqual([expect.objectContaining({ code: "scope_check_skipped", message: expect.any(String) })]);
+    const message = advisories?.[0]?.message as string;
+    expect(message).toContain("mission:release");
+    expect(message).toContain("slice:SLICE.ONE");
+    if (senderState === "long tags") for (const tag of extraTags) expect(message).toContain(tag);
+    expect(scopeLines()).toMatch(/\bskipped\b/i);
+    expect(scopeLines()).not.toMatch(/unresolved|ambiguous|unavailable/i);
+  });
 });
