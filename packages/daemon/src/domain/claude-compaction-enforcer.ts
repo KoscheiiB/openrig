@@ -157,11 +157,6 @@ export type ManualCompactionOutcome =
       /** /compact's result was lost, so its restore steps follow in case it ran. */
       restoreOwed?: true };
 
-type ManualCompactionRefusal = Extract<ManualCompactionOutcome, { triggered: false }>;
-type ManualCompactionOptions = { operatorInitiated?: boolean; skipMap?: boolean; actor?: TerminalActor };
-type ManualCompactionStart = ManualCompactionRefusal
-  | { attemptId: string; completion: Promise<ManualCompactionOutcome> };
-
 export type EnforcerSkipReason =
   | "terminal_policy_refused"
   | "terminal_policy_unavailable"
@@ -1560,14 +1555,14 @@ export class ClaudeCompactionEnforcer {
    */
   async triggerManualCompact(
     input: EnforcerInput,
-    opts: ManualCompactionOptions = {},
+    opts: { operatorInitiated?: boolean; skipMap?: boolean; actor?: TerminalActor } = {},
   ): Promise<ManualCompactionOutcome> {
-    const start = this.startManualCompact(input, opts);
-    return "completion" in start ? start.completion : start;
+    // Do not hold a delivery/lifecycle lease while a seat writes its map or goes idle.
+    // Each actual send takes the existing guard; final checks bind the attempt across awaits.
+    return this.triggerManualCompactUnchecked(input, opts);
   }
 
-  /** Check and reserve the attempt without awaiting, so only its admitting caller gets the receipt. */
-  startManualCompact(input: EnforcerInput, opts: ManualCompactionOptions): ManualCompactionStart {
+  private async triggerManualCompactUnchecked(input: EnforcerInput, opts: { operatorInitiated?: boolean; skipMap?: boolean; actor?: TerminalActor }): Promise<ManualCompactionOutcome> {
     // The manual budget starts with the request. A request reaching a seat before the monitor's first poll after a restart
     // finds its owed restore or open preparation first, so it neither prepares twice nor replaces the owed restore.
     const requestedAt = this.now();
@@ -1588,14 +1583,7 @@ export class ClaudeCompactionEnforcer {
     if (policyRefusal) return this.recordManualFailure(input.sessionName, policyRefusal);
     const attempt = this.beginPreparation(input, "manual", opts.skipMap === true, actor, requestedAt);
     if (attempt.status === "stopped") return this.recordManualFailure(input.sessionName, attempt.reason ?? "occupant_generation_unavailable");
-    this.setManualStage(input.sessionName, "preparing", undefined, opts.operatorInitiated === true);
-    return { attemptId: attempt.attemptId, completion: this.finishManualCompact(input, opts, attempt) };
-  }
-
-  private async finishManualCompact(input: EnforcerInput, opts: ManualCompactionOptions, attempt: PreparationAttempt): Promise<ManualCompactionOutcome> {
-    // No delivery lease is held while the seat writes its map or goes idle.
-    // Each actual send takes the existing guard and rechecks the attempt.
-    const failed = (reason: string): ManualCompactionRefusal => {
+    const failed = (reason: string): Extract<ManualCompactionOutcome, { triggered: false }> => {
       // A cancelled request may settle after an explicit retry. Its receipt must
       // not stop or overwrite the successor attempt's state.
       if (this.pendingPreCompactPrep.get(input.sessionName) === attempt) {
@@ -1605,6 +1593,7 @@ export class ClaudeCompactionEnforcer {
       return { triggered: false, stage: "skipped-or-failed", reason,
         preparation: { attemptId: attempt.attemptId, mapPath: attempt.mapPath, delivery: attempt.delivery, compact: attempt.compact } };
     };
+    this.setManualStage(input.sessionName, "preparing", undefined, opts.operatorInitiated === true);
     await this.deliverPreparation(input, attempt);
     // Manual preparation can pause for an ordinary approval, before or after the map is complete. OpenRig never answers
     // it. It keeps the latest completed reading of the seat on the attempt (awaitingInput), recorded before deadline
@@ -2582,7 +2571,7 @@ export class ClaudeCompactionEnforcer {
     } catch { return false; }
   }
 
-  private recordManualFailure(sessionName: string, reason: string): ManualCompactionRefusal {
+  private recordManualFailure(sessionName: string, reason: string): ManualCompactionOutcome {
     this.setManualStage(sessionName, "skipped-or-failed", reason);
     return { triggered: false, stage: "skipped-or-failed", reason };
   }

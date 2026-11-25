@@ -160,8 +160,7 @@ export function ingestDecision(ev: SlackEvent): { ingest: true } | { ingest: fal
 export interface StoredInboundFile { name: string; localPath: string; mimetype?: string; bytes: number }
 export interface FailedInboundFile { name: string; error: string }
 export interface InboundFileResult { stored: StoredInboundFile[]; failed: FailedInboundFile[] }
-export interface InboundFileOrigin { channelId: string; messageTs: string; authorId: string }
-export interface InboundFilePort { transfer(files: unknown[], origin: InboundFileOrigin): Promise<InboundFileResult> }
+export interface InboundFilePort { transfer(files: unknown[], eventTs: string, eventChannel?: string): Promise<InboundFileResult> }
 
 export function shouldIngest(ev: SlackEvent): boolean {
   return ingestDecision(ev).ingest;
@@ -356,15 +355,13 @@ export class InboundRouter {
         });
         if (!this.deps.files) {
           transfer = namedAll("file transfer unavailable (no file port wired)");
-        } else if (!ev.channel || !ev.user) {
-          transfer = namedAll("file transfer unavailable (missing Slack message origin)");
         } else {
           // R1 F2: a THROWING port (disk-full mkdirp, any crash) must never cost
           // the already-ACKed message — the row still lands and every file
           // becomes a NAMED failure. Failure honesty is a property of this seam,
           // not a promise the port is trusted to keep.
           try {
-            transfer = await this.deps.files.transfer(fileMetas, { channelId: ev.channel, messageTs: ts, authorId: ev.user });
+            transfer = await this.deps.files.transfer(fileMetas, ts, ev.channel);
           } catch (e) {
             this.deps.log?.(`inbound file port CRASHED ts=${ts}: ${(e as Error).message}`);
             transfer = namedAll(`file transfer crashed: ${(e as Error).message || "unknown error"}`);

@@ -70,7 +70,7 @@ export function growCommand(depsOverride?: StatusDeps): Command {
 
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (!daemonStatusGuard(status, { json: opts.json })) return;
+      if (!daemonStatusGuard(status)) return;
       const client = deps.clientFactory(getDaemonUrl(status));
 
       const resolution = await resolveRigHandle(client, rigId);
@@ -126,9 +126,7 @@ export function growCommand(depsOverride?: StatusDeps): Command {
       try {
         agentRef = await resolveDefaultAgentRef(client, opts.runtime);
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        if (opts.json) console.log(JSON.stringify({ ok: false, detail }, null, 2));
-        else console.error(detail);
+        console.error(err instanceof Error ? err.message : String(err));
         process.exitCode = 1;
         return;
       }
@@ -237,13 +235,13 @@ export function growCommand(depsOverride?: StatusDeps): Command {
         if (detail && !nodes.some((node) => node.error && detail.includes(node.error))) {
           console.error(`  ${detail}`);
         }
+        for (const warning of warnings) console.error(`  Warning: ${warning}`);
         if (retryTargets.length > 0) {
           console.error("  Failed nodes can be relaunched individually. Recover by:");
           for (const target of retryTargets) console.error(`    rig launch ${resolvedRigId} ${target}`);
         }
       }
 
-      if (!opts.json) for (const warning of warnings) console.error(`  Warning: ${warning}`);
       if (!ok) process.exitCode = 1;
     });
 

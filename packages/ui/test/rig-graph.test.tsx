@@ -1594,11 +1594,11 @@ describe("RigGraph node selection (P5.1-2 navigate)", () => {
   });
 });
 
-// Task 7: RigNode footer (seat, spec and a non-default profile)
-describe("RigNode footer", () => {
+// Task 7: RigNode spec hint rendering
+describe("RigNode spec hint", () => {
   afterEach(() => cleanup());
 
-  it("shows the seat and spec in the footer, without the default profile", () => {
+  it("renders spec hint when resolvedSpecName is set", () => {
     render(
       <ReactFlowProvider>
         <RigNode data={{
@@ -1615,33 +1615,13 @@ describe("RigNode footer", () => {
       </ReactFlowProvider>
     );
 
-    // The footer names the seat and its spec; the default profile adds nothing, so it is left out.
-    const footer = screen.getByTestId("seat-footer");
-    expect(footer.textContent).toBe("dev.impl · impl-agent");
+    const hint = screen.getByTestId("spec-hint");
+    expect(hint).toBeDefined();
+    expect(hint.textContent).toContain("impl-agent");
+    expect(hint.textContent).toContain("default");
   });
 
-  it("shows a profile other than the default one in the footer", () => {
-    render(
-      <ReactFlowProvider>
-        <RigNode data={{
-          logicalId: "dev.impl",
-          role: "worker",
-          runtime: "claude-code",
-          model: null,
-          status: "running",
-          binding: null,
-          canonicalSessionName: "dev-impl@test-rig",
-          resolvedSpecName: "impl-agent",
-          profile: "reviewer",
-          edgeCount: 2,
-        }} />
-      </ReactFlowProvider>
-    );
-
-    expect(screen.getByTestId("seat-footer").textContent).toBe("dev-impl · impl-agent · reviewer");
-  });
-
-  it("shows only the seat in the footer when there is no spec", () => {
+  it("does not render spec hint when resolvedSpecName is null", () => {
     render(
       <ReactFlowProvider>
         <RigNode data={{
@@ -1658,7 +1638,7 @@ describe("RigNode footer", () => {
       </ReactFlowProvider>
     );
 
-    expect(screen.getByTestId("seat-footer").textContent).toBe("dev.impl");
+    expect(screen.queryByTestId("spec-hint")).toBeNull();
   });
 
   it("exposes hover metadata for runtime inspection", () => {

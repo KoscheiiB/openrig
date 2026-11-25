@@ -290,7 +290,6 @@ export class MissionControlWriteContract {
             tier: source.tier ?? undefined,
             summary: source.summary,
             evidenceRef: source.evidenceRef,
-            evidenceRefRoots: source.evidenceRefRoots,
             tags: source.tags
               ? [...source.tags, `mission-control:${input.verb}`]
               : [`mission-control:${input.verb}`],

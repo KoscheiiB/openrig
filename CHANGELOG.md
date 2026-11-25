@@ -75,8 +75,7 @@ The seat pool's add, whole-rig hold and dispatch paths are in place, but nothing
 - After a reboot, a rig with a seat that has neither saved startup context nor a resume token is left out of `rig start --last`; the output names it and why.
 - A seat whose tmux session is gone can read as running if its pane id is reused, and a slow restore of a seat's original conversation can report the wrong outcome. Check the seat's screen with `rig capture`.
 - A `rig send` while Claude's `AskUserQuestion` dialog is open can become its answer.
-- The fixes for a paste left unsubmitted when a Claude notice shares the row under the input ([#3724](https://github.com/mvschwarz/openrig/pull/3724)) and for an idle Codex seat reading as waiting on a permission ([#3713](https://github.com/mvschwarz/openrig/pull/3713)) haven't been confirmed on an installed release yet. If you still see either, check the seat's screen with `rig capture`.
-- When a Codex seat's `config.toml` or `hooks.json` is a symbolic link, hook trust is recorded under the link's target, so hooks may need review again. With a linked `config.toml`, OpenRig can miss a setting that turns its hooks off and set them up anyway. Review hook prompts yourself.
+- When a Codex seat's `config.toml` or `hooks.json` is a symbolic link, hook trust is recorded under the link's target, so hooks may need review again. With a linked `config.toml`, OpenRig can miss a setting that turns its hooks off. Review hook prompts yourself.
 - The tmux outage record is in memory, so a restart during a loss records it again.
 - Only one earlier restore packet is kept aside while a new one builds.
 - A percent `context-usage-threshold` doesn't fire for a Pi seat; use a token threshold.

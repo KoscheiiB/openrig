@@ -37,16 +37,14 @@ export function createCommand(depsOverride?: StatusDeps): Command {
     .action(async (name: string, opts: { runtime: string; cwd: string; json?: boolean }) => {
       const deps = getDeps();
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (!daemonStatusGuard(status, { json: opts.json })) return;
+      if (!daemonStatusGuard(status)) return;
 
       const client = deps.clientFactory(getDaemonUrl(status));
       let agentRef: string;
       try {
         agentRef = await resolveDefaultAgentRef(client, opts.runtime);
       } catch (err) {
-        const detail = err instanceof Error ? err.message : String(err);
-        if (opts.json) console.log(JSON.stringify({ ok: false, detail }, null, 2));
-        else console.error(detail);
+        console.error(err instanceof Error ? err.message : String(err));
         process.exitCode = 1;
         return;
       }

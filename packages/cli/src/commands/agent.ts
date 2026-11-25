@@ -41,7 +41,7 @@ export function agentCommand(depsOverride?: AgentDeps): Command {
       }
 
       const status = await getDaemonStatus(deps.lifecycleDeps);
-      if (!daemonStatusGuard(status, { json: opts.json })) return;
+      if (!daemonStatusGuard(status)) return;
 
       const client = deps.clientFactory(getDaemonUrl(status));
 
