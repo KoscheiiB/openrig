@@ -229,7 +229,10 @@ export class BootstrapOrchestrator {
             // A service bundle needs Docker Compose v2. An install stops here, before the install target is written or a
             // team is created. A plan says so and goes on: it may be previewing an install for a machine that has Compose.
             if (serviceBundleTarget && (opts.mode === "apply" || planningServices) && this.deps.serviceOrchestrator) {
-              const compose = await this.deps.serviceOrchestrator.composeAvailable();
+              const serviceBlock = parsedSpec?.services as Record<string, unknown> | undefined;
+              const compose = await this.deps.serviceOrchestrator.composeAvailable(
+                typeof serviceBlock?.docker_context === "string" ? serviceBlock.docker_context : undefined,
+              );
               if (!compose.ok && planningServices) {
                 warnings.push(`${compose.message} An install on this machine would stop before writing the install target or creating a team.`);
               } else if (!compose.ok) {
@@ -959,7 +962,15 @@ export class BootstrapOrchestrator {
       // Only these generations were archived by this instantiation transaction.
       const predecessors = replacedRigIds.flatMap(id => {
         const record = rigRepo.getServicesRecord(id);
-        return record ? [{ id, projectName: record.projectName }] : [];
+        if (!record) return [];
+        let dockerContext: string | undefined;
+        try {
+          const stored = JSON.parse(record.specJson) as { dockerContext?: unknown };
+          dockerContext = typeof stored.dockerContext === "string" ? stored.dockerContext : undefined;
+        } catch {
+          // An unreadable context is treated like an omitted one.
+        }
+        return [{ id, projectName: record.projectName, dockerContext }];
       });
       const predecessorProjects = new Set(predecessors.map(record => record.projectName));
       if (!configuredProjectName && predecessorProjects.size > 1) {
@@ -968,7 +979,11 @@ export class BootstrapOrchestrator {
       }
       const inheritedProject = predecessorProjects.values().next().value as string | undefined;
       const projectName = configuredProjectName ?? inheritedProject ?? deriveComposeProjectName(rigId);
-      const preservesPredecessor = predecessorProjects.has(projectName);
+      // Without two explicit contexts, the project may still share an engine.
+      const preservesPredecessor = predecessors.some(predecessor =>
+        predecessor.projectName === projectName
+        && (predecessor.dockerContext === undefined || services.dockerContext === undefined
+          || predecessor.dockerContext === services.dockerContext));
       const rollback = preservesPredecessor ? undefined : async () => {
         // A failed launch is rolled back regardless of the normal shutdown policy.
         // Never delete volumes or tear down an inherited predecessor project.

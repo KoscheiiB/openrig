@@ -51,6 +51,23 @@ describe("ComposeServicesAdapter", () => {
     expect(cmd).not.toContain("--wait"); // readiness is separate
   });
 
+  it("routes a rig's Compose lifecycle through its explicit Docker context", async () => {
+    const exec = vi.fn<ExecFn>().mockResolvedValue("");
+    const adapter = new ComposeServicesAdapter(exec);
+
+    await adapter.composeAvailable("kiri");
+    await adapter.up({ composeFile: "/tmp/docker-compose.yml", projectName: "my-rig", dockerContext: "kiri" });
+    await adapter.status({ composeFile: "/tmp/docker-compose.yml", projectName: "my-rig", dockerContext: "kiri" });
+    await adapter.down({ composeFile: "/tmp/docker-compose.yml", projectName: "my-rig", dockerContext: "kiri", policy: "down" });
+
+    expect(exec.mock.calls.map(([command]) => command)).toEqual([
+      "docker --context 'kiri' compose version 2>&1",
+      "docker --context 'kiri' compose -f '/tmp/docker-compose.yml' -p 'my-rig' up -d 2>&1",
+      "docker --context 'kiri' compose -f '/tmp/docker-compose.yml' -p 'my-rig' ps --format json 2>&1",
+      "docker --context 'kiri' compose -f '/tmp/docker-compose.yml' -p 'my-rig' down 2>&1",
+    ]);
+  });
+
   it("down calls docker compose down", async () => {
     const exec = vi.fn<ExecFn>().mockResolvedValue("");
     const adapter = new ComposeServicesAdapter(exec);
@@ -409,6 +426,18 @@ describe("ServiceOrchestrator", () => {
     // Receipt cleared after teardown
     const record = rigRepo.getServicesRecord(rig.id);
     expect(record?.latestReceiptJson).toBeNull();
+  });
+
+  it("teardown — keeps a project with an unreadable stored spec", async () => {
+    const rig = seedRigWithServices({ kind: "compose", composeFile: "docker-compose.yml" });
+    db.prepare("UPDATE rig_services SET spec_json = ? WHERE rig_id = ?").run("{", rig.id);
+    const exec = vi.fn<ExecFn>();
+    const orchestrator = new ServiceOrchestrator({ rigRepo, composeAdapter: new ComposeServicesAdapter(exec) });
+
+    expect(await orchestrator.teardown(rig.id, { policyOverride: "down_and_volumes" })).toEqual({
+      ok: true, kept: "kept project test-rig: stored services spec is unreadable",
+    });
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it("teardown — without Docker Compose v2 and with no containers, the rig's services are down, so rig down can remove it", async () => {
