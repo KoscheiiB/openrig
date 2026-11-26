@@ -151,7 +151,10 @@ export class ServiceOrchestrator {
       return { ok: true }; // No services — nothing to tear down
     }
     const spec = this.parseSpec(record);
-    const successor = this.rigRepo.getLiveServicesSuccessor(rigId, record.projectName, spec?.dockerContext);
+    if (!spec) {
+      return { ok: true, kept: `kept project ${record.projectName}: stored services spec is unreadable` };
+    }
+    const successor = this.rigRepo.getLiveServicesSuccessor(rigId, record.projectName, spec.dockerContext);
     if (successor) {
       return { ok: true, kept: `kept project ${record.projectName}: still used by rig ${successor.name} (${successor.id})` };
     }

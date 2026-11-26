@@ -71,14 +71,15 @@ describe("bootstrap Compose project identity", () => {
     }
   });
 
-  it.each(["success", "failure", "explicit", "ambiguous"])("uses exact predecessors and protects retained projects (%s)", async (scenario) => {
+  it.each(["success", "failure", "explicit", "ambiguous", "implicit-predecessor", "implicit-replacement", "mixed-teardown"])("uses exact predecessors and protects retained projects (%s)", async (scenario) => {
     const db = createFullTestDb();
     try {
       const rigRepo = new RigRepository(db);
       const commands: string[] = [];
+      const bootFails = ["failure", "implicit-predecessor", "implicit-replacement"].includes(scenario);
       const adapter = new ComposeServicesAdapter(async cmd => {
         commands.push(cmd);
-        if (scenario === "failure" && cmd.includes("up -d")) throw new Error("test boot failure");
+        if (bootFails && cmd.includes("up -d")) throw new Error("test boot failure");
         return "";
       });
       const serviceOrchestrator = new ServiceOrchestrator({ rigRepo, composeAdapter: adapter });
@@ -87,15 +88,15 @@ describe("bootstrap Compose project identity", () => {
         db, rigRepo, serviceOrchestrator, bootstrapRepo: dbHandle,
         runtimeVerifier: dbHandle, installExecutor: dbHandle, packageInstallService: dbHandle,
       } as ConstructorParameters<typeof BootstrapOrchestrator>[0]);
-      const store = (id: string, projectName: string) => rigRepo.setServicesRecord(id, {
-        kind: "compose", specJson: JSON.stringify({ kind: "compose", composeFile: "compose.yaml", projectName }),
+      const store = (id: string, projectName: string, dockerContext?: string) => rigRepo.setServicesRecord(id, {
+        kind: "compose", specJson: JSON.stringify({ kind: "compose", composeFile: "compose.yaml", projectName, dockerContext }),
         rigRoot: process.cwd(), composeFile: "compose.yaml", projectName,
       });
       const historical = rigRepo.createRig("demo-rig");
       store(historical.id, "unrelated-old-project");
       rigRepo.archiveRig(historical.id);
       const predecessor = rigRepo.createRig("demo-rig");
-      store(predecessor.id, "legacy-project");
+      store(predecessor.id, "legacy-project", scenario === "implicit-replacement" ? "default" : undefined);
       rigRepo.archiveRig(predecessor.id);
       const replaced = [predecessor.id];
       if (scenario === "ambiguous") {
@@ -110,7 +111,7 @@ name: demo-rig
 services:
   kind: compose
   compose_file: compose.yaml
-${scenario === "explicit" ? "  project_name: requested-project\n" : ""}pods:
+${scenario === "explicit" ? "  project_name: requested-project\n" : ""}${["implicit-predecessor", "mixed-teardown"].includes(scenario) ? "  docker_context: default\n" : ""}pods:
   - id: dev
     label: Development
     members:
@@ -124,7 +125,8 @@ edges: []
 `;
       const hook = await (orchestrator as unknown as ServiceHookAccess).buildServicePrelaunchHook(yaml, process.cwd(), [], []);
       const result = await hook!(current.id, replaced);
-      expect(result.ok).toBe(scenario !== "failure" && scenario !== "ambiguous");
+      expect(result.ok).toBe(!bootFails && scenario !== "ambiguous");
+      if (bootFails) expect(result.message).toContain("inherited Compose project legacy-project retained");
       if (scenario === "ambiguous") {
         expect(result.code).toBe("compose_project_conflict");
         for (const id of replaced) {
@@ -140,7 +142,7 @@ edges: []
         expect(rigRepo.getServicesRecord(current.id)!.projectName).toBe(expected);
         expect(commands.some(cmd => cmd.includes(`-p '${expected}'`) && cmd.includes("up -d"))).toBe(true);
         expect(commands.some(cmd => cmd.includes("down"))).toBe(false);
-        if (scenario === "success") {
+        if (scenario === "success" || scenario === "mixed-teardown") {
           // Even explicit volume cleanup on the archived generation cannot destroy the live project.
           commands.length = 0;
           const teardown = await serviceOrchestrator.teardown(predecessor.id, { policyOverride: "down_and_volumes" });

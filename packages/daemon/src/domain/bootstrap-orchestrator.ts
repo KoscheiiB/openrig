@@ -964,14 +964,13 @@ export class BootstrapOrchestrator {
         const record = rigRepo.getServicesRecord(id);
         if (!record) return [];
         let dockerContext: string | undefined;
-        let contextUnknown = false;
         try {
           const stored = JSON.parse(record.specJson) as { dockerContext?: unknown };
           dockerContext = typeof stored.dockerContext === "string" ? stored.dockerContext : undefined;
         } catch {
-          contextUnknown = true;
+          // An unreadable context is treated like an omitted one.
         }
-        return [{ id, projectName: record.projectName, dockerContext, contextUnknown }];
+        return [{ id, projectName: record.projectName, dockerContext }];
       });
       const predecessorProjects = new Set(predecessors.map(record => record.projectName));
       if (!configuredProjectName && predecessorProjects.size > 1) {
@@ -980,12 +979,11 @@ export class BootstrapOrchestrator {
       }
       const inheritedProject = predecessorProjects.values().next().value as string | undefined;
       const projectName = configuredProjectName ?? inheritedProject ?? deriveComposeProjectName(rigId);
-      // A Compose project name is scoped to one Docker engine. Reusing the same
-      // name on another context does not preserve the predecessor's containers.
-      // If a predecessor record is unreadable, keep the conservative legacy rule.
+      // Without two explicit contexts, the project may still share an engine.
       const preservesPredecessor = predecessors.some(predecessor =>
         predecessor.projectName === projectName
-        && (predecessor.contextUnknown || predecessor.dockerContext === services.dockerContext));
+        && (predecessor.dockerContext === undefined || services.dockerContext === undefined
+          || predecessor.dockerContext === services.dockerContext));
       const rollback = preservesPredecessor ? undefined : async () => {
         // A failed launch is rolled back regardless of the normal shutdown policy.
         // Never delete volumes or tear down an inherited predecessor project.

@@ -83,12 +83,15 @@ describe("env routes", () => {
     expect(commands[0]!.name).toBe("Vault status");
   });
 
-  it("GET /env/logs uses the rig's selected Docker context", async () => {
+  it.each([
+    { stored: "kiri", expected: "kiri" },
+    { stored: 42, expected: undefined },
+  ])("GET /env/logs uses a stored Docker context when it is a string ($stored)", async ({ stored, expected }) => {
     let captured: Record<string, unknown> | undefined;
     const app = createApp({
       getServicesRecord: () => ({
         rigId: "rig-1", kind: "compose",
-        specJson: JSON.stringify({ kind: "compose", dockerContext: "kiri", profiles: ["db"] }),
+        specJson: JSON.stringify({ kind: "compose", dockerContext: stored, profiles: ["db"] }),
         composeFile: "/tmp/svc.yaml", projectName: "test-svc",
       }),
       logs: (opts) => { captured = opts; return { ok: true, output: "Kiri logs" }; },
@@ -98,7 +101,7 @@ describe("env routes", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, output: "Kiri logs" });
     expect(captured).toMatchObject({
-      composeFile: "/tmp/svc.yaml", projectName: "test-svc", dockerContext: "kiri",
+      composeFile: "/tmp/svc.yaml", projectName: "test-svc", dockerContext: expected,
       profiles: ["db"], service: "db", tail: 25,
     });
   });

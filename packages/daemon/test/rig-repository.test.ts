@@ -196,12 +196,12 @@ describe("RigRepository", () => {
     expect(repo.getLiveServicesSuccessor(predecessor.id, "shared-project")).toEqual({ id: live.id, name: "same-name" });
   });
 
-  it("treats a Compose project on another Docker context as a different runtime target", () => {
+  it("treats a Compose project on another explicit Docker context as a different runtime target", () => {
     const live = repo.createRig("same-name");
     const predecessor = repo.createRig("same-name");
     repo.setServicesRecord(live.id, {
       kind: "compose",
-      specJson: JSON.stringify({ kind: "compose", composeFile: "compose.yaml" }),
+      specJson: JSON.stringify({ kind: "compose", composeFile: "compose.yaml", dockerContext: "default" }),
       rigRoot: "/tmp", composeFile: "compose.yaml", projectName: "shared-project",
     });
     repo.setServicesRecord(predecessor.id, {

@@ -428,6 +428,18 @@ describe("ServiceOrchestrator", () => {
     expect(record?.latestReceiptJson).toBeNull();
   });
 
+  it("teardown — keeps a project with an unreadable stored spec", async () => {
+    const rig = seedRigWithServices({ kind: "compose", composeFile: "docker-compose.yml" });
+    db.prepare("UPDATE rig_services SET spec_json = ? WHERE rig_id = ?").run("{", rig.id);
+    const exec = vi.fn<ExecFn>();
+    const orchestrator = new ServiceOrchestrator({ rigRepo, composeAdapter: new ComposeServicesAdapter(exec) });
+
+    expect(await orchestrator.teardown(rig.id, { policyOverride: "down_and_volumes" })).toEqual({
+      ok: true, kept: "kept project test-rig: stored services spec is unreadable",
+    });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it("teardown — without Docker Compose v2 and with no containers, the rig's services are down, so rig down can remove it", async () => {
     const rig = seedRigWithServices({ kind: "compose", composeFile: "docker-compose.yml" });
     const exec = vi.fn<ExecFn>(async (cmd: string) => {

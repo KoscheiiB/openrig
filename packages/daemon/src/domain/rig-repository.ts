@@ -1350,10 +1350,11 @@ export class RigRepository {
         const spec = JSON.parse(candidate.specJson) as { dockerContext?: unknown };
         candidateContext = typeof spec.dockerContext === "string" ? spec.dockerContext : undefined;
       } catch {
-        // Preserve legacy safety when a successor's runtime target cannot be read.
+        // An unreadable context is treated like an omitted one.
+      }
+      if (candidateContext === undefined || dockerContext === undefined || candidateContext === dockerContext) {
         return { id: candidate.id, name: candidate.name };
       }
-      if (candidateContext === dockerContext) return { id: candidate.id, name: candidate.name };
     }
     return null;
   }
